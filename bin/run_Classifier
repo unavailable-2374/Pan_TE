@@ -1,0 +1,8 @@
+rename_TE raw_TEs.fa > re.fa 
+
+mkdir DNA_cls DNA_out
+
+DeepTE_domain.py -d DNA_cls/ -o DNA_out/ -i re.fa -s $supfile --hmmscan $dir
+DeepTE.py -d DNA_cls -o DNA_out -i re_lib.fa -sp $model -m_dir $model_path -modify DNA_out/opt_te_domain_pattern.txt
+RepeatClassifier -consensi re.fa 
+merge re.fa.classified DNA_out/opt_DeepTE.fasta 

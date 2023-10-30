@@ -1,0 +1,28 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+open(IN,$ARGV[0]);
+open(OUT,">$ARGV[1]");
+
+my $chr = 1;
+my $flag = 0;
+my @data;
+
+while(<IN>){
+    chomp;
+    my @arr=split(/\t/);
+    if($chr eq $arr[1]){
+        foreach my $interval (@data) {
+            my ($start, $end) = @$interval;
+            if($start > $end){my $tmp = $end;$end=$start;$start=$tmp;}
+            if(($arr[8] > $end && $arr[9] > $end) || ($arr[8] < $end && $arr[9] < $end)){
+                $flag=1;next;
+            }else{$flag = 0;last;}
+        }if($flag==1){push @data, [$arr[8], $arr[9]];print OUT $_."\n";}
+    }else{
+		@data=();
+        print OUT $_."\n";
+        push @data, [$arr[8], $arr[9]];
+    }$chr = $arr[1];
+}

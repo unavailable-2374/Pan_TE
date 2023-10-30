@@ -1,0 +1,309 @@
+#!/public/agis/zhouyongfeng_group/caoshuo/tools/miniconda3/envs/RM/bin/perl
+use strict;
+use FindBin;
+use lib $FindBin::RealBin;
+use Getopt::Long;
+use POSIX qw(:sys_wait_h ceil floor);
+use File::Copy;
+use File::Spec;
+use File::Path;
+use File::Basename;
+use Cwd qw(abs_path getcwd cwd);
+use Data::Dumper;
+use Pod::Text;
+use Time::HiRes qw( gettimeofday tv_interval);
+
+use RepModelConfig;
+use lib $RepModelConfig::configuration->{'REPEATMASKER_DIR'}->{'value'};
+use RepeatUtil;
+use SeedAlignment;
+use SeedAlignmentCollection;
+use ThreadedTaskSimple;
+
+ use SearchResult;
+ use SearchResultCollection;
+ use WUBlastSearchEngine;
+ use NCBIBlastSearchEngine;
+ use SeqDBI;
+ use SimpleBatcher;
+ use FastaDB;
+
+my %families = ();
+my $workDir=$ARGV[0];
+my $genomeDB=$ARGV[1];
+my $familySizeCutoff = 15;
+my $threads = $ARGV[2];
+my $DEBUG = 0;
+my $combFamiliesFile = "$workDir/families.stk";
+my $consensiFile      = "$workDir/consensi.fa";
+
+my %families = ();
+if ( -f "$workDir/summary/eles" ) {
+    open IN, "< $workDir/summary/eles";
+    while ( <IN> ) {
+        next if ( /^#/ );
+        if ( /^\s+\d+\s+/ ) {
+            my @fields = split;
+            if ( $fields[ 4 ] < 0 || $fields[ 5 ] < 0 ) {
+                warn "WARNING: RECON returned a negative offset:\n    $_\n"
+                . "In file: $workDir/summary/eles.  Ignoring line and"
+                . " moving on.\n";
+                next;
+            }
+        push @{ $families{ $fields[ 0 ] }->{'elements'} },
+            {
+              seqName   => $fields[ 3 ],
+              elementID => $fields[ 1 ],
+              orient    => $fields[ 2 ],
+              start     => $fields[ 4 ],
+              end       => $fields[ 5 ]
+            };
+        }
+    }
+    close IN;
+}else {
+    die "Error: Recon failed to produce the summary/eles file!\n";
+}
+open OUTC, ">$workDir/consensi.fa";
+open INDX, ">$workDir/index.html";
+
+my $batchName = "DB.fa";
+my $batchDB = FastaDB->new( fileName => "$workDir/$batchName",
+                              openMode => SeqDBI::ReadOnly );
+
+my @indices = ();
+
+my @sortedKeys = sort {
+$#{ $families{$b}->{'elements'} } <=> $#{ $families{$a}->{'elements'} }
+} keys( %families );
+
+print "Number of families returned by RECON: "
+    . scalar( keys( %families ) ) . "\n";
+print "Processing families with greater than $familySizeCutoff elements\n";
+print "  - Saving instances...\n" if ( $DEBUG );
+my %refinableFamilies = ();
+foreach my $familyID ( @sortedKeys ) {
+last if ( $#{ $families{$familyID}->{'elements'} } < $familySizeCutoff );
+my $elementsRef = $families{$familyID}->{'elements'};
+open FAM, ">$workDir/family-$familyID.fa"
+    or die "RepeatModler: Can't open "
+    . "output file family-$familyID.fa\n";
+
+my $numElements = 0;
+my $giID = 1;
+foreach my $elementRef (
+    sort {
+    ( $b->{'end'} - $b->{'start'} ) <=> ( $a->{'end'} - $a->{'start'} )
+    } @{$elementsRef}
+    )
+{
+    $numElements++;
+    my $seqName = $elementRef->{'seqName'};
+    my $seqDesc = $batchDB->getDescription( $seqName );
+    my $genomicStartPos;
+    my $genomicEndPos;
+    my $genomicSeqID;
+    if ( $seqDesc =~ /(\S+):(\d+)-(\d+)/ ) {
+    $genomicSeqID    = $1;
+    $genomicStartPos = $2;
+    $genomicEndPos   = $3;
+    }
+    else {
+    print
+"ERROR: Sequence reference >$seqName< is not in the correct form!\n";
+    }
+
+    my $startOffset  = $elementRef->{'start'};
+    my $endOffset    = $elementRef->{'end'};
+    my $length       = $endOffset - $startOffset;
+    my $actualSeqLen = $batchDB->getSeqLength( $seqName );
+    if ( $endOffset > $actualSeqLen ) {
+    print
+"WARNING: Attempt to extract substring outside the range of the sequence\n"
+        . "         seqID=$seqName range=$startOffset-$endOffset!  Please report this\n"
+        . "         warning to the developers at help\@dfam.org.\n";
+    next;
+    }
+    my $sequence = $batchDB->getSubstr( $seqName, $startOffset, $length );
+    if ( $elementRef->{'orient'} ne "1" ) {
+    $sequence = reverse( $sequence );
+    $sequence =~ tr/ACGTYRMKHBVD/TGCARYKMDVBH/;
+    my $tmpOffset = $startOffset;
+    $startOffset = $endOffset-1;
+    $endOffset   = $tmpOffset-1;
+    }
+
+    $elementRef->{'sequence'} = $sequence;
+    print FAM ">gi|$giID $genomicSeqID" . ":"
+        . ( $startOffset + $genomicStartPos ) . "-"
+        . ( $endOffset + $genomicStartPos )
+        . " element-"
+        . $elementRef->{'elementID'} . "\n";
+
+    print FAM "" . $elementRef->{'sequence'} . "\n";
+    $giID++;
+}
+close FAM;
+$refinableFamilies{$familyID}++;
+}
+my $tsk = ThreadedTaskSimple->new();
+$tsk->setWorkingDir($workDir);
+$tsk->setName("refining_job");
+$tsk->setNumThreads($threads);
+$tsk->setMaxRetries(1);
+my $jobIdx = 0;
+for my $familyID ( keys %refinableFamilies ) {
+$tsk->addJob( name => "refiner-job-$jobIdx",
+            function => \&refineOneFamily,
+            parameters => ["$workDir/family-$familyID.fa", $genomeDB, $workDir, 1, $DEBUG] );
+$jobIdx++;
+}  
+print "About to run $jobIdx refinement jobs\n";
+
+$tsk->execute();
+
+for my $familyID ( keys %refinableFamilies ) {
+my $cons;
+my $maSize = 1;
+if ( -s "$workDir/family-$familyID.fa.refiner_cons" ) {
+    open INREF, "<$workDir/family-$familyID.fa.refiner_cons"
+        or die $!
+        . ": Could not open refined model $workDir/family-$familyID."
+        . "fa.refiner_cons!\n";
+    while ( <INREF> ) {
+    if ( /Final Multiple Alignment Size = (\d+)/ ) {
+        $maSize = $1;
+    }
+    else {
+        $cons .= $_;
+    }
+    }
+    close INREF;
+}
+else {
+    print "  WARNING: Refiner did not return a consensus.\n";
+}if ( $cons ne "" ) {
+    $families{$familyID}->{'consensus'}         = $cons;
+    $families{$familyID}->{'finalElementCount'} = $maSize;
+    if ( -s "$workDir/family-$familyID.fa.refiner.stk" ) {
+    my $stockholmFile = SeedAlignmentCollection->new();
+    my $IN;
+    open $IN, "<$workDir/family-$familyID.fa.refiner.stk"
+        or die
+        "Could not open family-$familyID.fa.refiner.stk for reading!\n";
+    open OUT, ">> $workDir/families.stk"
+        or die "Could not open $workDir/families.stk for appending!\n";
+    $stockholmFile->read_stockholm( $IN );
+    close $IN;
+
+    my $seedAlign = $stockholmFile->get( 0 );
+
+    $seedAlign->setDescription( "RepeatModeler Generated - rnd-1"
+                            . "_family-$familyID, RECON: [ RECON Size = "
+                            . ( $#{ $families{$familyID}->{'elements'} } + 1 )
+                            . ", Final Multiple Alignment Size = $maSize ]" );
+    print OUT "" . $seedAlign->toString();
+    close OUT;
+    }
+    print OUTC ">family-$familyID ( Recon Family Size = "
+        . ( $#{ $families{$familyID}->{'elements'} } + 1 ) . ", "
+        . "Final Multiple Alignment Size = "
+        . $maSize . " )\n";
+    print OUTC "$cons\n";
+
+    my $indexStr =
+        "<a href=\"family-$familyID-cons.html\">family-$familyID"
+        . " ( Recon Family Size = "
+        . ( $#{ $families{$familyID}->{'elements'} } + 1 ) . ", "
+        . "Final Multiple Alignment Size = "
+        . $maSize
+        . " )</a><br>\n";
+
+    print INDX $indexStr;
+    push @indices, [ $maSize, $indexStr ];
+
+}
+
+}  
+undef $batchDB;
+close INDX;
+
+my %seedAlnById = ();
+if ( -s "$workDir/families.stk" ) {
+my $stockholmFile = SeedAlignmentCollection->new();
+my $IN;
+open $IN, "<$workDir/families.stk"
+    or die "Could not open $workDir/families.stk for reading!\n";
+$stockholmFile->read_stockholm( $IN );
+close $IN;
+
+for ( my $i = 0 ; $i < $stockholmFile->size() ; $i++ ) {
+    my $seedAlign = $stockholmFile->get( $i );
+    my $id        = $seedAlign->getId();
+    if ( $id =~ /family-(\d+)/ ) {
+    $seedAlign->setId( "rnd-1" . "_family-$1" );
+    $seedAlnById{$1} = $seedAlign;
+    }
+    else {
+    print
+"Warning: could not decode ID from $workDir/families.stk file: id = $id\n";
+    }
+}
+}
+open INDX, ">$workDir/index.html";
+foreach my $index ( sort { $b->[ 0 ] <=> $a->[ 0 ] } @indices ) {
+    print INDX $index->[ 1 ];
+}
+
+open INDX, ">$workDir/index.html";
+foreach my $index ( sort { $b->[ 0 ] <=> $a->[ 0 ] } @indices ) {
+    print INDX $index->[ 1 ];
+}
+close INDX;
+close OUTC;
+
+my $numModels = 0;
+open OUTC, ">>$consensiFile"
+    or die "Could not open $consensiFile for appending!\n";
+open OUTS, ">>$combFamiliesFile"
+    or die "Could not open $combFamiliesFile for appending!\n";
+
+foreach my $familyKey (
+sort {
+    $families{$b}{'finalElementCount'} <=> $families{$a}{'finalElementCount'}
+}
+keys( %families )
+    )
+{
+
+last
+    if ( $families{$familyKey}->{'finalElementCount'} < $familySizeCutoff );
+print OUTS "" . $seedAlnById{$familyKey}->toString();
+print OUTC ">rnd-1". "_family-$familyKey ( Recon Family Size = "
+    . ( $#{ $families{$familyKey}->{'elements'} } + 1 ) . ", "
+    . "Final Multiple Alignment Size = "
+    . $families{$familyKey}->{'finalElementCount'} . " )\n";
+print OUTC "$families{ $familyKey }->{'consensus'}\n";
+$numModels++;
+
+}
+close OUTC;
+close OUTS;
+
+undef %families;
+
+sub refineOneFamily {
+  my $instancesFile = shift;
+  my $genomeDB = shift;
+  my $workDir = shift;
+  my $threads = shift;
+  my $DEBUG = shift;
+  
+  my $threadParam = "";
+  $genomeDB=~s/.fa//;
+  $threadParam = " -threads $threads " if ( $threads );
+  my $cmd = "$FindBin::RealBin/Refiner $threadParam "
+          . "-noTmp -giToID $genomeDB.translation $instancesFile";
+  $cmd .= " -quiet" unless ( $DEBUG );
+  system( $cmd );
+}
