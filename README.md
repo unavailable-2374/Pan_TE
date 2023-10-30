@@ -25,7 +25,7 @@ Both for linear or graph genome TE detection and annotation
 
   git clone https://github.com/unavailable-2374/Pan_TE.git
 
-### 2.Install
+### 2.Install:
 
     cd Pan_TE
     export PATH=/PATH/TO/bin >> ~/.bashrc
@@ -33,31 +33,31 @@ Both for linear or graph genome TE detection and annotation
     pip install sklearn
     conda activate pgta
 
-#### Manual installation section. 
+#### 3.Manual installation section:
  
- Download the model dir from the cyVerse link
-  Plants:
-  https://de.cyverse.org/dl/d/89D2FE7A-41BA-4F64-80E2-B9C26D49E99F/Plants_model.tar.gz
-  Metazoans:
-  https://de.cyverse.org/dl/d/441459EF-6DDD-41A5-A9AB-1D5D13049F18/Metazoans_model.tar.gz
-  Fungi:
-  https://de.cyverse.org/dl/d/8B112733-063A-4DE9-89EC-22A062D8807B/Fungi_model.tar.gz
-  Others:
-  https://de.cyverse.org/dl/d/34CF8ACB-0B1F-4210-8359-366A70539F01/Others_model.tar.gz
-  UNS models:
-  https://de.cyverse.org/dl/d/3280369B-030A-4ADF-8B6F-EDD4EC21DC4A/UNS_model.tar.gz
+    Download the model dir from the cyVerse link
+    Plants:
+    https://de.cyverse.org/dl/d/89D2FE7A-41BA-4F64-80E2-B9C26D49E99F/Plants_model.tar.gz
+    Metazoans:
+    https://de.cyverse.org/dl/d/441459EF-6DDD-41A5-A9AB-1D5D13049F18/Metazoans_model.tar.gz
+    Fungi:
+    https://de.cyverse.org/dl/d/8B112733-063A-4DE9-89EC-22A062D8807B/Fungi_model.tar.gz
+    Others:
+    https://de.cyverse.org/dl/d/34CF8ACB-0B1F-4210-8359-366A70539F01/Others_model.tar.gz
+    UNS models:
+    https://de.cyverse.org/dl/d/3280369B-030A-4ADF-8B6F-EDD4EC21DC4A/UNS_model.tar.gz
 
-   Download the model dir from the google link
-  Plants:
-  https://drive.google.com/file/d/1voj86STKcQH8lAhvY6yl5E65nzaM6o0B/view?usp=sharing
-  Metazoans:
-  https://drive.google.com/file/d/1ExRwC3szJ4XMa3ikxM9Ccu31lY79rdw9/view?usp=sharing
-  Fungi:
-  https://drive.google.com/file/d/1uvnm99ypauIKtqCxoybdtT-mEMdoupip/view?usp=sharing
-  Others:
-  https://drive.google.com/file/d/1Q6HW1NhNs0a6Ykrw7jGEKKPWxawpWiuM/view?usp=sharing
-  UNS model:
-  https://drive.google.com/file/d/1uXTEtNQtJc2DO-JpT0s4Kv1k2ogUjCLr/view?usp=sharing
+    Download the model dir from the google link
+    Plants:
+    https://drive.google.com/file/d/1voj86STKcQH8lAhvY6yl5E65nzaM6o0B/view?usp=sharing
+    Metazoans:
+    https://drive.google.com/file/d/1ExRwC3szJ4XMa3ikxM9Ccu31lY79rdw9/view?usp=sharing
+    Fungi:
+    https://drive.google.com/file/d/1uvnm99ypauIKtqCxoybdtT-mEMdoupip/view?usp=sharing
+    Others:
+    https://drive.google.com/file/d/1Q6HW1NhNs0a6Ykrw7jGEKKPWxawpWiuM/view?usp=sharing
+    UNS model:
+    https://drive.google.com/file/d/1uXTEtNQtJc2DO-JpT0s4Kv1k2ogUjCLr/view?usp=sharing
  
 ## Usage
 
