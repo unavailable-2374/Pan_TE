@@ -3,22 +3,6 @@ Design for linear or graph genome TE detection and annotation
 
 ![The Pan_TE workflow](https://github.com/unavailable-2374/Pan_TE/tree/main/image/PGTA.png)
 
-## Requirements
-
-### Tools
-- [Look4LTRs ](https://github.com/BioinformaticsToolsmith/Look4LTRs)
-- [RMblast ] ()
-- [RepeatScout ] ()
-- [RECON ] ()
-- [DeepTE ] ()
-- [Minigraph-Cactus ] ()
-- [TRF-finder ] ()
-- [CD-Hit ] ()
-- [MAFFT ] ()
-- [RepeatClassfier ] ()
-- [blast ] ()
-- [hmmscan ] ()
-
 ## Software Installation 
 
 ### 1.Download the latest Pipeline:
