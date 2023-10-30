@@ -23,7 +23,7 @@ Both for linear or graph genome TE detection and annotation
 
 ### 1.Download the latest Pipeline:
 
-  git clone https://github.com/unavailable-2374/Pan_TE.git
+    git clone https://github.com/unavailable-2374/Pan_TE.git
 
 ### 2.Install:
 
