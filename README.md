@@ -1,7 +1,7 @@
 # Zhou Lab @ AGIS Pan_TE 
 Design for linear or graph genome TE detection and annotation
 
-![The Pan_TE workflow](https://github.com/unavailable-2374/Pan_TE/tree/main/image/PGTA.png)
+![The Pan_TE workflow](/Pan_TE/tree/main/image/PGTA.png)
 
 ## Requirements
 
@@ -33,7 +33,7 @@ Design for linear or graph genome TE detection and annotation
     pip install sklearn
     conda activate pgta
 
-#### 3.Manual installation section:
+### 3.Manual installation section:
  
     Download the model dir from the cyVerse link
     Plants:
@@ -59,7 +59,7 @@ Design for linear or graph genome TE detection and annotation
     UNS model:
     https://drive.google.com/file/d/1uXTEtNQtJc2DO-JpT0s4Kv1k2ogUjCLr/view?usp=sharing
 
-#### Look4LTRs intallation section:
+### Look4LTRs intallation section:
     git clone https://github.com/BioinformaticsToolsmith/Look4LTRs.git
     mkdir bin
     cd bin
