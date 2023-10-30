@@ -39,38 +39,31 @@ Both for linear or graph genome TE detection and annotation
     Pan_TE.pl --genome gemome.fa  --cpu 40 --out demo --model P --model_dir path/to/model --hmmscan path/to/hmmscam
     Parameters:
         [General]
-        --ref <string>     Required
-    genome file in fasta format.
-
-    [other]
-        --list <string> default:NA
-        path file for genome .
-    
-        --out <string>    default: .
-        the work dir.
-    
-        -M <int>    
-        memory limit (in MB) for the program, default 0; 0 for unlimitted;
-    
-        --model <string>
-        P or M or F or O. P:Plants, M:Metazoans, F:Fungi, and O: Others.
-    
-        --model_dir <string>
-        Provide model_dir that could be downloaded from website (optional requirements). 
-    
-        --hmmscan <int>
-        path to hmmscan
-    
-        --cpu <int>    default: 4
-        the number of threads, preferably in multiples of 4.
-    
-        --sensitive defaut:normal
-        Sensitivity represents a parameter when merging genomes; 
-        the more sensitive is more cautious for merging, 
-        the longer the procedure takes and the more TEs may be obtained.
-        super,hight,normal,low
-    
-        --help|-h Display this help info
-    
-    Version: 1.0.0
-    USAGE
+            --ref <string>     Required
+            genome file in fasta format.
+        [other]
+            --list <string> default:NA
+            path file for genome .
+        
+            --out <string>    default: .
+            the work dir.
+        
+            -M <int>    
+            memory limit (in MB) for the program, default 0; 0 for unlimitted;
+        
+            --model <string>
+            P or M or F or O. P:Plants, M:Metazoans, F:Fungi, and O: Others.
+        
+            --model_dir <string>
+            Provide model_dir that could be downloaded from website (optional requirements). 
+        
+            --hmmscan <int>
+            path to hmmscan
+        
+            --cpu <int>    default: 4
+            the number of threads, preferably in multiples of 4.
+        
+            --help|-h Display this help info
+        
+        Version: 1.0.0
+        USAGE
