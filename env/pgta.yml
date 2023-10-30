@@ -1,0 +1,12 @@
+name: PGTA
+
+channels:
+ - bioconda
+ - defaults
+dependencies:
+ - RepeatModeler2
+ - python=3.6
+ - tensorflow-gpu=1.14.0
+ - biopython
+ - keras=2.2.4
+ - numpy=1.16.0
