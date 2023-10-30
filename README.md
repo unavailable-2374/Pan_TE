@@ -1,7 +1,7 @@
 # Zhou Lab @ AGIS Pan_TE 
 Design for linear or graph genome TE detection and annotation
 
-<img width="1500" alt="The Pan_TE workflow" src="https://github.com/unavailable-2374/Pan_TE/tree/main/image/PGTA.jpg?raw=true" >
+![The Pan_TE workflow]([/path/to/img.jpg](https://github.com/unavailable-2374/Pan_TE/tree/main/image/PGTA.jpg))
 
 ## Requirements
 
