@@ -33,11 +33,11 @@ Both for linear or graph genome TE detection and annotation
     conda activate pgta
 ## Usage
 
-  Usage:
-      perl Pan_TE.pl [options]
-  For example:
-      Pan_TE.pl --genome gemome.fa  --cpu 40 --out demo --model P --model_dir path/to/model --hmmscan path/to/hmmscam
-      Parameters:
+    Usage:
+        perl Pan_TE.pl [options]
+    For example:
+        Pan_TE.pl --genome gemome.fa  --cpu 40 --out demo --model P --model_dir path/to/model --hmmscan path/to/hmmscam
+        Parameters:
           [General]
               --ref <string>     Required
               genome file in fasta format.
