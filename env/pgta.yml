@@ -3,10 +3,12 @@ name: PGTA
 channels:
  - bioconda
  - defaults
+ - conda-forge
 dependencies:
  - RepeatModeler2
- - python=3.6
- - tensorflow-gpu=1.14.0
- - biopython
- - keras=2.2.4
- - numpy=1.16.0
+ - networkx=2.4
+ - numpy=1.19.1
+ - pandas=1.0.5
+ - scikit-learn=0.23.1
+ - scipy=1.5.2
+ - python=3.7
