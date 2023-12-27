@@ -1,0 +1,10 @@
+renameTE TE raw.fa re.fa 
+
+python /public/agis/zhouyongfeng_group/caoshuo/tools/ClassifyTE/generate_feature_file.py -f re.fa -d sup_features -o sup.csv
+python /public/agis/zhouyongfeng_group/caoshuo/tools/ClassifyTE/evaluate.py -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb
+
+RepeatClassifier -consensi re.fa 
+
+merge re.fa.classified TEs.fa
+
+sed -i 's:_unkown::' TE_lib.fa

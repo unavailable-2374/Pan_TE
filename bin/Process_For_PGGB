@@ -1,0 +1,8 @@
+j=1
+for i in $(ls $1/*.gfa)
+do
+ for_pggb.py $i $2/$j.fa $2/$j.list --min_length $3 --max_length $4 --core_min_length $5 --core_max_length $6 --core_uniq_length $7
+ j++
+done
+cat $2/*.fa > tmp.fa
+rename tmp.fa > pgg.fa
