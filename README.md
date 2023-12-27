@@ -11,7 +11,7 @@ Design for linear or graph genome TE detection and annotation
 
     cd Pan_TE
     export PATH=/PATH/TO/bin >> ~/.bashrc
-    mamba env create -f pgta.yml
+    mamba env create -f env/pgta.yml
     pip install sklearn
     conda activate pgta
 
