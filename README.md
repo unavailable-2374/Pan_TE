@@ -21,6 +21,9 @@ Design for linear or graph genome TE detection and annotation
     cd bin
     cmake ..
     make look4ltrs
+
+### ClassifyTE intallation section:
+    git clone https://github.com/manisa/ClassifyTE.git
  
 ## Usage
 
