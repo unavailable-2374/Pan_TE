@@ -5,7 +5,7 @@ channels:
  - defaults
  - conda-forge
 dependencies:
- - RepeatModeler2
+ - RepeatModeler
  - networkx=2.4
  - numpy=1.19.1
  - pandas=1.0.5
