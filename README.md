@@ -10,10 +10,10 @@ Design for linear or graph genome TE detection and annotation
 ### 2.Install:
 
     cd Pan_TE
-    export PATH=/PATH/TO/bin >> ~/.bashrc
+    export PATH=/YOUR/PATH/TO/bin >> ~/.bashrc
+        like: export PATH=/public/home/soft/Pan_TE/bin >> ~/.bashrc
     mamba env create -f env/pgta.yml
-    pip install sklearn
-    conda activate pgta
+    conda activate PGTA
 
 ### [Look4LTRs](https://github.com/BioinformaticsToolsmith/Look4LTRs) intallation section:
     git clone https://github.com/BioinformaticsToolsmith/Look4LTRs.git
