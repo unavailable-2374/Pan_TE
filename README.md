@@ -16,7 +16,7 @@ Design for linear or graph genome TE detection and annotation
 
 ### [Look4LTRs](https://github.com/BioinformaticsToolsmith/Look4LTRs) intallation section:
     git clone https://github.com/BioinformaticsToolsmith/Look4LTRs.git
-    cd look4LTR
+    cd Look4LTRs
     mkdir bin
     cd bin
     cmake ..
