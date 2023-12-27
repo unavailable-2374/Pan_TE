@@ -12,3 +12,5 @@ dependencies:
  - scikit-learn=0.23.1
  - scipy=1.5.2
  - python=3.7
+ - cmake=3.10.3
+ - gcc=11.1.0
