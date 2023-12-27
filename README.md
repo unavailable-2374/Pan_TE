@@ -15,14 +15,15 @@ Design for linear or graph genome TE detection and annotation
     pip install sklearn
     conda activate pgta
 
-### Look4LTRs intallation section:
+### [Look4LTRs](https://github.com/BioinformaticsToolsmith/Look4LTRs) intallation section:
     git clone https://github.com/BioinformaticsToolsmith/Look4LTRs.git
+    cd look4LTR
     mkdir bin
     cd bin
     cmake ..
     make look4ltrs
 
-### ClassifyTE intallation section:
+### [ClassifyTE](https://github.com/manisa/ClassifyTE/tree/master) intallation section:
     git clone https://github.com/manisa/ClassifyTE.git
     go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89mfh/view?usp=sharing)
     
