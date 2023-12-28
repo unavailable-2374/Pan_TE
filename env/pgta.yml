@@ -13,3 +13,4 @@ dependencies:
  - scipy=1.5.2
  - cmake=3.10.3
  - gcc=11.1.0
+ - gxx_linux-64
