@@ -24,6 +24,7 @@ Design for linear or graph genome TE detection and annotation
     vim ../src/Util.h add [#include <cstdint>] on the top
     vim ../src/KmerHistogram.h add [#include <cstdint>] on the top
     make look4ltrs
+    export PATH=/YOUR/PATH/TO/Look4LTRs/bin >> ~/.bashrc
 
 ### [ClassifyTE](https://github.com/manisa/ClassifyTE/tree/master) intallation section:
     git clone https://github.com/manisa/ClassifyTE.git
