@@ -15,3 +15,4 @@ dependencies:
  - gcc=11.1.0
  - gxx_linux-64
  - seqtk
+ - bedtools
