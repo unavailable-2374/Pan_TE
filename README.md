@@ -37,36 +37,40 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
 ## Usage
 
     Usage:
-        perl Pan_TE.pl [options]
+        perl $0 [options]
+    
     For example:
-        Pan_TE.pl --genome gemome.fa  --cpu 40 --out demo --model P --model_dir path/to/model --hmmscan path/to/hmmscam
-        Parameters:
-          [General]
-              --ref <string>     Required
-              genome file in fasta format.
-          [other]
-              --list <string> default:NA
-              path file for genome .
-          
-              --out <string>    default: .
-              the work dir.
-          
-              -M <int>    
-              memory limit (in MB) for the program, default 0; 0 for unlimitted;
-          
-              --model <string>
-              P or M or F or O. P:Plants, M:Metazoans, F:Fungi, and O: Others.
-          
-              --model_dir <string>
-              Provide model_dir that could be downloaded from website (optional requirements). 
-          
-              --hmmscan <int>
-              path to hmmscan
-          
-              --cpu <int>    default: 4
-              the number of threads, preferably in multiples of 4.
-          
-              --help|-h Display this help info
-          
-          Version: 1.0.0
-          USAGE
+        perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir Your_Path_To_ClassifyTE
+    
+    Parameters::
+    [General]
+    
+        --ref <string>     Required
+        genome file in fasta format.
+    
+        --ClassifyTE_dir <string>
+        Provide ClassifyTE's dir for run classification.
+    
+    [other]
+        --list <string> default:NA
+        path file for GFA, see gfa.list for formate.
+    
+        --out <string>    default: .
+        the work dir.
+    
+        -M <int>    
+        memory limit (in MB) for the program, default 0; 0 for unlimitted;
+    
+        --flag <string>
+        PGGB or Minigraph-Cactus.
+    
+        --cpu <int>    default: 4
+        the number of threads, preferably in multiples of 4.
+    
+        --fragment_size <int>    default: 40000
+        the length for fragment.
+    
+        --help|-h Display this help info
+    
+    Version: 1.0.0
+    USAGE
