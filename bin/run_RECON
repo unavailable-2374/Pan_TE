@@ -5,52 +5,51 @@ use warnings;
 my $tmpDir = "round-$ARGV[0]";
 chdir $tmpDir;
 my $cmdString;
-
-$cmdString="sample_for_genome $ARGV[2] $ARGV[3] $ARGV[4] > DB.fa";
+$cmdString="sample_for_genome --file $ARGV[2] --samples $ARGV[3] --length $ARGV[4] > tmp.fa";
 system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
 
 if($ARGV[0] > 1){
-	for(my $i = 1;$i<$ARGV[0];$i++){
-		$cmdString="cat ../round-$i/consensi.fa >> lib.fa";
-		system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-	}
-	$cmdString="perl /public/agis/zhouyongfeng_group/caoshuo/tools/EDTA/util/rename_TE.pl lib.fa > re.fa";
-	system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-	$cmdString="makeblastdb -in re.fa -dbtype nucl -parse_seqids -out DB";
-	system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-	$cmdString="blastn -query tmp.fa -out db.tbl -db DB -outfmt 6 -evalue 1e-5 -num_threads $ARGV[1]";
-	system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-	$cmdString="samtools faidx re.fa";
-	system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-	$cmdString="mask_genome re.fa.fai db.tbl";
-	system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-	$cmdString="bedtools maskfasta -fi tmp.fa -fo DB.fa.mask -bed mask.bed";
-	system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-	open(TS,"../../genome/genome.translation") or die "cannot open translation file due to $!\n";
-	my %ID;
+        for(my $i = 1;$i<$ARGV[0];$i++){
+                $cmdString="cat ../round-$i/consensi.fa >> lib.fa";
+                system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        }
+        $cmdString="perl /public/agis/zhouyongfeng_group/caoshuo/tools/EDTA/util/rename_TE.pl lib.fa > re.fa";
+        system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        $cmdString="makeblastdb -in re.fa -dbtype nucl -parse_seqids -out DB";
+        system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        $cmdString="blastn -query tmp.fa -out db.tbl -db DB -outfmt 6 -evalue 1e-5 -num_threads $ARGV[1]";
+        system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        $cmdString="samtools faidx re.fa";
+        system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        $cmdString="mask_genome re.fa.fai db.tbl";
+        system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        $cmdString="bedtools maskfasta -fi tmp.fa -fo DB.fa.mask -bed mask.bed";
+        system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        open(TS,"../../genome/genome.translation") or die "cannot open translation file due to $!\n";
+        my %ID;
 
-	while(<TS>){
-		chomp;
-		my @arr = split(/\t/);
-		$ID{$arr[0]} = $arr[1];
-	}
-	close TS;
+        while(<TS>){
+                chomp;
+                my @arr = split(/\t/);
+                $ID{$arr[0]} = $arr[1];
+        }
+        close TS;
 
-	open(IN,"DB.fa.mask") or die "cannot open DB.fa.mask due to $!\n";
-	open(OUT,">DB.fa") or die "cannot open DB.fa due to $!\n";
+        open(IN,"DB.fa.mask") or die "cannot open DB.fa.mask due to $!\n";
+        open(OUT,">DB.fa") or die "cannot open DB.fa due to $!\n";
 
-	my $i=1;
+        my $i=1;
 
-	while (<IN>) {
-		chomp;
-		if(/>/){
-			s/>//;
-			my @arr=split(/:/);
-			$_=">gi|".$i." gi|".$ID{$arr[0]}.":".$arr[1];
-			$i++;
-		}print OUT $_."\n";
-	}
-	close IN; close OUT;
+        while (<IN>) {
+                chomp;
+                if(/>/){
+                        s/>//;
+                        my @arr=split(/:/);
+                        $_=">gi|".$i." gi|".$ID{$arr[0]}.":".$arr[1];
+                        $i++;
+                }print OUT $_."\n";
+        }
+        close IN; close OUT;
 }else{
     open(TS,"../../genome/genome.translation") or die "cannot open translation file due to $!\n";
     my %ID;
@@ -60,13 +59,13 @@ if($ARGV[0] > 1){
         $ID{$arr[0]} = $arr[1];
     }
     close TS;
-    open(IN,"tmp.fa") or die "cannot open DB.fa.mask due to $!\n";
+    open(IN,"tmp.fa") or die "cannot open tmp due to $!\n";
     open(OUT,">DB.fa") or die "cannot open DB.fa due to $!\n";
     my $i=1;
     while (<IN>){
         chomp;
         if(/>/){
-			s/>//;
+                        s/>//;
             my @arr=split(/:/);
             $_=">gi|".$i." gi|".$ID{$arr[0]}.":".$arr[1];
             $i++;

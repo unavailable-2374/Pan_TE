@@ -1,10 +1,16 @@
-renameTE TE raw.fa re.fa 
+mkdir data
+renameTE TE raw.fa data/re.fa 
 
-python /public/agis/zhouyongfeng_group/caoshuo/tools/ClassifyTE/generate_feature_file.py -f re.fa -d sup_features -o sup.csv
-python /public/agis/zhouyongfeng_group/caoshuo/tools/ClassifyTE/evaluate.py -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb
+ln -s $1/features ./
+ln -s $1/nodes ./
+ln -s $1/models
+python $1/generate_feature_file.py -f re.fa -d sup_features -o sup.csv
+python $1/evaluate.py -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb
 
 RepeatClassifier -consensi re.fa 
 
-merge re.fa.classified TEs.fa
+process_for_classify.py output/predicted_out_sup_features.csv result.txt
+Combine_for_Two
 
-sed -i 's:_unkown::' TE_lib.fa
+sed -i 's:#I:#LINE:' TEs.fa
+sed -i 's:gypsy:LTR/Gypsy:' TEs.fa

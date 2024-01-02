@@ -34,7 +34,7 @@ my $roundTmpDir = $ARGV[0];
 my $consensiFile = $ARGV[1];    #output.fa
 my $familyCutoff = 15;
 my $threads = $ARGV[2];
-my $RMBLASTN_PRGM   = "/public/agis/zhouyongfeng_group/caoshuo/tools/rmblast/bin/rmblastn";
+my $RMBLASTN_PRGM   = "/public/home/lijiacui/miniconda3/envs/PGTA/bin/rmblastn";
 my $NCBIBLASTDB_PRGM = "makeblastdb";
 my $NCBIDBCMD_PRGM = "blastdbcmd";
 
@@ -50,7 +50,7 @@ if ( -s "LTR.fa" ) {
   threads          => $threads,
 );
 }
-`mv $roundConsensiFile consensi.fa`;
+`cp $roundConsensiFile consensi.fa`;
 sub buildRSConsensiMT {
   my %parameters = @_;
 
@@ -89,7 +89,7 @@ sub buildRSConsensiMT {
   $searchEngineN->setCores($threads);
   $searchEngineN->setScoreMode( SearchEngineI::complexityAdjustedScoreMode );
 
-system(   "$NCBIBLASTDB_PRGM -blastdb_version 4 -out $workDir/consensi.fa "
+system(   "$NCBIBLASTDB_PRGM -out $workDir/consensi.fa "
             . "-parse_seqids -dbtype nucl -in $workDir/consensi.fa >> "
             . "$workDir/makeblastdb.log 2>&1" );
   

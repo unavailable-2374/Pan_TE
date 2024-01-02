@@ -18,7 +18,7 @@ my @filestat = stat ($genomeDB.".fa");
 if($rsSampleSize eq "all"){
   $sampleFastaFile = $genomeDB.".fa";
 }else{
-  $cmdString="sample_for_genome $genomeDB.fa $rsSampleSize $ARGV[4]> $sampleFastaFile";
+  $cmdString="sample_for_genome --file $genomeDB.fa --samples 600 --length 100000 > $sampleFastaFile";
   system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
 }
 

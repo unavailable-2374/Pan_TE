@@ -1,7 +1,7 @@
 j=1
 for i in $(cat $1)
 do
-echo "for_pggb.py $i $2/$j.fa $2/$j.list --min_length $3 --max_length $4 --core_min_length $5 --core_max_length $6 --core_uniq_length $7
+echo "for_mc.py $i $2/$j.fa $2/$j.list --min_length $3 --max_length $4 --core_min_length $5 --core_max_length $6 --core_uniq_length $7
 cat $j.fa >> tmp.fa" > command.list
  j=`expr $j + 1`
 done
