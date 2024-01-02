@@ -16,3 +16,4 @@ dependencies:
  - gxx_linux-64
  - seqtk
  - bedtools
+ - ParaFly
