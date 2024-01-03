@@ -40,7 +40,7 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
         perl $0 [options]
     
     For example:
-        perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir Your_Path_To_ClassifyTE
+        perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir Your_Path_To_ClassifyTE --RM_dir Your_Path_To_rmblastn
     
     Parameters::
     [General]
@@ -50,6 +50,9 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
     
         --ClassifyTE_dir <string>
         Provide ClassifyTE's dir for run classification.
+
+        --RM_dir <string>
+        Provide rmblastn's dir for run align.
     
     [other]
         --list <string> default:NA
