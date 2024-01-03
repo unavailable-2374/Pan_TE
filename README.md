@@ -22,8 +22,8 @@ Design for linear or graph genome TE detection and annotation
     mkdir bin
     cd bin
     cmake ..
-    vim ../src/Util.h add [#include <cstdint>] on the top
-    vim ../src/KmerHistogram.h add [#include <cstdint>] on the top
+    vim ../src/Util.h add "#include <cstdint>" on the top
+    vim ../src/KmerHistogram.h add "#include <cstdint>" on the top
     make look4ltrs
     export PATH=/YOUR/PATH/TO/Look4LTRs/bin:$PATH
 
