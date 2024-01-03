@@ -11,7 +11,7 @@ Design for linear or graph genome TE detection and annotation
 
     cd Pan_TE
     chmod 750 bin/*
-    export PATH=/YOUR/PATH/TO/bin //* like: export PATH=/public/home/soft/Pan_TE/bin
+    export PATH=/YOUR/PATH/TO/bin //* like: export PATH=/public/home/soft/Pan_TE/bin:$PATH
     mamba env create -f env/pgta.yml
     ln -s /PATH/TO/miniconda3/envs/PGTA/bin/x86_64-conda-linux-gnu-g++ /PATH/TO/miniconda3/envs/PGTA/bin/g++
     conda activate PGTA
@@ -25,7 +25,7 @@ Design for linear or graph genome TE detection and annotation
     vim ../src/Util.h add [#include <cstdint>] on the top
     vim ../src/KmerHistogram.h add [#include <cstdint>] on the top
     make look4ltrs
-    export PATH=/YOUR/PATH/TO/Look4LTRs/bin
+    export PATH=/YOUR/PATH/TO/Look4LTRs/bin:$PATH
 
 ### [ClassifyTE](https://github.com/manisa/ClassifyTE/tree/master) intallation section:
     git clone https://github.com/manisa/ClassifyTE.git
