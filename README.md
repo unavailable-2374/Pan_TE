@@ -1,5 +1,5 @@
-# Zhou Lab @ AGIS Pan_TE 
-Design for linear or graph genome TE detection and annotation
+# Pan_TE 
+Design for linear or graph genome TE detection and classification 
 
 ## Software Installation 
 
