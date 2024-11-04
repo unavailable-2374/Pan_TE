@@ -35,7 +35,7 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
 - Unzip and copy all the models from "ClassifyTE_Models" directory into the folder **model** inside the root folder **ClassifyTE**
  
 ### Usage:
-   Parameters
+    Parameters:
    [General]
     --genome <string>         Required. Genome file in FASTA format.
     --ClassifyTE_dir <string> Provide path to ClassifyTE for classification.
