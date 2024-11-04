@@ -34,7 +34,7 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
 - Click on **ClassifyTE_Models.zip**. This will automatically download models built with TE datasets.
 - Unzip and copy all the models from "ClassifyTE_Models" directory into the folder **model** inside the root folder **ClassifyTE**
  
-## Usage
+### Usage:
    Parameters
    [General]
     --genome <string>         Required. Genome file in FASTA format.
