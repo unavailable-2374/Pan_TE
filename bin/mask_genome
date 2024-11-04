@@ -1,0 +1,30 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+open(IN,$ARGV[0]) or die "cannot open $ARGV[0] due to $!\n";
+
+my %hash;
+
+while(<IN>){
+    chomp;
+    my @arr=split(/\t/);
+    $hash{$arr[0]} = $arr[1];
+}
+close IN;
+
+open(IN,$ARGV[1]) or die "cannot open $ARGV[0] due to $!\n";
+open(OUT,">mask.bed") or die "cannot open mask.bed due to $!\n";
+
+while(<IN>){
+    chomp;
+    my @arr=split(/\t/);
+    my $std = $hash{$arr[1]}*0.4;
+    if($arr[3] > $std){
+        if($arr[6] > $arr[7]){print OUT $arr[0]."\t".$arr[7]."\t".$arr[6]."\n";}
+        else{print OUT $arr[0]."\t".$arr[6]."\t".$arr[7]."\n";}
+    }
+}
+close IN;
+close OUT;

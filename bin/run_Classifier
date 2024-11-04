@@ -1,0 +1,17 @@
+mkdir data
+renameTE TE raw_TEs.fa data/re.fa 
+
+ln -s $1/features ./
+ln -s $1/nodes ./
+ln -s $1/models
+python $1/generate_feature_file.py -f re.fa -d sup_features -o sup.csv
+python $1/evaluate.py -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb
+
+RepeatClassifier -consensi data/re.fa 
+
+process_for_classify.py output/predicted_out_sup_features.csv result.txt
+Combine_for_Two
+
+sed -i 's:#I:#LINE:' TEs.fa
+sed -i 's:gypsy:LTR/Gypsy:' TEs.fa
+sed -i 's:#Unknown#:#:' TEs.fa

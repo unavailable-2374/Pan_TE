@@ -1,0 +1,36 @@
+#!/usr/bin/perl
+use strict;
+
+my %hash;
+my $flag;
+my $key;
+
+open(IN,"data/re.fa.classified ") or die "open file die for $!\n";
+open(OUT,">TEs.fa");
+while(<IN>){
+    chomp;
+    if(/>/){
+        if(/#Unknown/){
+            s/>//;
+            my @arr = split(/#/);
+            $key = $arr[0];
+            $hash{$key};
+            $flag = 0;
+        }else{
+            print OUT $_."\n";
+            $flag = 1;
+        }
+    }elsif($flag == 1){
+        print OUT $_."\n";
+    }else{
+        $hash{$key} .= $_;
+    }
+}
+
+open(LS,"result.txt ") or die "result.txt die for $!\n";
+
+while(<LS>){
+    chomp;
+    my @arr = split(/#/);
+    if(exists $hash{$arr[0]}){print OUT ">".$_."\n".$hash{$arr[0]}."\n";}
+}

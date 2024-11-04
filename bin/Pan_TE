@@ -1,0 +1,318 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Cwd;
+use Getopt::Long;
+use threads;
+use POSIX qw(:sys_wait_h ceil floor);
+use Cwd qw(abs_path getcwd cwd);
+use File::Basename;
+
+# Gather command-line arguments
+my $command_line_args = join " ", @ARGV;
+my $dirname = dirname($0);
+$dirname =~ s{/bin$}{};
+
+# Usage information
+my $usage = <<"USAGE";
+Usage:
+    perl $0 [options]
+
+Example:
+    perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir Your_Path_To_ClassifyTE --RM_dir Your_Path_To_rmblastn
+
+Parameters:
+[General]
+    --genome <string>         Required. Genome file in FASTA format.
+    --ClassifyTE_dir <string> Provide path to ClassifyTE for classification.
+    --RM_dir <string>         Provide path to rmblastn for classification.
+
+[Other]
+    --list <string>           Default: NA. Path file for GFA, see gfa.list for format.
+    --out <string>            Default: current directory. The work directory.
+    -M <int>                  Memory limit (in MB), default: 0 (unlimited).
+    --flag <string>           PGGB or Minigraph-Cactus.
+    --cpu <int>               Default: 4. Number of threads, preferably in multiples of 4.
+    --fragment_size <int>     Default: 40000. Length for fragment.
+    --help|-h                 Display this help information.
+
+Version: 1.0.0
+USAGE
+
+if (@ARGV==0){die $usage}
+
+my ($genome, $style, $model_dir, $mem, $gn_ls, $CPU, $cmdString, $out, $fragment_size, $rm_dir, $help);
+GetOptions(
+    "help|h" =>\$help,
+    "genome:s" => \$genome,
+    "cpu:s" => \$CPU,
+    "out:s" => \$out,
+    "list:s" => \$gn_ls,
+    "M:s" => \$mem,
+    "ClassifyTE_dir:s" => \$model_dir,
+    "RM_dir:s" => \$rm_dir,
+    "flag:s" => \$style,
+	"fragment_size" => \$fragment_size
+);
+
+my $Luck = int(rand(9999999))+1;
+$out ||= "panTE_".$Luck;
+$CPU ||= 4;
+$mem ||=0;
+$fragment_size ||="40000";
+my @filestat;
+my $thr1;
+my $thr2;
+my $dir;
+
+$dir = getcwd;
+$genome = $dir."/$genome";
+
+if($genome && $gn_ls){print "please input genome only or list only\n"}
+
+if($genome){ 
+    print STDERR "\n============================================\n";
+    print STDERR "RUN Genome Model $out" . "(" . (localtime) . ")" . "\n";
+	@filestat=stat($genome);
+	mkdir "$out" unless -e "$out";
+	chdir $out;
+        print STDERR "Step 1: Prepare For Genome $genome" . "(" . (localtime) . ")" . "\n";
+	unless (-e "genome.ok") {
+        mkdir "genome" unless -e "genome";
+        $cmdString="awk '{print \$1}' $genome > genome/genome.fa";
+        if (-e "genome/genome.fa"){
+            print STDERR "Skip genome.fa existed " . "(" . (localtime) . ")" . "\n";
+        }else{
+            system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+            `samtools faidx genome/genome.fa`;
+			$cmdString="index genome/genome";
+			print STDERR (localtime) . ": CMD: $cmdString\n";
+			system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        }
+        open OUT, ">", "genome.ok" or die $!; close OUT;
+    }else{
+        print STDERR "Skip Step 1 for the file genome.ok exists\n";
+    }
+    $dir = getcwd;
+    $genome = $dir."/genome";
+}if($gn_ls){
+    print STDERR "\n============================================\n";
+    print STDERR "RUN Graph-Genome Model $out" . "(" . (localtime) . ")" . "\n";
+	$gn_ls = abs_path($gn_ls);
+	mkdir "$out" unless -e "$out";
+	chdir $out;
+    my ($min_length,$max_length);
+    my $core_min_length = 30;
+    my $core_uniq_length = 0.4;
+    print STDERR "Step 1: Process For Graph-Genome $gn_ls" . "(" . (localtime) . ")" . "\n";
+	unless (-e "genome.ok") {
+        if($filestat[7] > "150000000"){
+            $min_length = 100000;
+            $max_length = 200000;
+        }elsif($filestat[7] > "120000000"){
+            $min_length = 80000;
+            $max_length = 200000;
+        }elsif($filestat[7] > "80000000"){
+            $min_length = 50000;
+            $max_length = 100000;
+        }else{
+            $min_length = 40000;
+            $max_length = 80000;
+        }
+        mkdir "genome" unless -e "genome";
+        chdir "genome";
+        if($style eq "PGGB"){
+            $cmdString="Process_For_PGGB $gn_ls ./ $min_length $max_length $core_min_length $min_length $core_uniq_length $CPU &> decode_for_pggb.log";
+            print STDERR (localtime) . ": CMD: $cmdString\n";
+            #system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        }else{
+            $cmdString="Process_For_MC $gn_ls ./ $min_length $max_length $core_min_length $min_length $core_uniq_length $CPU &> decode_for_MC.log";
+            print STDERR (localtime) . ": CMD: $cmdString\n";
+            system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+        }
+		$cmdString="index genome";
+        open OUT, ">", "../genome.ok" or die $!; close OUT;
+    }else{
+        print STDERR "Skip Step 1 for the file genome.ok exists\n";
+    }
+    $dir = getcwd;
+    $genome = $dir."/genome";;
+}
+	
+print STDERR "Step 2: Looking For LTRs " . "(" . (localtime) . ")" . "\n";
+unless (-e "LTR.ok") {
+    chdir $dir;
+    mkdir "look4ltrs" unless -e "look4ltrs";
+	chdir "look4ltrs";
+	if($gn_ls){
+		my $timeout = 4 * 60 * 60;
+		`pre_process $genome ltr.fa`;
+		$cmdString="timeout $timeout look4ltrs --fasta $genome --out ./ --parallel $CPU > LTR_detect.log";
+	}else{
+    	        $cmdString="para_look4ltrs $genome $CPU $dir &> LTR_detect.log";
+	}
+	print STDERR (localtime) . ": CMD: $cmdString\n";
+    $thr1 = threads->create(\&run_ltr, $cmdString);
+}else{
+    print STDERR "Skip Step 2 for the file LTR.ok exists\n";
+}
+
+print STDERR "Step 3: Running RepeatScout " . "(" . (localtime) . ")" . "\n";
+
+unless (-e "RepeatScout.ok") {
+    if($filestat[7] > 500000000){
+        $cmdString="build_RS $dir/RepeatScout/tmp $genome/genome $CPU 400 $rm_dir $dir &> build.log";
+		print STDERR (localtime) . ": CMD: $cmdString\n";
+        $thr2 = threads->create(\&run_rs, $cmdString);
+    }else{
+        $cmdString="build_RS $dir/RepeatScout/tmp $genome/genome $CPU all $rm_dir $dir &> build.log";
+		print STDERR (localtime) . ": CMD: $cmdString\n";
+        $thr2 = threads->create(\&run_rs, $cmdString);
+    }
+    if($thr1){$thr1->join();$thr2->join();}
+    else{$thr2->join();}
+}else{
+    print STDERR "Skip Step 3 for the file RepeatScout.ok exists\n";
+}
+
+print STDERR "Step 4: Running RECON " . "(" . (localtime) . ")" . "\n";
+my $simple_size=0;
+unless (-e "RECON.ok") {
+    chdir $dir;
+    mkdir "RECON" unless -e "RECON";
+    chdir "RECON";
+    my $sample_time;
+    $cmdString="cat ../RepeatScout/consensi.fa ../look4ltrs/consensi.fa > raw.fa ";
+    system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+	$cmdString="cd-hit-est -i raw.fa -o lib.fa -c 0.8 -aS 0.8 -M 0 -d 0 -T 0 -n 5 -g 1 -b 500 -G 0 -A 80 -l 30 &> cdhit.log";
+	unless (-e "lib.fa") {
+		system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+	}
+	my $i=1;
+    if($filestat[7] > "10000000000"){
+        print STDERR "Use Huge genome model, it will spend a lot of time\n";
+        print STDERR "Huge genome model will run 6 rounds\n";
+        #my @sample_size = (0,240,480,720,1400,2800,5600);
+        #for(my $i=1;$i<=6;$i++){
+            if(-e "round-$i.ok"){next;}
+            mkdir "round-$i" unless -e "round-$i";
+            chdir "round-$i";
+            $cmdString="run_RECON $i $CPU ../../genome/genome.fa 5600 200000 $rm_dir &> RECON.log";
+			print STDERR (localtime) . ": CMD: $cmdString\n";
+            system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+            #`cat consensi.fa >> ../consensi.fa`;
+            chdir "../";
+        #}
+    }elsif($filestat[7] > "5000000000"){
+        print STDERR "Use Big genome model, it will spend a lot of time\n";
+        print STDERR "Big genome model will run 5 rounds\n";
+        #my @sample_size = (0,120,240,480,860,2800);
+        #for(my $i=1;$i<=5;$i++){
+            if(-e "round-$i.ok"){next;}
+            mkdir "round-$i" unless -e "round-$i";
+            chdir "round-$i";
+            $cmdString="run_RECON $i $CPU ../../genome/genome.fa 2800 200000 $rm_dir &> RECON.log";
+			print STDERR (localtime) . ": CMD: $cmdString\n";
+            system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+            #`cat consensi.fa >> ../consensi.fa`;
+            chdir "../";
+        #}            
+    }elsif($filestat[7] > "1000000000"){
+        print STDERR "Use middle genome model, it will spend a lot of time\n";
+        print STDERR "middle genome model will run 5 rounds\n";
+        #my @sample_size = (0,80,120,240,480,860);
+        #for(my $i=1;$i<=5;$i++){
+            if(-e "round-$i.ok"){next;}
+            mkdir "round-$i" unless -e "round-$i";
+            chdir "round-$i";
+            $cmdString="run_RECON $i $CPU ../../genome/genome.fa 860 100000 $rm_dir &> RECON.log";
+			print STDERR (localtime) . ": CMD: $cmdString\n";
+            system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+         #   `cat consensi.fa >> ../consensi.fa`;
+            chdir "../";
+        #}            
+    }elsif($filestat[7] > "500000000"){
+        print STDERR "Use middle genome model, it will spend a lot of time\n";
+        print STDERR "middle genome model will run 4 rounds\n";
+        #my @sample_size = (0,80,120,240,360);
+        #for(my $i=1;$i<=4;$i++){
+            if(-e "round-$i.ok"){next;}
+            mkdir "round-$i" unless -e "round-$i";
+            chdir "round-$i";
+            $cmdString="run_RECON $i $CPU ../../genome/genome.fa 360 80000 $rm_dir &> RECON.log";
+			print STDERR (localtime) . ": CMD: $cmdString\n";
+            system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+         #   `cat consensi.fa >> ../consensi.fa`;
+            chdir "../";
+        #}            
+    }else{
+        print STDERR "Use small genome model, it will spend a lot of time\n";
+        if($filestat[7] > "300000000"){
+            print STDERR "small genome model will run 3 rounds\n";
+          #  my @sample_size = (0,80,120,240);
+          #  for(my $i=1;$i<=3;$i++){
+                if(-e "round-$i.ok"){next;}
+                mkdir "round-$i" unless -e "round-$i";
+                chdir "round-$i";
+                $cmdString="run_RECON $i $CPU ../../genome/genome.fa 240 40000 $rm_dir &> RECON.log";
+				print STDERR (localtime) . ": CMD: $cmdString\n";
+                system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+            #    `cat consensi.fa >> ../consensi.fa`;
+                chdir "../";
+           # }  
+        }else{
+            print STDERR "small genome model will run 1 rounds\n";
+            my $size = length($filestat[7]) - 1;
+            my $len = 0 x $size;
+            my $sz = substr($filestat[7],0,1);
+            $size = int($sz.$len)/1000000;
+            unless(-e "round-1.ok"){
+            mkdir "round-1" unless -e "round-1";
+            chdir "round-1";
+            $cmdString="run_RECON 1 $CPU ../../genome/genome.fa $size 40000 $rm_dir &> RECON.log";
+			print STDERR (localtime) . ": CMD: $cmdString\n";
+            system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+            #`cat consensi.fa >> ../consensi.fa`;
+            chdir "../"; }
+        }          
+    }
+	`cp round-1/consensi.fa ./`;
+    chdir "../"; 
+    open OUT, ">", "RECON.ok" or die $!; close OUT;
+}else{
+    print STDERR "Skip Step 4 for the file RECON.ok exists\n";
+}
+
+print STDERR "Step 4: Combining For results " . "(" . (localtime) . ")" . "\n";
+
+unless (-e "Combine.ok") {
+    mkdir "Combine" unless -e "Cmbine";
+    chdir "Combine";
+
+    $cmdString="cat ../RECON/lib.fa ../RECON/consensi.fa > raw_TEs.fa";
+    system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+
+    $cmdString="sh run_Classifier $model_dir &> classify.log";
+	print STDERR (localtime) . ": CMD: $cmdString\n";
+    system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+}
+print STDERR "\n============================================\n";
+print STDERR "Finish run Pan_TE" . "(" . (localtime) . ")" . "\n";
+
+
+sub run_ltr {
+    my ($cmd) = @_;
+    system($cmd) == 0 or die "failed to execute: $cmd\n";
+    system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+
+    open OUT, ">", "$dir/LTR.ok" or die $!; close OUT;
+    print "LTR completed\n";
+}
+
+sub run_rs {
+    my ($cmd) = @_;
+    system($cmd) == 0 or die "failed to execute: $cmd\n";
+    print "RS completed\n";
+    open OUT, ">", "$dir/RepeatScout.ok" or die $!; close OUT;
+}
+

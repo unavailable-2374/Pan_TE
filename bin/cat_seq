@@ -1,0 +1,70 @@
+import argparse
+from Bio import SeqIO
+from Bio.Seq import Seq  # 从 Bio.Seq 导入 Seq 类
+
+# 合并序列时的阈值
+MAX_SEQ_LENGTH = 10 * 10**6  # 10Mb
+NS = "N" * 200  # 用200个"N"连接
+
+def parse_fai(fai_file):
+    """解析fai文件，返回序列长度字典"""
+    seq_lengths = {}
+    with open(fai_file) as f:
+        for line in f:
+            parts = line.split('\t')
+            seq_id = parts[0]
+            length = int(parts[1])
+            seq_lengths[seq_id] = length
+    return seq_lengths
+
+def merge_sequences(fasta_file, fai_file, output_file):
+    """合并FASTA文件中的序列并输出到新的文件"""
+    seq_lengths = parse_fai(fai_file)
+    merged_sequences = []
+    current_merged_seq = ""
+    
+    with open(fasta_file) as fasta_handle:
+        for record in SeqIO.parse(fasta_handle, "fasta"):
+            seq_id = record.id
+            seq = str(record.seq)
+            length = seq_lengths.get(seq_id, len(seq))
+            
+            if length >= MAX_SEQ_LENGTH:
+                # 如果序列长度超过10Mb，直接保存，不合并
+                merged_sequences.append(record)
+            else:
+                # 如果当前合并的序列长度加上本序列的长度仍然不超过10Mb
+                if len(current_merged_seq) + length <= MAX_SEQ_LENGTH:
+                    if current_merged_seq:
+                        current_merged_seq += NS  # 添加200个N作为连接
+                    current_merged_seq += seq
+                else:
+                    # 如果超过了10Mb，保存当前合并好的序列，重新开始新的合并
+                    new_record = SeqIO.SeqRecord(Seq(current_merged_seq), id="merged_seq_{}".format(len(merged_sequences)+1), description="")
+                    merged_sequences.append(new_record)
+                    current_merged_seq = seq
+        
+        # 处理最后一条合并序列
+        if current_merged_seq:
+            new_record = SeqIO.SeqRecord(Seq(current_merged_seq), id="merged_seq_{}".format(len(merged_sequences)+1), description="")
+            merged_sequences.append(new_record)
+
+    # 将结果输出到文件
+    with open(output_file, "w") as output_handle:
+        SeqIO.write(merged_sequences, output_handle, "fasta")
+
+def main():
+    # 使用argparse来解析命令行参数
+    parser = argparse.ArgumentParser(description="Merge sequences from a FASTA file using 200 'N's until 10Mb")
+    parser.add_argument("-f", "--fasta", required=True, help="Input FASTA file")
+    parser.add_argument("-i", "--fai", required=True, help="Input FAI index file")
+    parser.add_argument("-o", "--output", required=True, help="Output file for merged sequences")
+
+    args = parser.parse_args()
+
+    # 调用合并函数
+    merge_sequences(args.fasta, args.fai, args.output)
+
+if __name__ == "__main__":
+    main()
+
