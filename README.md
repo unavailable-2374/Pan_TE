@@ -35,45 +35,20 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
 - Unzip and copy all the models from "ClassifyTE_Models" directory into the folder **model** inside the root folder **ClassifyTE**
  
 ## Usage
+Parameters:
+   [General]
+    --genome <string>         Required. Genome file in FASTA format.
+    --ClassifyTE_dir <string> Provide path to ClassifyTE for classification.
+    --RM_dir <string>         Provide path to rmblastn for classification.
 
-    Usage:
-        perl $0 [options]
-    
-    For example:
-        perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir Your_Path_To_ClassifyTE --RM_dir Your_Path_To_rmblastn
-    
-    Parameters::
-    [General]
-    
-        --ref <string>     Required
-        genome file in fasta format.
-    
-        --ClassifyTE_dir <string>
-        Provide ClassifyTE's dir for run classification.
+[Other]
+    --list <string>           Default: NA. Path file for GFA, see gfa.list for format.
+    --out <string>            Default: current directory. The work directory.
+    -M <int>                  Memory limit (in MB), default: 0 (unlimited).
+    --flag <string>           PGGB or Minigraph-Cactus.
+    --cpu <int>               Default: 4. Number of threads, preferably in multiples of 4.
+    --fragment_size <int>     Default: 40000. Length for fragment.
+    --help|-h                 Display this help information.
 
-        --RM_dir <string>
-        Provide rmblastn's dir for run align.
-    
-    [other]
-        --list <string> default:NA
-        path file for GFA, see gfa.list for formate.
-    
-        --out <string>    default: .
-        the work dir.
-    
-        -M <int>    
-        memory limit (in MB) for the program, default 0; 0 for unlimitted;
-    
-        --flag <string>
-        PGGB or Minigraph-Cactus.
-    
-        --cpu <int>    default: 4
-        the number of threads, preferably in multiples of 4.
-    
-        --fragment_size <int>    default: 40000
-        the length for fragment.
-    
-        --help|-h Display this help info
-    
-    Version: 1.0.0
-    USAGE
+Version: 1.0.0
+USAGE
