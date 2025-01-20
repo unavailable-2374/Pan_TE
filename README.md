@@ -11,9 +11,10 @@ Design for linear or graph genome TE detection and annotation
 
     cd Pan_TE
     chomp 750 bin/*
-    export PATH=/YOUR/PATH/TO/bin >> ~/.bashrc //* like: export PATH=/public/home/soft/Pan_TE/bin >> ~/.bashrc
+    echo 'export PATH="/YOUR/PATH/TO/bin:$PATH"' >> ~/.bashrc //* like: echo 'export PATH=/public/home/soft/Pan_TE/bin:$PATH"' >> ~/.bashrc
     mamba env create -f env/pgta.yml
     ln -s /PATH/TO/miniconda3/envs/PGTA/bin/x86_64-conda-linux-gnu-g++ /PATH/TO/miniconda3/envs/PGTA/bin/g++
+    export PERL5LIB=/home/tool/Pan_TE/share:/home/tool/miniconda3/envs/PGTA/share/RepeatMasker:$PERL5LIB
     conda activate PGTA
 
 ### [Look4LTRs](https://github.com/BioinformaticsToolsmith/Look4LTRs) intallation section:
@@ -35,42 +36,24 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
 - Unzip and copy all the models from "ClassifyTE_Models" directory into the folder **model** inside the root folder **ClassifyTE**
  
 ## Usage
-
     Usage:
-        perl $0 [options]
+    perl $0 [options]
+
+    Example:
+        perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir Your_Path_To_ClassifyTE 
     
-    For example:
-        perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir Your_Path_To_ClassifyTE
-    
-    Parameters::
+    Parameters:
     [General]
+        --genome <string>         Required. Genome file in FASTA format.
+        --ClassifyTE_dir <string> Provide path to ClassifyTE for classification.
     
-        --ref <string>     Required
-        genome file in fasta format.
-    
-        --ClassifyTE_dir <string>
-        Provide ClassifyTE's dir for run classification.
-    
-    [other]
-        --list <string> default:NA
-        path file for GFA, see gfa.list for formate.
-    
-        --out <string>    default: .
-        the work dir.
-    
-        -M <int>    
-        memory limit (in MB) for the program, default 0; 0 for unlimitted;
-    
-        --flag <string>
-        PGGB or Minigraph-Cactus.
-    
-        --cpu <int>    default: 4
-        the number of threads, preferably in multiples of 4.
-    
-        --fragment_size <int>    default: 40000
-        the length for fragment.
-    
-        --help|-h Display this help info
+    [Other]
+        --D <string>           Default: NA. Path for VCF, see gfa.list for format.
+        --out <string>            Default: current directory. The work directory.
+        -M <int>                  Memory limit (in MB), default: 0 (unlimited).
+        --cpu <int>               Default: 4. Number of threads, preferably in multiples of 4.
+        --fragment_size <int>     Default: 40000. Length for fragment.
+        --help|-h                 Display this help information.
     
     Version: 1.0.0
     USAGE
