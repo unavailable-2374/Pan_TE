@@ -10,7 +10,7 @@ Design for linear or graph genome TE detection and annotation
 ### 2.Install:
 
     cd Pan_TE
-    chomp 750 bin/*
+    chmod 750 bin/*
     echo 'export PATH="/YOUR/PATH/TO/bin:$PATH"' >> ~/.bashrc //* like: echo 'export PATH=/public/home/soft/Pan_TE/bin:$PATH"' >> ~/.bashrc
     mamba env create -f env/pgta.yml
     ln -s /PATH/TO/miniconda3/envs/PGTA/bin/x86_64-conda-linux-gnu-g++ /PATH/TO/miniconda3/envs/PGTA/bin/g++
