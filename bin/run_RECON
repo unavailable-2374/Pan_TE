@@ -1,0 +1,217 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use File::Path qw(make_path remove_tree);
+use File::Spec;
+use Cwd qw(getcwd);
+use constant {
+    MIN_THREADS => 1,
+    DEFAULT_EVALUE => '1e-5',
+    BLAST_DB_TYPE => 'nucl'
+};
+
+die "Usage: $0 round_num threads genome_file genome_size batch_size rm_dir\n"
+    unless @ARGV == 6;
+
+my ($round_num, $threads, $genome_file, $genome_size, $batch_size, $rm_dir) = @ARGV;
+
+die "Round number must be positive\n" unless $round_num > 0;
+die "Threads must be at least " . MIN_THREADS . "\n" unless $threads >= MIN_THREADS;
+die "Genome file $genome_file not found\n" unless -f $genome_file;
+die "Invalid genome size\n" unless $genome_size =~ /^\d+$/;
+die "Invalid batch size\n" unless $batch_size =~ /^\d+$/;
+die "RM directory $rm_dir not found\n" unless -f $rm_dir;
+
+my $tmp_dir = "round-$round_num";
+chdir $tmp_dir or die "Cannot change to directory $tmp_dir: $!\n";
+
+my $times = int($genome_size) / int($batch_size);
+my $cpu_threads = int($threads/4);
+$cpu_threads = MIN_THREADS if $cpu_threads < MIN_THREADS;
+
+process_repeat_masker($genome_file, $cpu_threads, $times, $batch_size);
+process_blast_db($threads);
+run_recon_pipeline();
+build_final_output($threads, $rm_dir);
+
+my $ok_file = "../round-${round_num}.ok";
+open(my $fh_ok, '>', $ok_file) or die "Cannot create $ok_file: $!\n";
+close $fh_ok;
+
+exit 0;
+
+sub process_repeat_masker {
+    my ($genome_file, $cpu_threads, $times, $batch_size) = @_;
+    
+    return if -e "repeat/tmp.fa.tbl";
+    
+    run_cmd("sample_for_genome $genome_file.fai out.bed $times $batch_size");
+    run_cmd("seqtk subseq $genome_file out.bed > tmp.fa");
+    
+    system("cat ../lib.fa > lib.fa") == 0 
+        or die "Failed to create initial lib.fa\n";
+    
+    if($round_num > 1) {
+        for(my $i = 1; $i < $round_num; $i++) {
+            run_cmd("cat ../round-$i/consensi.fa >> lib.fa");
+        }
+    }
+    
+    # Run RepeatMasker
+    run_cmd("RepeatMasker -lib lib.fa -e rmblast -lcambig -dir repeat " . 
+            "-pa $cpu_threads -q tmp.fa -div 10");
+}
+
+sub process_blast_db {
+    my ($threads) = @_;
+    return if -e "msp.out";
+    
+    my %id_mapping = load_translation_table();
+    
+    process_masked_file(\%id_mapping);
+    
+    run_cmd("makeblastdb -in DB.fa -dbtype " . BLAST_DB_TYPE . 
+            " -parse_seqids -out DB");
+    run_cmd("blastn -query DB.fa -out recon.tbl -db DB -outfmt 6 " .
+            "-evalue " . DEFAULT_EVALUE . " -num_threads $threads");
+    run_cmd("Tbl2Msp recon.tbl > msp.out");
+    
+    create_seq_name_list();
+}
+
+sub run_recon_pipeline {
+    for my $dir ('images', 'summary') {
+        make_path($dir) unless -d $dir;
+    }
+    
+    run_cmd("imagespread seq_name.list msp.out");
+    move_gmon("imagespread");
+    
+    run_cmd("sort -k 3,3 -k 4n,4n -k 5nr,5nr images/spread1 > images/images_sorted");
+    unlink glob "images/spread*";
+    
+    process_element_definition();
+    
+    process_element_redefinition();
+    
+    process_edge_redefinition();
+    
+    run_cmd("famdef seq_name.list");
+    move_gmon("famdef");
+}
+
+sub process_element_definition {
+    remove_tree('ele_def_res');
+    make_path('ele_def_res');
+    
+    run_cmd("eledef seq_name.list msp.out single");
+    move_gmon("eledef");
+}
+
+sub process_element_redefinition {
+    remove_tree('ele_redef_res');
+    make_path('ele_redef_res');
+    
+    create_symlinks('ele_def_res', 'ele_redef_res');
+    run_cmd("eleredef seq_name.list");
+    move_gmon("eleredef");
+    remove_symlinks();
+}
+
+sub process_edge_redefinition {
+    remove_tree('edge_redef_res');
+    make_path('edge_redef_res');
+    
+    create_symlinks('ele_redef_res', 'edge_redef_res');
+    run_cmd("edgeredef seq_name.list");
+    move_gmon("edgeredef");
+    remove_symlinks();
+    
+    create_symlinks('edge_redef_res', undef);
+}
+
+sub load_translation_table {
+    my %id_mapping;
+    open(my $fh_trans, '<', "../../genome/genome.fa.translation") 
+        or die "Cannot open translation file: $!\n";
+    while(<$fh_trans>) {
+        chomp;
+        my ($key, $value) = split(/\t/);
+        $id_mapping{$key} = $value;
+    }
+    close $fh_trans;
+    return %id_mapping;
+}
+
+sub process_masked_file {
+    my ($id_mapping_ref) = @_;
+    
+    open(my $fh_in, '<', "repeat/tmp.fa.masked") 
+        or die "Cannot open tmp.fa.masked: $!\n";
+    open(my $fh_out, '>', "DB.fa") 
+        or die "Cannot open DB.fa: $!\n";
+    
+    my $counter = 1;
+    while (my $line = <$fh_in>) {
+        chomp $line;
+        if($line =~ /^>/) {
+            $line =~ s/^>//;
+            my ($id) = split(/:/, $line);
+            print $fh_out ">gi|${counter} gi|" . 
+                  $id_mapping_ref->{$id} . ":" . 
+                  (split(/:/, $line, 2))[1] . "\n";
+            $counter++;
+        } else {
+            print $fh_out "$line\n";
+        }
+    }
+    close $fh_in;
+    close $fh_out;
+}
+
+sub create_seq_name_list {
+    run_cmd("grep '>' DB.fa | wc -l > seq_name.list");
+    open(my $in, '<', 'DB.fa') or die "Can't open DB.fa: $!";
+open(my $out, '>>', 'seq_name.list') or die "Can't open seq_name.list: $!";
+
+my @headers;
+while (<$in>) {
+    if (/^>(.*)/) {
+        push @headers, (split /\s+/, $1)[0];
+    }
+}
+print $out "$_\n" for sort @headers;
+
+close $in;
+close $out;
+}
+
+sub create_symlinks {
+    my ($src, $dst) = @_;
+    unlink('tmp', 'tmp2');
+    symlink($src, 'tmp') or die "Cannot create symlink tmp: $!\n";
+    symlink($dst, 'tmp2') or die "Cannot create symlink tmp2: $!\n" if $dst;
+}
+
+sub remove_symlinks {
+    unlink('tmp', 'tmp2');
+}
+
+sub move_gmon {
+    my $prefix = shift;
+    if (-f "gmon.out") {
+        rename("gmon.out", "${prefix}-gmon.out") 
+            or die "Cannot rename gmon.out: $!\n";
+    }
+}
+
+sub build_final_output {
+    my ($threads, $rm_dir) = @_;
+    run_cmd("build_for_RECON ./ ../../genome/genome.fa $threads $rm_dir");
+}
+
+sub run_cmd {
+    my $cmd = shift;
+    $cmd =~ s/[`;\$]/\\$&/g;
+    system($cmd) == 0 or die "Failed to execute: $cmd\n";
+}

@@ -1,0 +1,143 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use Cwd;
+use POSIX qw(:sys_wait_h ceil floor);
+
+my $TmpDir = $ARGV[0];
+my $sampleFastaFile = "DB.fa";
+my $genomeDB = $ARGV[1];
+my $threads = $ARGV[2];
+my $rsSampleSize = $ARGV[3];
+my $DUSTMASKER_PRGM = "dustmasker";
+my $cmdString;
+
+my @filestat = stat ($genomeDB);
+chdir $ARGV[5];
+mkdir "RepeatScout" unless -e "RepeatScout";
+chdir "RepeatScout";
+mkdir "tmp" unless -e "tmp";
+unless(-e "raw_lib.fa"){
+if($rsSampleSize eq "all"){
+  $sampleFastaFile = $genomeDB;
+}else{
+  $cmdString="sample_for_genome $genomeDB.fai out.bed 12000 50001";
+  system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+  $cmdString="seqtk subseq ../genome/genome.fa out.bed > $sampleFastaFile";
+  system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+}
+&runRepeatScout(
+  workDir     => $TmpDir,
+  trfPrgm     => "trf",
+  dustmskPrgm => $DUSTMASKER_PRGM,
+  fastaFile   => $sampleFastaFile,
+  seqSize     => $filestat[7]
+);
+if($rsSampleSize eq "all"){
+	`mv $genomeDB.rscons.filtered raw_lib.fa`;
+}else{
+	`mv DB.fa.rscons.filtered raw_lib.fa`;
+}print "111\n";
+}
+$cmdString="Refiner_for_RS $TmpDir consensi.fa $genomeDB consensi.stk $threads $ARGV[4] $ARGV[5]";
+system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+
+sub runRepeatScout {
+  my %parameters = @_;
+
+  die "runRepeatScout() missing trfPrgm parameter!\n"
+      if ( !defined $parameters{'trfPrgm'} );
+  my $TRF_PRGM = $parameters{'trfPrgm'};
+
+  die "runRepeatScout() missing dustmskPrgm parameter!\n"
+      if ( !defined $parameters{'dustmskPrgm'} );
+  my $DUSTMASKER_PRGM = $parameters{'dustmskPrgm'};
+
+  die "runRepeatScout() missing workDir parameter!\n"
+      if ( !defined $parameters{'workDir'} );
+  my $tmpDir = $parameters{'workDir'};
+
+  die "runRepeatScout() missing fastaFile parameter!\n"
+      if ( !defined $parameters{'fastaFile'} );
+  my $fastaFile = $parameters{'fastaFile'};
+
+  die "runRepeatScout() missing seqSize parameter!\n"
+      if ( !defined $parameters{'seqSize'} );
+  my $seqSize = $parameters{'seqSize'};
+
+  my $origDir = getcwd();
+
+  my $lmerSize = ceil( ( log( $seqSize ) / log( 4 ) ) + 1 );
+
+  print "   - RepeatScout: Running build_lmer_table ( l = $lmerSize )..\n";
+  my $cmd ="build_lmer_table -l $lmerSize -sequence "
+      . "$fastaFile -freq $fastaFile.lfreq 2>&1 > repeatscout.log";
+  `$cmd`;
+  if ( $? ) { die "build_lmer_table failed. Exit code $?\n"; }
+
+  print "   - RepeatScout: Running RepeatScout..";
+  $cmd =
+        "RepeatScout -l $lmerSize -sequence $fastaFile"
+      . " -tandemdist 500 -output $fastaFile.rscons -freq $fastaFile.lfreq "
+      . "-stopafter 100 2>&1 >> repeatscout.log";
+
+  `$cmd`;
+  if ( $? || -s "repeatscout.log" ) {
+    die
+"RepeatScout failed. Exit code $?.\n  Check $tmpDir/repeatscout.log for more details.\n";
+  }
+
+  if ( -s "$fastaFile.rscons" ) {
+    my $rawFams = 0;
+    open IN, "<$fastaFile.rscons"
+        or die "Could not open $tmpDir/$fastaFile.rscon for reading!\n";
+    while ( <IN> ) {
+      $rawFams++ if ( /^>/ );
+    }
+    close IN;
+    print " : $rawFams raw families identified\n";
+
+    print "   - RepeatScout: Running filtering stage..";
+    $ENV{'TRF_COMMAND'}        = $TRF_PRGM;
+    $ENV{'DUSTMASKER_COMMAND'} = $DUSTMASKER_PRGM;
+    $cmd                       =
+          "filter-stage-1.prl $fastaFile.rscons > "
+        . "$fastaFile.rscons.filtered 2>> filter-stage-1.log";
+    `$cmd`;
+
+    my $finalFams = 0;
+    if ( -s "$fastaFile.rscons.filtered" ) {
+      open IN, "<$fastaFile.rscons.filtered"
+          or die
+          "Could not open $tmpDir/$fastaFile.rscon.filtered for reading!\n";
+          while ( <IN> ) {
+        $finalFams++ if ( /^>/ );
+      }
+      close IN;
+    }
+    else {
+      if ( -s "filter-stage-1.log" ) {
+        open IN, "<filter-stage-1.log"
+            or die "Could not open $tmpDir/filter-stage-1.log for reading!\n";
+        my $errMsg = "";
+        while ( <IN> ) {
+          if ( /ERROR/ || /Can\'t locate/ || /BEGIN failed/ ) {
+            $errMsg .= $_;
+          }
+        }
+        close IN;
+        if ( $errMsg ne "" ) {
+          die "RepeatScout filter-stage-1 failed:\n$errMsg"
+              . "Please see $tmpDir/filter-stage-1.log for details.\n";
+        }
+      }
+    }
+    print " $finalFams families remaining\n";
+  }
+  else {
+    print " : no families identified\n";
+  }
+
+  return;
+}

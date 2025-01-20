@@ -1,0 +1,45 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+open(IN, $ARGV[0]);
+open(OUT, ">$ARGV[1]");
+
+my %hash;
+my %record;
+my $sum = 0;
+
+my $sample_times = $ARGV[2];
+my $sample_length = $ARGV[3];
+
+while (<IN>) {
+    chomp;
+    my @arr = split(/\t/);
+    if ($arr[1] * 0.8 < $sample_length) {
+        next;
+    }
+    $sum += $arr[1];
+    $hash{$arr[0]} = [$sum - $arr[1] + 1, $sum];  # 存储每个片段的全局起始和结束位置
+    $record{$arr[0]} = $arr[1];
+}
+
+my $used = 0;
+
+for (my $i = $sample_times; $i > 0; $i--) {
+    my $region = int($sum / $i);
+    my $begin = int(rand($region - $sample_length));
+    my $start = $begin + $used;
+    my $end = $start + $sample_length - 1;
+
+    foreach my $key (sort keys %hash) {
+        my ($chr_start, $chr_end) = @{$hash{$key}};
+        if ($start >= $chr_start && $end <= $chr_end) {
+			my $rel_start = $start - $chr_start + 1;
+            my $rel_end = $end - $chr_start + 1;
+            print OUT "$key\t$rel_start\t$rel_end\n";
+            last;  # 完成当前采样后退出循环
+        }
+    }
+    $used += $region;
+    $sum -= $region;
+}

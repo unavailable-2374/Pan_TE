@@ -1,0 +1,24 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+open(IN,$ARGV[0]) or die "cannot open due to $!\n";
+
+my $score;
+my %hash;
+
+while (<IN>) {
+    chomp;
+    my @arr=split(/\t/);
+    $arr[1] = "gi|".$arr[1];
+    if($arr[0] eq $arr[1]){next;}
+    my $key1 = $arr[0].$arr[1].$arr[6].$arr[7].$arr[8].$arr[9];
+    my $key2 = $arr[1].$arr[0].$arr[8].$arr[9].$arr[6].$arr[7];
+	if(exists $hash{$key1} || exists $hash{$key2}){next;}
+	else{$hash{$key1}="";}
+    $score = $arr[11];
+    if($arr[11] =~ /(\S+)(e|E)\+(\d+)/){
+        $score = $1 * exp($3*log(10));
+    }
+        printf("%06d %03d %05d %05d %s %05d %05d %s \n", $score,$arr[2],$arr[6],$arr[7],$arr[0],$arr[8],$arr[9],$arr[1]);
+}close IN;

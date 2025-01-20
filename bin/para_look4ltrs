@@ -1,0 +1,87 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Cwd;
+
+# 检查命令行参数
+my $fasta_file = $ARGV[0];
+unless ($fasta_file) {
+    die "Usage: $0 <fasta_file>\n";
+}
+
+my $i=0;
+chdir $ARGV[2];
+chdir "look4ltrs"; 
+# 打开FASTA文件
+open(my $fh, '<', "$fasta_file") or die "Cannot open file $fasta_file: $!";
+
+my $out_fh; # 文件句柄用于输出文件
+my $length = 0;
+while (my $line = <$fh>) {
+    chomp $line;
+	
+    # 如果行以大于号开头，表明是新的染色体
+    if ($line =~ /^>(\S+)/) {
+        my $chromosome = $1;
+
+        # 关闭之前染色体的文件句柄（如果有的话）
+        close($out_fh) if $out_fh;
+		$i++;
+        mkdir "chr$i" unless -e "chr$i";
+        # 为新染色体打开新的输出文件
+        open($out_fh, '>>', "chr$i/chr$i.fasta") or die "Cannot open file $chromosome.fasta: $!";
+        print $out_fh "$line\n";
+    } else {
+		#$length += length($line);
+		#if($length > 20000000){
+			#$i++;
+		#	$length = 0;
+		#}
+        # 否则，将序列行写入当前染色体的文件
+        print $out_fh "$line\n";
+    }
+}
+
+close($fh);
+close($out_fh) if $out_fh;
+
+open(COMD,">command.list") or die "Cannot open file command.list: $!";
+
+my $current_dir = getcwd();
+
+my $threads;
+my $cmdString;
+
+if($i>$ARGV[1]){
+	$threads = 1;
+	$cmdString="ParaFly -c command.list -CPU $ARGV[1] > /dev/null";
+}else{
+	$threads = int($ARGV[1]/$i);
+	$cmdString="ParaFly -c command.list -CPU $i > /dev/null";
+}
+
+for(my $j = 1;$j<=$i;$j++){
+	my $timeout = 3 * 60 * 60;
+	$fasta_file =~ s/\/genome.fa//;
+	print COMD "timeout $timeout look4ltrs -t $fasta_file --fasta $current_dir/chr$j --out $current_dir/chr$j --parallel $threads >> ltr.stat\n";
+}
+unless ( -e "raw.fa"){
+   system("$cmdString") ;
+for(my $j = 1;$j<=$i;$j++){
+	`cat $current_dir/chr$j/Bed/*.bed >> $current_dir/genome.bed`;
+	`sort -k1,1 -k2,2n $current_dir/genome.bed > $current_dir/genome.sorted.bed`;
+	`clean_list $current_dir/genome.sorted.bed $current_dir/genome.cleaned.bed`;
+	`seqtk subseq $fasta_file/genome.fa $current_dir/genome.cleaned.bed > $current_dir/LTR.fa`;
+}
+
+`filter-stage-1.prl LTR.fa > LTR.fa.filter`;
+$cmdString="minimap2 -t $ARGV[1] -n 1 -p 0.5 -B 2 -O 4,12 -z 300,200 -a ../genome/genome.fa LTR.fa.filter > LTR.sam";
+system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+$cmdString="check.py > list.txt";
+system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+$cmdString="seqtk subseq LTR.fa.filter list.txt > raw.fa ";
+system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+}
+$cmdString="cd-hit-est -i raw.fa -o consensi.fa -c 0.8 -aS 0.8 -M 0 -d 0 -T 0 -n 5 -g 1 -b 500 -G 0 -A 80 -l 30 > cd.log";
+system("$cmdString") == 0 or die "failed to execute: $cmdString\n";

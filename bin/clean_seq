@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+import sys
+
+def replace_degenerate_symbols(input_file, output_file):
+    # 定义简并符号
+    degenerate_symbols = set('WRMKYSHBVDXNwrmkyshbvd')
+
+    # 读取输入文件
+    with open(input_file, 'r') as infile:
+        sequence = infile.read()
+
+    # 将简并符号替换为 'N'
+    converted_sequence = ''.join('C' if base in degenerate_symbols else base for base in sequence)
+
+    # 将转换后的序列写入输出文件
+    with open(output_file, 'w') as outfile:
+        outfile.write(converted_sequence)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python script.py <input_file> <output_file>")
+        sys.exit(1)
+
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+
+    replace_degenerate_symbols(input_file, output_file)

@@ -1,0 +1,17 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+open(IN,$ARGV[1]);
+open(OUT,">$ARGV[2]");
+
+my $num = 0;
+while (<IN>) {
+    chomp;
+    if(/>/){
+        $num++;
+        $num = sprintf("%08d", $num);
+        print OUT ">".$ARGV[0]."_".$num."#Unknown\n";
+    }else{print OUT $_."\n";}
+}

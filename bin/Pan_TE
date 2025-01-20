@@ -1,0 +1,513 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Cwd qw(abs_path getcwd);
+use Getopt::Long;
+use POSIX qw(:sys_wait_h ceil floor);
+use File::Basename;
+use File::Path qw(make_path remove_tree);
+use Parallel::ForkManager;
+use Time::HiRes qw(time);
+
+use constant {
+    MIN_CPU => 4,
+    DEFAULT_FRAGMENT_SIZE => 40000,
+    MIN_CORE_LENGTH => 30,
+    CORE_UNIQ_LENGTH => 0.4,
+    TIMEOUT_LTR => 4 * 60 * 60,
+};
+
+our $VERSION = '1.0.0';
+
+use constant {
+    HUGE_GENOME_SIZE   => 10_000_000_000,
+    BIG_GENOME_SIZE    => 5_000_000_000,
+    MEDIUM_GENOME_SIZE => 1_000_000_000,
+    SMALL_GENOME_SIZE  => 500_000_000,
+    TINY_GENOME_SIZE   => 300_000_000,
+    MAX_SAMPLE_SIZE    => 5_000_000_000,  # 5Gb maximum sampling size
+};
+
+my %GENOME_CONFIGS = (
+    'huge' => {
+        rounds => 1,
+        sample_percent => 30,
+        batch_size => 200000
+    },
+    'big' => {
+        rounds => 1,
+        sample_percent => 60,
+        batch_size => 200000
+    },
+    'medium' => {
+        rounds => 1,
+        sample_percent => 70,
+        batch_size => 100000
+    },
+    'small' => {
+        rounds => 1,
+        sample_percent => 80,
+        batch_size => 80000
+    },
+    'tiny' => {
+        rounds => 1,
+        sample_percent => 90,
+        batch_size => 40000
+    }
+);
+
+my $script_dir = dirname(abs_path($0));
+$script_dir =~ s{/bin$}{};
+
+my %opts = parse_arguments();
+
+my $run_id = int(rand(9999999)) + 1;
+$opts{out} ||= "panTE_$run_id";
+$opts{cpu} ||= MIN_CPU;
+$opts{mem} ||= 0;
+$opts{fragment_size} ||= DEFAULT_FRAGMENT_SIZE;
+
+die "Please input either genome or list, not both\n"
+    if $opts{genome} && $opts{list};
+die "No input provided. Use --genome or --list\n"
+    if !$opts{genome} && !$opts{list};
+
+my $current_dir = getcwd();
+$opts{genome} = "$current_dir/$opts{genome}" if $opts{genome};
+
+make_path($opts{out}) unless -e $opts{out};
+chdir $opts{out} or die "Cannot change to directory $opts{out}: $!\n";
+
+my @file_stats = stat($opts{genome} || $opts{list});
+
+process_genome(\%opts, \@file_stats) if $opts{genome};
+process_graph_genome(\%opts, \@file_stats) if $opts{list};
+$current_dir = "$current_dir/$opts{out}";
+$opts{genome} = "$current_dir/genome/genome.fa";
+
+my $success;
+
+print STDERR "Running Step 2 (LTR) and Step 3 (RepeatScout) in parallel...\n";
+if (-e "LTR.ok" && -e "RepeatScout.ok") {
+    print STDERR "Steps 2 and 3 were previously completed successfully, skipping...\n";
+}
+else {
+    my $success = run_parallel_processes(\%opts, $current_dir, \@file_stats);
+    unless ($success) {
+        die "ERROR: Steps 2 and 3 did not complete successfully. Please check the logs.\n";
+    }
+}
+
+print STDERR "Steps 2 and 3 completed successfully. Proceeding to Step 4...\n";
+
+run_recon(\%opts, \@file_stats, $current_dir);
+
+combine_results(\%opts);
+
+print STDERR "\n============================================\n";
+print STDERR "Finished running Pan_TE (" . localtime() . ")\n";
+
+sub parse_arguments {
+    my %opts;
+    my $help;
+
+    GetOptions(
+        "help|h" => \$help,
+        "genome=s" => \$opts{genome},
+        "cpu=i" => \$opts{cpu},
+        "out=s" => \$opts{out},
+        "list=s" => \$opts{list},
+        "M=i" => \$opts{mem},
+        "ClassifyTE_dir=s" => \$opts{model_dir},
+        "RM_dir=s" => \$opts{rm_dir},
+        "flag=s" => \$opts{style},
+        "fragment_size=i" => \$opts{fragment_size}
+    ) or usage();
+
+    usage() if $help;
+    return %opts;
+}
+
+sub usage {
+    print <<"END_USAGE";
+Usage:
+    perl $0 [options]
+
+Example:
+    perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir /path/to/ClassifyTE --RM_dir /path/to/rmblastn
+
+Parameters:
+[General]
+    --genome <string>         Required. Genome file in FASTA format.
+    --ClassifyTE_dir <string> Path to ClassifyTE for classification.
+    --RM_dir <string>         Path to rmblastn for classification.
+
+[Other]
+    --list <string>           Default: NA. Path file for GFA.
+    --out <string>           Default: current directory. Work directory.
+    -M <int>                 Memory limit (MB), default: 0 (unlimited).
+    --flag <string>          PGGB or Minigraph-Cactus.
+    --cpu <int>             Default: 4. Number of threads.
+    --fragment_size <int>    Default: 40000. Fragment length.
+    --help|-h               Display this help.
+
+Version: $VERSION
+END_USAGE
+    exit(1);
+}
+sub process_genome {
+    my ($opts, $file_stats) = @_;
+
+    print STDERR "\n============================================\n";
+    print STDERR "Running Genome Model $opts->{out} (" . localtime() . ")\n";
+
+    return if -e "genome.ok";
+
+    print STDERR "Step 1: Preparing Genome $opts->{genome} (" . localtime() . ")\n";
+    make_path("genome") unless -e "genome";
+
+    run_cmd("tr 'a-z' 'A-Z' < $opts->{genome} > tmp.fa");
+    run_cmd("clean_seq tmp.fa genome/genome.fa") unless -e "genome/genome.fa";
+    run_cmd("samtools faidx genome/genome.fa");
+    run_cmd("index genome/genome");
+    unlink("tmp.fa");
+    create_checkpoint("genome.ok");
+}
+
+sub process_graph_genome {
+    my ($opts, $file_stats) = @_;
+
+    print STDERR "\n============================================\n";
+    print STDERR "Running Graph-Genome Model $opts->{out} (" . localtime() . ")\n";
+
+    return if -e "genome.ok";
+
+    my $size = $file_stats->[7];
+    my ($min_length, $max_length) = determine_length_params($size);
+
+    make_path("genome") unless -e "genome";
+    chdir "genome" or die "Cannot change to genome directory: $!\n";
+
+    my $cmd = $opts->{style} eq "PGGB"
+        ? "Process_For_PGGB"
+        : "Process_For_MC";
+
+    run_cmd("$cmd $opts->{list} ./ $min_length $max_length " .
+            MIN_CORE_LENGTH . " $min_length " . CORE_UNIQ_LENGTH .
+            " $opts->{cpu} &> decode_for_" . lc($opts->{style}) . ".log");
+
+    run_cmd("index genome");
+    create_checkpoint("../genome.ok");
+}
+
+sub run_parallel_processes {
+    my ($opts, $current_dir, $file_stats) = @_;
+    
+    my $pm = Parallel::ForkManager->new(2);
+    my %process_status = (
+        'LTR' => 0,
+        'RepeatScout' => 0
+    );
+    
+    # Setup completion tracking
+    $pm->run_on_finish(sub {
+        my ($pid, $exit_code, $id) = @_;
+        if ($exit_code == 0) {
+            $process_status{$id} = 1;
+            print STDERR "$id completed successfully\n";
+        } else {
+            print STDERR "WARNING: $id failed with exit code $exit_code\n";
+        }
+    });
+    
+    my @processes = (
+        {
+            name => 'LTR',
+            checkpoint => 'LTR.ok',
+            run => sub {
+                process_ltrs($opts, $current_dir, $opts->{verbose});
+            }
+        },
+        {
+            name => 'RepeatScout',
+            checkpoint => 'RepeatScout.ok',
+            run => sub {
+                process_repeatscout($opts, $current_dir, $file_stats, $opts->{verbose});
+            }
+        }
+    );
+    
+    # Run processes in parallel
+    foreach my $process (@processes) {
+        next if -e $process->{checkpoint};
+        
+        my $pid = $pm->start($process->{name});
+        if ($pid == 0) { # Child process
+            print STDERR "Starting $process->{name} process\n";
+            my $start_time = time();
+            
+            eval {
+                $process->{run}->();
+            };
+            
+            if ($@) {
+                print STDERR "Error in $process->{name}: $@\n";
+                $pm->finish(1);
+            }
+            
+            my $duration = time() - $start_time;
+            printf STDERR "Completed %s in %.2f seconds\n", $process->{name}, $duration;
+            $pm->finish(0);
+        }
+    }
+     $pm->wait_all_children;
+
+    # Verify both processes completed successfully
+    my $all_completed = 1;
+    foreach my $process (@processes) {
+        unless (-e $process->{checkpoint}) {
+            print STDERR "ERROR: $process->{name} process did not complete successfully\n";
+            $all_completed = 0;
+        }
+    }
+
+    # Double-check the process status
+    foreach my $proc (keys %process_status) {
+        unless ($process_status{$proc}) {
+            print STDERR "ERROR: $proc did not finish successfully according to status tracking\n";
+            $all_completed = 0;
+        }
+    }
+
+    return $all_completed;
+}
+
+sub process_ltrs {
+    my ($opts, $current_dir, $verbose) = @_;
+    print STDERR "Step 2: Looking for LTRs (" . localtime() . ")\n";
+    
+    # Create LTR directory
+    my $ltr_dir = "$current_dir/look4ltrs";
+    make_path($ltr_dir) unless -e $ltr_dir;
+    chdir $ltr_dir or die "Cannot change to look4ltrs directory: $!\n";
+    
+    # Run LTR command
+    my $cmd = $opts->{list}
+    ? "timeout " . TIMEOUT_LTR . " look4ltrs --fasta $opts->{genome} --out ./ --parallel $opts->{cpu}"
+        : "para_look4ltrs $opts->{genome} $opts->{cpu} $current_dir";
+
+    print STDERR "Starting para_look4ltrs at " . localtime() . "\n";
+    run_cmd($cmd . " &> LTR_detect.log", $verbose);
+    
+    # Wait and check for para_look4ltrs completion
+    my $max_wait = 7200;  # 2 hour timeout
+    my $waited = 0;
+    while (!-e "$ltr_dir/consensi.fa") {
+        if ($waited >= $max_wait) {
+            die "ERROR: Timeout waiting for para_look4ltrs to create consensi.fa\n";
+        }
+        sleep 60; # Check every minute
+        $waited += 60;
+    }
+    
+    # Verify the file is not empty
+    unless (-s "$ltr_dir/consensi.fa") {
+        die "ERROR: para_look4ltrs completed but consensi.fa is empty\n";
+    }
+    
+    print STDERR "para_look4ltrs completed successfully at " . localtime() . "\n";
+    create_checkpoint("$current_dir/LTR.ok");
+}
+
+sub process_repeatscout {
+    my ($opts, $current_dir, $file_stats, $verbose) = @_;
+    print STDERR "Step 3: Running RepeatScout (" . localtime() . ")\n";
+
+    # Create RepeatScout directory if it doesn't exist
+    my $rs_dir = "$current_dir/RepeatScout";
+    make_path($rs_dir) unless -e $rs_dir;
+    make_path("$rs_dir/tmp") unless -e "$rs_dir/tmp";
+
+    my $size_param = $file_stats->[7] > 500_000_000 ? "400" : "all";
+    my $cmd = "build_RS $rs_dir/tmp $opts->{genome} " .
+              "$opts->{cpu} $size_param $opts->{rm_dir} $current_dir";
+
+    print STDERR "Starting build_RS at " . localtime() . "\n";
+    run_cmd($cmd . " &> $rs_dir/build.log", $verbose);
+
+    # Wait and check for build_RS completion
+    my $max_wait = 60000; # 10 minutes timeout
+    my $waited = 0;
+    while (!-e "$rs_dir/consensi.fa") {
+        if ($waited >= $max_wait) {
+            die "ERROR: Timeout waiting for build_RS to create consensi.fa\n";
+        }
+        sleep 60; # Check every minute
+        $waited += 60;
+    }
+
+    # Verify the file is not empty
+    unless (-s "$rs_dir/consensi.fa") {
+        die "ERROR: build_RS completed but consensi.fa is empty\n";
+    }
+
+    print STDERR "build_RS completed successfully at " . localtime() . "\n";
+    create_checkpoint("$current_dir/RepeatScout.ok");
+}
+
+sub run_recon {
+    my ($opts, $file_stats, $current_dir) = @_;
+
+    print STDERR "Step 4: Running RECON (" . localtime() . ")\n";
+    return if -e "RECON.ok";
+
+    make_path("RECON") unless -e "RECON";
+    chdir "RECON" or die "Cannot change to RECON directory: $!\n";
+
+    prepare_library();
+    process_recon_rounds($opts, $file_stats);
+
+    run_cmd("cp round-1/consensi.fa ./");
+    chdir "../";
+    create_checkpoint("RECON.ok");
+}
+
+sub prepare_library {
+    run_cmd("cat ../RepeatScout/consensi.fa ../look4ltrs/consensi.fa > raw.fa");
+    run_cmd("cd-hit-est -i raw.fa -o lib.fa -c 0.8 -aS 0.8 -M 0 -d 0 " .
+            "-T 0 -n 5 -g 1 -b 500 -G 0 -A 80 -l 30 > cdhit.log")
+        unless -e "lib.fa";
+}
+
+sub process_recon_rounds {
+    my ($opts, $file_stats) = @_;
+    
+    my $genome_size = $file_stats->[7];
+    my $config = determine_genome_config($genome_size);
+    
+    print STDERR sprintf(
+        "Processing genome:\n" .
+        "  Size: %.2f Gb\n" .
+        "  Type: %s\n" .
+        "  Sampling Size: %.1f%% (%.2f Gb)\n" .
+        "  Batch size: %d\n",
+        $genome_size / 1_000_000_000,
+        $config->{type},
+        $config->{sample_percent},
+        $config->{sample_size}/ 1_000_000_000,
+        $config->{batch_size}
+    );
+
+    # Process single round
+    make_path("round-1") unless -e "round-1";
+    
+    run_cmd("run_RECON 1 $opts->{cpu} $opts->{genome} " .
+            "$config->{sample_size} $config->{batch_size} $opts->{rm_dir}");
+    
+    chdir "../";
+}
+
+sub combine_results {
+    my ($opts) = @_;
+
+    print STDERR "Step 5: Combining results (" . localtime() . ")\n";
+    return if -e "Combine.ok";
+
+    make_path("Combine") unless -e "Combine";
+    chdir "Combine" or die "Cannot change to Combine directory: $!\n";
+
+    run_cmd("cat ../RECON/lib.fa ../RECON/consensi.fa > raw_TEs.fa");
+    run_cmd("run_Classifier $opts->{model_dir} > classify.log");
+
+    create_checkpoint("Combine.ok");
+}
+
+sub determine_genome_config {
+    my ($size) = @_;
+    
+    my $config;
+    if ($size > HUGE_GENOME_SIZE) {
+        $config = {
+            type => 'huge',
+            %{$GENOME_CONFIGS{huge}}
+        };
+    }
+    elsif ($size > BIG_GENOME_SIZE) {
+        $config = {
+            type => 'big',
+            %{$GENOME_CONFIGS{big}}
+        };
+    }
+    elsif ($size > MEDIUM_GENOME_SIZE) {
+        $config = {
+            type => 'medium',
+            %{$GENOME_CONFIGS{medium}}
+        };
+    }
+    elsif ($size > SMALL_GENOME_SIZE) {
+        $config = {
+            type => 'small',
+            %{$GENOME_CONFIGS{small}}
+        };
+    }
+    else {
+        $config = {
+            type => 'tiny',
+            %{$GENOME_CONFIGS{tiny}}
+        };
+    }
+    
+    # Calculate actual sample size based on genome size and percentage
+    $config->{sample_size} = calculate_sample_size($size, $config->{sample_percent}, $config->{batch_size});
+    
+    return $config;
+}
+
+sub calculate_sample_size {
+    my ($genome_size, $sample_percent, $batch_size) = @_;
+    
+    # Calculate the raw sample size based on percentage
+    my $raw_sample_size = int($genome_size* ($sample_percent / 100 ));
+    
+    # Cap the sample size at MAX_SAMPLE_SIZE
+    my $final_sample_size = $raw_sample_size > MAX_SAMPLE_SIZE ? 
+                           MAX_SAMPLE_SIZE : $raw_sample_size;
+    
+    return $final_sample_size;
+}
+
+sub determine_length_params {
+    my ($size) = @_;
+
+    return (100000, 200000) if $size > 150000000;
+    return (80000, 200000)  if $size > 120000000;
+    return (50000, 100000)  if $size > 80000000;
+    return (40000, 80000);
+}
+
+sub run_cmd {
+    my ($cmd, $verbose) = @_;
+    print STDERR "Running command: $cmd\n" if $verbose;
+    
+    $cmd =~ s/[`;\$]/\\$&/g;  # Basic shell metacharacter escaping
+    
+    my $start_time = time();
+    system($cmd);
+    my $exit_code = $? >> 8;
+    my $duration = time() - $start_time;
+    
+    if ($exit_code != 0) {
+        die sprintf("Command failed (exit code %d): %s\nDuration: %.2f seconds\n", 
+                   $exit_code, $cmd, $duration);
+    }
+    
+    printf STDERR "Command completed in %.2f seconds\n", $duration if $verbose;
+    return $exit_code;
+}
+
+sub create_checkpoint {
+    my $file = shift;
+    open(my $fh, '>', $file) or die "Cannot create checkpoint file $file: $!\n";
+    close $fh;
+}
+

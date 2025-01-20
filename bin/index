@@ -1,0 +1,16 @@
+#!/usr/bin/perl
+use strict;
+
+open(IN,"$ARGV[0].fa");
+open(OUT,">$ARGV[0].fa.translation");
+
+my $i=1;
+
+while(<IN>){
+	chomp;
+	if(/>/){
+		s/>//;
+		print OUT $_."\t".$i."\n";
+		$i++;
+	}
+}

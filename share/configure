@@ -1,0 +1,521 @@
+#!/usr/bin/env perl 
+##---------------------------------------------------------------------------##
+##  File:
+##      @(#) configure
+##  Author:
+##      Robert Hubley <rhubley@systemsbiology.org>
+##  Description:
+##      A configuration utility for the RepeatMasker distribution.
+##
+#******************************************************************************
+#* Copyright (C) Institute for Systems Biology 2003-2019 Developed by
+#* Robert Hubley.
+#*
+#* This work is licensed under the Open Source License v2.1.  To view a copy
+#* of this license, visit http://www.opensource.org/licenses/osl-2.1.php or
+#* see the license.txt file contained in this distribution.
+#*
+###############################################################################
+
+=head1 NAME
+
+configure - Configure the RepeatMasker distribution
+
+=head1 SYNOPSIS
+
+  perl ./configure 
+
+=head1 DESCRIPTION
+
+  An installation script for the RepeatMasker distribution
+
+=head1 CONFIGURATION OVERRIDES
+
+=head1 SEE ALSO
+
+=over 4
+
+RepeatMasker
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2003-2019 Robert Hubley, Institute for Systems Biology
+
+=head1 AUTHOR
+
+Robert Hubley <rhubley@systemsbiology.org>
+
+=cut
+
+#
+# Module Dependence
+#
+use strict;
+use Config;
+use Cwd;
+use FindBin;
+use Getopt::Long;
+use Pod::Text;
+use lib $FindBin::Bin;
+use RepeatMaskerConfig;
+use POSIX qw(:sys_wait_h);
+
+# No output buffering
+$|=1;
+
+#
+# Release Version
+#
+my $version = $RepeatMaskerConfig::VERSION;
+
+#
+# First...make sure we are running in the same directory
+# as the script is located.  This avoids problems where
+# this script ends up in someones path and they run it
+# unqualified from another installation directory.
+#
+if ( getcwd() ne $FindBin::RealBin ) {
+  print "\n    The RepeatMasker configure script must be run from\n"
+      . "    inside the RepeatMasker installation directory:\n\n"
+      . "       $FindBin::RealBin\n\n"
+      . "    Perhaps this is not the \"configure\" you are looking for?\n\n";
+  exit;
+}
+
+#
+# Option processing
+#  e.g.
+#   -t: Single letter binary option
+#   -t=s: String parameters
+#   -t=i: Number parameters
+#
+my @getopt_args = ( '-version', '-perlbin=s' );
+
+# Add configuration parameters as additional command-line options
+push @getopt_args, RepeatMaskerConfig::getCommandLineOptions();
+
+#
+# Get the supplied command line options, and set flags
+#
+my %options = ();
+Getopt::Long::config( "noignorecase", "bundling_override" );
+unless ( GetOptions( \%options, @getopt_args ) ) {
+  usage();
+}
+
+#
+# Provide the POD text from this file and 
+# from the config file by merging them 
+# together.  The heading "CONFIGURATION
+# OVERRIDES" provides the insertion point
+# for the configuration POD.
+#
+sub usage {
+  my $p = Pod::Text->new();
+  $p->output_fh(*STDOUT);
+  my $pod_str;
+  open IN,"<$0" or die "Could not open self ($0) for generating documentation!";
+  while (<IN>){
+    if ( /^=head1\s+CONFIGURATION OVERRIDES\s*$/ )
+    {
+      my $c_pod = RepeatMaskerConfig::getPOD();
+      if ( $c_pod ) {
+        $pod_str .= $_ . $c_pod;
+      }
+    }else {
+      $pod_str .= $_;
+    }
+  }
+  close IN;
+  print "$0 - $version\n";
+  $p->parse_string_document($pod_str);
+  exit(1);
+}
+
+#
+# Resolve configuration settings using the following precedence: 
+# command line first, then environment, followed by config
+# file.
+#
+RepeatMaskerConfig::resolveConfiguration(\%options);
+my $config = $RepeatMaskerConfig::configuration;
+
+##
+## Perl interpreter location
+##
+my $perlLocation = $^X;
+if ( $options{'perlbin'} ) {
+  my $tbin = "";
+  if ( -d $options{'perlbin'} ) {
+    if ( -x ( $options{'perlbin'} . "/perl" ) ) {
+      $tbin = $options{'perlbin'} . "/perl";
+    }
+    elsif ( -x ( $options{'perlbin'} . "/bin/perl" ) ) {
+      $tbin = $options{'perlbin'} . "/bin/perl";
+    }
+    else {
+      die "Could not find perl using supplied -perlbin parameter $options{'perlbin'}\n"
+          . "as $options{'perlbin'}/perl or $options{'perlbin'}/bin/perl.  Please fix\n"
+          . "and rerun configure.\n";
+    }
+  }
+  elsif ( -x $options{'perlbin'} ) {
+    $tbin = $options{'perlbin'};
+  }
+  if ( $tbin ne $perlLocation ) {
+    my $optStr;
+    foreach my $key ( keys %options ) {
+      if ( $key ne "perlbin" ) {
+        $optStr .= " -$key " . $options{$key};
+      }
+    }
+
+    # Rerun with intended version of perl
+    exec( "$tbin $FindBin::RealBin/configure $optStr" );
+  }
+}
+
+##
+## Check for perl version
+##
+if ( $] && $] < 5.008 ) {
+  print "RepeatMasker should be used with perl 5.008 or higher.\n"
+      . "Perl $] is being used to run configure.";
+  exit;
+}
+
+##
+## Check for RepeatMasker dependencies
+##
+BEGIN {
+  my @modDependencies = (
+                          "Tie::File",  "Getopt::Long",
+                          "POSIX",      "File::Copy",
+                          "File::Path", "Data::Dumper",
+                          "Cwd",        "Storable"
+  );
+
+  my @missingModules = ();
+  foreach my $module ( @modDependencies ) {
+    unless ( eval "require " . $module . ";" ) {
+      push @missingModules, $module;
+    }
+  }
+  if ( @missingModules ) {
+    print "\nThe following perl modules required by RepeatMasker "
+        . "are missing from\nyour system.  Please install these or "
+        . "or upgrade your perl version\nto 5.8.x first:\n    "
+        . join( "\n    ", @missingModules ) . "\n";
+    exit;
+  }
+}
+
+#
+# Check for XS version of Scalar::Util
+#
+eval "use Scalar::Util qw(weaken);";
+if ( $@ ) {
+  print "\nThe CPAN module Scalar::Util included in this version of perl\n"
+      . "is not compiled with the XS option.  RepeatMasker requires the\n"
+      . "XS version of the module.  Please reinstall XS Scalar::Util from\n"
+      . "CPAN and restart the configure process.\n\n";
+  exit;
+}
+
+#
+# Check Storable Version
+#
+my $storableVersion =
+    `$perlLocation -mStorable -e 'print \$Storable::VERSION' 2>/dev/null`;
+if ( $storableVersion < 2.06 ) {
+  print "\nYour perl installation contains an old Storable CPAN module\n"
+      . "( version = $storableVersion ).  Please upgrade your Storable module "
+      . "to\nversion 2.06 or higher and then re-run the configure program.\n\n";
+  exit;
+}
+
+#
+# Test python3 and h5py
+#
+system('python3 -c "import h5py"');
+if ( $? ) {
+  die "\nPython3 and the h5py module is a pre-requisite for RepeatMasker.\n" 
+      . "Either python3 could not be found in your path or h5py is not installed.\n"
+      . "Please very both before rerunning configure.\n\n";
+}
+
+##
+## Alter perl invocation headers
+##
+print " -- Setting perl interpreter...\n";
+my @progFiles = (
+                  "RepeatMasker",
+                  "DateRepeats",
+                  "ProcessRepeats",
+                  "RepeatProteinMask",
+                  "DupMasker",
+                  "addRepBase.pl",
+                  "util/calcDivergenceFromAlign.pl",
+                  "util/createRepeatLandscape.pl",
+                  "util/maskFile.pl",
+                  "util/rmOutToGFF3.pl",
+                  "util/buildRMLibFromEMBL.pl",
+                  "util/rmToUCSCTables.pl"
+);
+
+# perlLocation will be used in shebang lines, so it must be
+# an absolute path. However $^X is not always absolute (e.g. macOS).
+# In most cases, $Config{perlpath} is still an absolute path.
+if ( !File::Spec->file_name_is_absolute($perlLocation) ) {
+  $perlLocation = $Config{perlpath} . $Config{_exe};
+}
+if ( ! File::Spec->file_name_is_absolute($perlLocation) || ! -x $perlLocation ) {
+  die "Could not find an absolute path for the running perl interpreter!\n" .
+      "Try specifying your perl path manually with the -perlbin option.\n";
+}
+
+my $perlLocEsc = $perlLocation;
+$perlLocEsc =~ s/\//\\\//g;
+
+foreach my $file ( @progFiles ) {
+  system(
+         "$perlLocation -i -0pe \'s/^#\\!.*perl.*/#\\!$perlLocEsc/g\;' $file" );
+}
+
+##
+## Introduce ourselves
+##
+system( "clear" );
+print "RepeatMasker Configuration Program\n";
+my $answer;
+my $goodParam;
+
+# So that we can get the engine versions
+require NCBIBlastSearchEngine;
+require WUBlastSearchEngine;
+require CrossmatchSearchEngine;
+require HMMERSearchEngine;
+
+##
+## RepeatMasker location
+##
+my $rmLocation = "$FindBin::Bin";
+if ( -d "$rmLocation/Libraries" &&
+     $config->{'LIBDIR'}->{'value'} eq "" ){
+  $config->{'LIBDIR'}->{'value'} = $rmLocation . "/Libraries";
+}
+if ( ! RepeatMaskerConfig::validateParam('LIBDIR') ) {
+  RepeatMaskerConfig::promptForParam('LIBDIR');
+}
+my $LIBDIR = $config->{'LIBDIR'}->{'value'};
+
+print "\n\nChecking for libraries...\n\n";
+# Installation scenarios
+#  1: Both Dfam *and* RepBase RepeatMasker Edition
+if ( -s "$LIBDIR/Dfam.h5" && -s "$LIBDIR/RMRBSeqs.embl" ) {
+  unlink("$LIBDIR/RepeatMaskerLib.h5") if ( -e "$LIBDIR/RepeatMaskerLib.h5" );
+  defined(my $pid = fork) or die "Couldn't fork: $!";
+  if (!$pid) { # Child
+    system("$FindBin::RealBin/addRepBase.pl -libdir $LIBDIR");
+    exit;
+  } else { # Parent
+    while (! waitpid($pid, WNOHANG)) {
+      sleep 2;
+      print ".";
+    }
+  }
+  print "\n";
+#  2: Just a form of Dfam ( curated or curated+uncurated )
+}elsif ( -s "$LIBDIR/Dfam.h5" ) {
+  print "  - Found Dfam\n";
+  unlink("$LIBDIR/RepeatMaskerLib.h5") if ( -e "$LIBDIR/RepeatMaskerLib.h5" );
+  system("ln -s $LIBDIR/Dfam.h5 $LIBDIR/RepeatMaskerLib.h5");
+#  3: What...nothing?
+}else {
+  die "\nCould not find $LIBDIR/Dfam.h5!\n" .
+      "Please download a copy of the Dfam library ( famdb HDF5 format )\n" . 
+      "from:\n\n" . 
+      "  https://www.dfam.org/releases/Dfam_#.#/families/Dfam.h5.gz\n" .
+      "or\n" . 
+      "  https://www.dfam.org/releases/Dfam_#.#/families/Dfam_curatedonly.h5.gz\n\n" .
+      "uncompress it ( gunzip ), store in $LIBDIR,\n" . 
+      "and rerun the configure program.\n\n\n";
+}
+#print "<PRESS ENTER TO CONTINUE>\n";
+#$answer = <STDIN>;
+
+
+my $dbInfo = `$rmLocation/famdb.py -i $LIBDIR/RepeatMaskerLib.h5 info`;
+
+if ( ! $options{'trf_prgm'} ) {
+  RepeatMaskerConfig::promptForParam('TRF_PRGM');
+}
+
+##
+## Search Engine Configuration
+##
+if ( ! ( $options{'abblast_dir'} || $options{'rmblast_dir'} || $options{'hmmer_dir'} ||
+         $options{'crossmatch_dir'} ) ) {
+  searchEngineMenu();
+}else {
+  # Assumption: if at least one engine is specified on the command line then the intention
+  #             is to not prompt for any engines.
+}
+
+print "Building FASTA version of RepeatMasker.lib ...";
+
+defined(my $pid = fork) or die "Couldn't fork: $!";
+if (!$pid) { # Child
+  system("$rmLocation/famdb.py -i $rmLocation/Libraries/RepeatMaskerLib.h5 families --descendants 1 --curated --format fasta_name --include-class-in-name > $rmLocation/Libraries/RepeatMasker.lib");
+  exit;
+} else { # Parent
+  while (! waitpid($pid, WNOHANG)) {
+    sleep 2;
+    print ".";
+  }
+}
+print "\n";
+
+#
+# Freeze RM and RMPep libraries for RepeatModeler use among others
+#
+if ( RepeatMaskerConfig::validateParam('RMBLAST_DIR') ) 
+{
+   my $binDir = $config->{'RMBLAST_DIR'}->{'value'};
+   print "Building RMBlast frozen libraries..\n";
+   system(   "$binDir/makeblastdb -dbtype nucl -in "
+           . "$LIBDIR/RepeatMasker.lib > /dev/null 2>&1" );
+   system(   "$binDir/makeblastdb -dbtype prot -in "
+           . "$LIBDIR/RepeatPeps.lib > /dev/null 2>&1" );
+}
+if ( RepeatMaskerConfig::validateParam('ABBLAST_DIR') ) 
+{
+   my $binDir = $config->{'ABBLAST_DIR'}->{'value'};
+   print "Building WUBlast/ABBlast frozen libraries..\n";
+   system(   "$binDir/xdformat -n -I "
+           . "$LIBDIR/RepeatMasker.lib > /dev/null 2>&1" );
+   system(   "$binDir/xdformat -p -I "
+           . "$LIBDIR/RepeatPeps.lib > /dev/null 2>&1" );
+}
+
+# Save settings
+RepeatMaskerConfig::updateConfigFile();
+
+print "The program is installed with a the following repeat libraries:\n";
+print "$dbInfo\n";
+
+print "Further documentation on the program may be found here:\n";
+print "  $rmLocation/repeatmasker.help\n\n";
+
+####################### S U B R O U T I N E S ##############################
+
+sub searchEngineMenu {
+  my $configFile = shift;
+
+  my @searchEngines = (
+    {
+      name         => "CROSSMATCH_DIR",
+      desc         => "Crossmatch",
+      defname      => "crossmatch",
+      status       => 0,
+    },
+    {
+      name         => "RMBLAST_DIR",
+      desc         => "RMBlast",
+      defname      => "rmblast",
+      status       => 0,
+    },
+    {
+      name         => "HMMER_DIR",
+      desc         => "HMMER3.1 & DFAM",
+      defname      => "hmmer",
+      status       => 0,
+    },
+    {
+      name         => "ABBLAST_DIR",
+      desc         => "ABBlast",
+      defname      => "abblast",
+      status       => 0,
+    }
+
+  );
+
+  my $done          = 0;
+  my $defaultEngine = "";
+  do {
+    system( "clear" );
+    print "\n\n\n";
+    print "Add a Search Engine:\n";
+    my $i;
+    for ( $i = 0 ; $i <= $#searchEngines ; $i++ )
+    {
+      print "   " . ( $i + 1 ) . ". $searchEngines[$i]->{'desc'}: [ ";
+      if ( $searchEngines[ $i ]->{'status'} == 0 )
+      {
+        print "Un-configured ]\n";
+      } elsif ( $searchEngines[ $i ]->{'status'} == 1 )
+      {
+        print "Configured ]\n";
+      } else
+      {
+        print "Configured, Default ]\n";
+      }
+    }
+    print "\n";
+    print "   " . ( $i + 1 ) . ". Done\n";
+
+    print "\n\nEnter Selection: ";
+    $answer = <STDIN>;
+    $answer =~ s/[\n\r]+//g;
+
+    if ( $answer =~ /\d+/ && $answer > 0 && $answer <= ( $#searchEngines + 2 ) )
+    {
+      if ( $answer == ( $#searchEngines + 2 ) ) {
+        if ( $defaultEngine eq "" ) {
+          print "You must configure at least one search engine!\n";
+          print "<PRESS ENTER TO CONTINUE - CTRL-C to QUIT>\n";
+          $answer = <STDIN>;
+        }
+        else {
+          $done = 1;
+        }
+      }
+      else {
+        RepeatMaskerConfig::promptForParam($searchEngines[$answer-1]->{'name'});
+        if ( $defaultEngine ne "" ) {
+          system("clear");
+          print "\n\n\n";
+          print "Do you want " . $searchEngines[$answer-1]->{'desc'} . " to be your default\nsearch engine for Repeatmasker? (Y/N) ";
+          print " [ Y ]: ";
+          my $isDefault = <STDIN>;
+          $isDefault =~ s/[\n\r]+//g;
+          if ( $isDefault =~ /^\s*$/ || $isDefault =~ /\s*[yY]\s*/ ) 
+          {
+            for ( $i = 0 ; $i <= $#searchEngines ; $i++ )
+            {
+              $searchEngines[$i]->{'status'} = 1 
+                if ( $searchEngines[$i]->{'status'} == 2 );
+            }
+            $searchEngines[ $answer - 1 ]->{'status'} = 2;
+            $RepeatMaskerConfig::configuration->{'DEFAULT_SEARCH_ENGINE'}->{'value'} = $searchEngines[$answer-1]->{'defname'};
+            $defaultEngine = $answer;
+          }else {
+            $searchEngines[ $answer - 1 ]->{'status'} = 1;
+          }
+        }else {
+          $searchEngines[ $answer - 1 ]->{'status'} = 2;
+          $defaultEngine = $answer;
+        }
+      }
+    }
+    else {
+      print "Invalid selection!\n";
+      print "<PRESS ENTER TO CONTINUE>\n";
+      $answer = <STDIN>;
+    }
+  } while ( $done == 0 );
+}
+
+1;

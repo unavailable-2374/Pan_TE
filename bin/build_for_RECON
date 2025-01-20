@@ -1,0 +1,223 @@
+#!/usr/bin/env perl
+use strict;
+use FindBin;
+use lib $FindBin::RealBin;
+use POSIX qw(:sys_wait_h ceil floor);
+use File::Spec;
+use File::Path qw(make_path);
+use File::Basename;
+use Parallel::ForkManager;
+use IO::Handle;  # For buffering optimization
+
+use RepModelConfig;
+use lib $RepModelConfig::configuration->{'REPEATMASKER_DIR'}->{'value'};
+use SeedAlignment;
+use SeedAlignmentCollection;
+use SearchResult;
+use SearchResultCollection;
+use NCBIBlastSearchEngine;
+use SeqDBI;
+use FastaDB;
+
+our %families = ();
+our $familySizeCutoff = 15;
+our $DEBUG = 0;
+
+die "Usage: $0 workDir genomeDB total_threads\n" unless @ARGV == 3;
+my ($workDir, $genomeDB, $threads) = @ARGV;
+
+# Pre-calculate constants
+my $max_parallel = int($threads / 4);  # 4 threads per Refiner process
+$max_parallel = 1 if $max_parallel < 1;
+
+# Initialize file handles with large buffers for better IO performance
+my $buffer_size = 1024 * 1024;  # 1MB buffer
+$| = 1;  # Disable output buffering for STDOUT
+
+# Process RECON output with optimized IO
+%families = process_recon_output($workDir);
+my $family_count = scalar(keys(%families));
+print "Number of families returned by RECON: $family_count\n";
+print "Processing families with greater than $familySizeCutoff elements\n";
+
+# Process families in parallel batches
+my %refinableFamilies = process_families(\%families, $workDir);
+
+# Setup parallel processing
+my $pm = Parallel::ForkManager->new($max_parallel);
+$pm->set_waitpid_blocking_sleep(0);  # Non-blocking wait
+
+# Process refinement in parallel
+run_parallel_refiners(\%refinableFamilies, $workDir, $genomeDB, $threads, $pm);
+
+# Final processing
+process_refined_families(\%families, \%refinableFamilies, $workDir);
+
+undef %families;
+undef %refinableFamilies;
+
+sub process_recon_output {
+    my $workDir = shift;
+    my %families;
+    
+    my $eles_file = "$workDir/summary/eles";
+    die "Error: Recon failed to produce the summary/eles file!\n" unless -f $eles_file;
+    
+    # Use large buffer for file reading
+    open my $fh, '<', $eles_file or die "Cannot open eles file: $!";
+    $fh->blocking(0);
+    while (<$fh>) {
+        next if /^#/;
+        if (/^\s+\d+\s+/) {
+            my @fields = split;
+            next if $fields[4] < 0 || $fields[5] < 0;
+            $families{$fields[0]}->{elements} ||= [];
+            push @{$families{$fields[0]}->{elements}}, {
+                seqName   => $fields[3],
+                elementID => $fields[1],
+                orient    => $fields[2],
+                start     => $fields[4],
+                end       => $fields[5]
+            };
+        }
+    }
+    close $fh;
+    return %families;
+}
+
+sub process_families {
+    my ($families_ref, $workDir) = @_;
+    my %refinableFamilies;
+
+    # Open output files with large buffers
+    open my $fh_cons, '>', "$workDir/consensi.fa" or die $!;
+    open my $fh_idx, '>', "$workDir/index.html" or die $!;
+    $fh_cons->autoflush(0);
+    $fh_idx->autoflush(0);
+    
+    # Initialize DB once for all operations
+    my $batchDB = FastaDB->new(
+        fileName => "$workDir/DB.fa",
+        openMode => SeqDBI::ReadOnly
+    );
+
+    # Pre-sort families by size
+    my @sortedKeys = sort {
+        @{$families_ref->{$b}->{elements}} <=> @{$families_ref->{$a}->{elements}}
+    } keys %$families_ref;
+
+    foreach my $familyID (@sortedKeys) {
+        last if @{$families_ref->{$familyID}->{elements}} < $familySizeCutoff;
+        
+        process_single_family($familyID, $families_ref, $batchDB, $workDir);
+        $refinableFamilies{$familyID}++;
+    }
+
+    # Flush and close files
+    close $fh_cons;
+    close $fh_idx;
+    undef $batchDB;
+
+    return %refinableFamilies;
+}
+
+sub process_single_family {
+    my ($familyID, $families_ref, $batchDB, $workDir) = @_;
+    
+    open my $fh_fam, '>:raw', "$workDir/family-$familyID.fa" 
+        or die "Cannot open family-$familyID.fa: $!";
+    
+    my $elementsRef = $families_ref->{$familyID}->{elements};
+    my $giID = 1;
+
+    # Pre-sort elements
+    my @sorted_elements = sort {
+        ($b->{end} - $b->{start}) <=> ($a->{end} - $a->{start})
+    } @$elementsRef;
+
+    foreach my $elementRef (@sorted_elements) {
+        my $seqName = $elementRef->{seqName};
+        my $seqDesc = $batchDB->getDescription($seqName);
+        
+        my ($genomicSeqID, $genomicStartPos, $genomicEndPos) = 
+            $seqDesc =~ /(\S+):(\d+)-(\d+)/ or next;
+
+        my $startOffset = $elementRef->{start};
+        my $endOffset = $elementRef->{end};
+        
+        next if $endOffset > $batchDB->getSeqLength($seqName);
+        
+        my $sequence = $batchDB->getSubstr($seqName, $startOffset, $endOffset - $startOffset);
+        if ($elementRef->{orient} ne "1") {
+            $sequence = reverse($sequence);
+            $sequence =~ tr/ACGTYRMKHBVD/TGCARYKMDVBH/;
+            my $tmp = $startOffset;
+            $startOffset = $endOffset-1;
+            $endOffset = $tmp-1;
+        }
+
+        $elementRef->{sequence} = $sequence;
+        print $fh_fam ">gi|$giID $genomicSeqID:" 
+            . ($startOffset + $genomicStartPos) . "-"
+            . ($endOffset + $genomicStartPos)
+            . " element-" 
+            . $elementRef->{elementID} . "\n$sequence\n";
+        $giID++;
+    }
+    close $fh_fam;
+}
+
+sub run_parallel_refiners {
+    my ($refinableFamilies_ref, $workDir, $genomeDB, $threads,  $pm) = @_;
+    
+    foreach my $familyID (keys %$refinableFamilies_ref) {
+        $pm->start and next;
+        
+        my $instancesFile = "family-$familyID.fa";
+        my $cmd = "$FindBin::RealBin/Refiner.py"
+                . " $instancesFile "
+		. $instancesFile .".refiner_cons"
+		. " -t 4"
+		. " -c 0.3"
+		. " -f 0.5"
+                . " -s 0.6";
+        system($cmd);
+        $pm->finish;
+    }
+    
+    $pm->wait_all_children;
+}
+
+sub process_refined_families {
+    my ($families_ref, $refinableFamilies_ref, $workDir) = @_;
+    
+    open my $fh_cons, '>>', "$workDir/consensi.fa" or die $!;
+    $fh_cons->autoflush(0);
+
+    foreach my $familyID (keys %$refinableFamilies_ref) {
+        my $refiner_cons = "$workDir/family-$familyID.fa.refiner_cons";
+        next unless -s $refiner_cons;
+
+        open my $fh_in, '<', $refiner_cons or next;
+        my ($cons, $maSize) = ('', 1);
+        while (<$fh_in>) {
+            if (/Final Multiple Alignment Size = (\d+)/) {
+                $maSize = $1;
+            } else {
+                $cons .= $_;
+            }
+        }
+        close $fh_in;
+
+        next unless $cons;
+
+        $families_ref->{$familyID}->{consensus} = $cons;
+        $families_ref->{$familyID}->{finalElementCount} = $maSize;
+
+        print $fh_cons ">family-$familyID (Recon Family Size = "
+            . (@{$families_ref->{$familyID}->{elements}} + 1)
+            . ", Final Multiple Alignment Size = $maSize)\n$cons\n";
+    }
+    close $fh_cons;
+}
+

@@ -1,0 +1,35 @@
+package:
+  name: repeatmasker
+  version: 4.1.5
+source:
+  sha256: 16e07f9efd99adf15f4492b0e334df5ad4ea6ca38ddf62bdd180d257f2f4753f
+  url: https://www.repeatmasker.org/RepeatMasker/RepeatMasker-4.1.5.tar.gz
+build:
+  noarch: generic
+  number: '1'
+  run_exports:
+    - repeatmasker
+requirements:
+  host:
+    - perl
+    - rmblast
+    - h5py
+  run:
+    - rmblast
+    - hmmer
+    - trf
+    - perl
+    - h5py
+    - wget
+test:
+  commands:
+    - RepeatMasker | grep "RepeatMasker - Mask repetitive DNA" > /dev/null
+about:
+  home: https://www.repeatmasker.org
+  license: Open Software License v2.1
+  summary: RepeatMasker is a program that screens DNA sequences for interspersed repeats
+    and low complexity DNA sequences.
+extra:
+  final: null
+  identifiers:
+    - biotools:RepeatMasker

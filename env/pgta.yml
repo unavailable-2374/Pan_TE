@@ -1,0 +1,21 @@
+name: PGTA
+
+channels:
+ - bioconda
+ - defaults
+ - conda-forge
+dependencies:
+ - RepeatModeler
+ - networkx=2.4
+ - numpy=1.19.1
+ - pandas=1.0.5
+ - scikit-learn=0.23.1
+ - scipy=1.5.2
+ - cmake=3.10.3
+ - gcc=11.1.0
+ - gxx_linux-64
+ - seqtk
+ - bedtools
+ - ParaFly
+ - Biopython
+ - mafft
