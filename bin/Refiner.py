@@ -203,7 +203,6 @@ class TEConsensusBuilder:
             expected_len = (subj_end - subj_start + 1)
             if aligned_len != expected_len:
                 continue
-
             for i in range(aligned_len):
                 ref_pos = subj_start + i
                 base    = qseq[i]
@@ -217,7 +216,6 @@ class TEConsensusBuilder:
             final_seqs.append(merged_seq)
 
         return final_seqs
-
     def build_consensus(self, aligned_sequences):
         if not aligned_sequences:
             return ""
@@ -299,6 +297,36 @@ class Config:
         
         self.matrix_path = None
         for path in possible_matrix_paths:
+            if os.path.exists(path):class Config:
+    def __init__(self):
+        import shutil
+        
+        conda_env_path = self.get_current_conda_env()
+        if conda_env_path:
+            self.rmblastn = os.path.join(conda_env_path, 'bin', 'rmblastn')
+            self.makeblastdb = os.path.join(conda_env_path, 'bin', 'makeblastdb')
+            logger.info(f"Using Conda environment: {conda_env_path}")
+        else:
+            self.rmblastn = shutil.which('rmblastn')
+            self.makeblastdb = shutil.which('makeblastdb')
+            logger.info("No Conda environment detected, using system PATH")
+        
+        if not os.path.exists(self.rmblastn):
+            raise FileNotFoundError(f"rmblastn not found at {self.rmblastn}")
+        if not os.path.exists(self.makeblastdb):
+            raise FileNotFoundError(f"makeblastdb not found at {self.makeblastdb}")
+
+        conda_env_dir = conda_env_path if conda_env_path else os.path.dirname(os.path.dirname(self.rmblastn))
+
+        possible_matrix_paths = [
+            os.path.join(conda_env_dir, 'share/RepeatModeler/Matrices/ncbi/nt/comparison.matrix'),
+            os.path.join(conda_env_dir, 'share/RepeatMasker/Libraries/Dfam.hmm'),
+            os.path.join(conda_env_dir, 'share/RepeatMasker/Matrices/nt'),
+            os.path.join(conda_env_dir, 'share/RepeatMasker/Matrices/BLOSUM62')
+        ]
+        
+        self.matrix_path = None
+        for path in possible_matrix_paths:
             if os.path.exists(path):
                 self.matrix_path = path
                 break
@@ -306,7 +334,32 @@ class Config:
         if self.matrix_path is None:
             self.matrix_path = 'BLOSUM62'
             
+        logger.info(f"Using rmblastn from: {self.rmblastn}")
         logger.info(f"Using scoring matrix: {self.matrix_path}")
+
+    def get_current_conda_env(self):
+
+        conda_prefix = os.environ.get('CONDA_PREFIX')
+        if conda_prefix:
+            return conda_prefix
+
+        import sys
+        if 'conda' in sys.prefix:
+            return sys.prefix
+
+        try:
+            conda_path = subprocess.check_output(['which', 'conda']).decode().strip()
+            if conda_path:
+                result = subprocess.check_output(['conda', 'info', '--json']).decode()
+                import json
+                conda_info = json.loads(result)
+                active_prefix = conda_info.get('active_prefix')
+                if active_prefix:
+                    return active_prefix
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            pass
+
+        return None
 
 if __name__ == "__main__":
     import argparse

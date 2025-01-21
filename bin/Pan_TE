@@ -239,76 +239,63 @@ sub process_vcfs {
         return;
     }
 
-    if ($total_threads <= scalar(@non_empty_files)) {
-        print "[INFO] Number of Threads: $total_threads <= Number of Files: "
-              . scalar(@non_empty_files)
-              . ", one by one in order...\n";
+    my @files_info = sort { $b->{size} <=> $a->{size} }
+                    map {
+                        {
+                            path => $_,
+                            size => -s $_,
+                            thr  => 0
+                        }
+                    } @non_empty_files;
 
-        for my $file (@non_empty_files) {
-            print "[INFO] Processing: $file with 1 thread\n";
-            process_one_vcf($file, 1);
-        }
-    }
-    else {
-        print "[INFO] Number of Threads: $total_threads > Number of Files: "
-              . scalar(@non_empty_files)
-              . ", proportionally distributing based on file size (balanced approach)...\n";
-
-        my @files_info = map {
-            {
-                path => $_,
-                size => -s $_,
-                thr  => 0,   
-            }
-        } @non_empty_files;
-
-        my $total_size = sum(map { $_->{size} } @files_info);
-
-        if ($total_size == 0) {
-            print "[WARN] All file sizes are 0. Skip.\n";
-            return;
-        }
-
-        my @ideal_values;
+    while (@files_info) {
+        my @batch = splice(@files_info, 0, 3);  # Take up to 3 files
+        my $batch_size = sum(map { $_->{size} } @batch);
+        
         my $used_threads = 0;
-        for my $info (@files_info) {
-            my $ideal = $total_threads * ($info->{size} / $total_size);
-            my $floor_val = int($ideal);
-
-            $floor_val = 1 if $floor_val < 1;
-
-            $info->{thr} = $floor_val;
-            push @ideal_values, { info => $info, fraction => ($ideal - $floor_val) };
-            $used_threads += $floor_val;
+        foreach my $file (@batch) {
+            my $proportion = $file->{size} / $batch_size;
+            my $threads = int($total_threads * $proportion);
+            
+            $threads = 1 if $threads < 1;
+            
+            $threads = $total_threads - $used_threads if $threads > ($total_threads - $used_threads);
+            
+            $file->{thr} = $threads;
+            $used_threads += $threads;
         }
 
-        my $leftover = $total_threads - $used_threads;
-
-        if ($leftover > 0) {
-            @ideal_values = sort { $b->{fraction} <=> $a->{fraction} } @ideal_values;
-            for my $i (0 .. $#ideal_values) {
-                last if $leftover <= 0;
-                $ideal_values[$i]{info}{thr}++;
-                $leftover--;
+        if ($used_threads < $total_threads) {
+            my $remaining = $total_threads - $used_threads;
+            foreach my $file (@batch) {
+                last if $remaining <= 0;
+                $file->{thr}++;
+                $remaining--;
             }
         }
 
-        my $pm = Parallel::ForkManager->new($total_threads);
+        print "[INFO] Processing batch of ", scalar(@batch), " files:\n";
+        foreach my $file (@batch) {
+            printf "[INFO] File: %s (%.2f GB) - Allocated %d threads\n",
+                   $file->{path},
+                   $file->{size} / (1024 * 1024 * 1024),
+                   $file->{thr};
+        }
 
-        for my $info (@files_info) {
-            print "[INFO] Allocate $info->{thr} threads to $info->{path}\n";
+        my $pm = Parallel::ForkManager->new(3);  
+        
+        foreach my $file (@batch) {
             $pm->start and next;
-
-            process_one_vcf($info->{path}, $info->{thr});
-
+            process_one_vcf($file->{path}, $file->{thr});
             $pm->finish;
         }
         $pm->wait_all_children;
-
-        print "[INFO] All non-empty files processed!\n";
+        
+        print "[INFO] Batch processing completed\n";
     }
-}
 
+    print "[INFO] All files processed!\n";
+}
 
 sub run_parallel_processes {
     my ($opts, $current_dir, $file_stats) = @_;
