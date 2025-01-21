@@ -8,6 +8,8 @@ use File::Basename;
 use File::Path qw(make_path remove_tree);
 use Parallel::ForkManager;
 use Time::HiRes qw(time);
+use File::Which;
+use List::Util qw(sum);
 
 use constant {
     MIN_CPU => 4,
@@ -59,6 +61,14 @@ my %GENOME_CONFIGS = (
 my $script_dir = dirname(abs_path($0));
 $script_dir =~ s{/bin$}{};
 
+my $RM_dir = which("rmblastn");
+
+if ($RM_dir) {
+    print "Found rmblastn at: $RM_dir\n";
+} else {
+    die "Could not find rmblastn in your PATH.\n";
+}
+
 my %opts = parse_arguments();
 
 my $run_id = int(rand(9999999)) + 1;
@@ -67,21 +77,23 @@ $opts{cpu} ||= MIN_CPU;
 $opts{mem} ||= 0;
 $opts{fragment_size} ||= DEFAULT_FRAGMENT_SIZE;
 
-die "Please input either genome or list, not both\n"
-    if $opts{genome} && $opts{list};
-die "No input provided. Use --genome or --list\n"
-    if !$opts{genome} && !$opts{list};
+die "No input provided. Use --genome\n"
+    if !$opts{genome} && !$opts{dir};
 
 my $current_dir = getcwd();
 $opts{genome} = "$current_dir/$opts{genome}" if $opts{genome};
+$opts{dir} = "$current_dir/$opts{dir}" if $opts{dir};
 
 make_path($opts{out}) unless -e $opts{out};
 chdir $opts{out} or die "Cannot change to directory $opts{out}: $!\n";
 
-my @file_stats = stat($opts{genome} || $opts{list});
+my @file_stats = stat($opts{genome} || $opts{dir});
 
-process_genome(\%opts, \@file_stats) if $opts{genome};
-process_graph_genome(\%opts, \@file_stats) if $opts{list};
+$opts{genome} 
+    and ( $opts{dir} 
+        ? process_graph_genome(\%opts, \@file_stats) ;
+        : process_genome(\%opts, \@file_stats) 
+    );
 $current_dir = "$current_dir/$opts{out}";
 $opts{genome} = "$current_dir/genome/genome.fa";
 
@@ -119,7 +131,6 @@ sub parse_arguments {
         "D=s" => \$opts{dir},
         "M=i" => \$opts{mem},
         "ClassifyTE_dir=s" => \$opts{model_dir},
-        "RM_dir=s" => \$opts{rm_dir},
         "fragment_size=i" => \$opts{fragment_size}
     ) or usage();
 
@@ -133,16 +144,15 @@ Usage:
     perl $0 [options]
 
 Example:
-    perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir /path/to/ClassifyTE --RM_dir /path/to/rmblastn
+    perl $0 --genome genome.fasta --cpu 80 --ClassifyTE_dir /path/to/ClassifyTE
 
 Parameters:
 [General]
     --genome <string>         Required. Genome file in FASTA format.
     --ClassifyTE_dir <string> Path to ClassifyTE for classification.
-    --RM_dir <string>         Path to rmblastn for classification.
 
 [Other]
-    --D <string>              Default: NA. Path file for VCF.
+    --D <string>              Default: NA. Path file for vcf.
     --out <string>            Default: current directory. Work directory.
     -M <int>                  Memory limit (MB), default: 0 (unlimited).
     --cpu <int>               Default: 4. Number of threads.
@@ -153,6 +163,7 @@ Version: $VERSION
 END_USAGE
     exit(1);
 }
+
 sub process_genome {
     my ($opts, $file_stats) = @_;
 
@@ -169,11 +180,9 @@ sub process_genome {
     run_cmd("samtools faidx genome/genome.fa");
     run_cmd("index genome/genome");
     unlink("tmp.fa");
+    print STDERR "Step 1: Genome $opts->{genome} has been processed! (" . localtime() . ")\n";
     create_checkpoint("genome.ok");
 }
-
-use File::Path qw(make_path);
-use Parallel::ForkManager;
 
 sub process_graph_genome {
     my ($opts, $file_stats) = @_;
@@ -188,24 +197,118 @@ sub process_graph_genome {
 
     make_path("genome") unless -e "genome";
     chdir "genome" or die "Cannot change to genome directory: $!\n";
+    make_path("tmp") unless -e "tmp";
 
     my @vcf_files = glob("$opts->{dir}/*.vcf");
-    die "No VCF files found in $opts->{dir}\n" unless @vcf_files;
+    die "No VCF files found in $opts->{dir}, please make sure it is *.vcf!\n" unless @vcf_files;
 
-    my $pm = Parallel::ForkManager->new($opts->{cpu});
+    print STDERR "Step 1: Processing VCFs $opts->{dir} (" . localtime() . ")\n";
 
-    foreach my $vcf (@vcf_files) {
-        $pm->start and next; 
-        run_cmd("decode_gfa.pl $vcf"); 
-        $pm->finish;          
-    }
-    $pm->wait_all_children;
+    process_vcfs(\@vcf_files, $opts->{cpu});
 
-    run_cmd("cat *.fa > combined.fa");
+    print STDERR "Step 1: VCFs $opts->{dir} have been processed! (" . localtime() . ")\n";
 
+    run_cmd("renameTE Seq <(cat tmp/*.fa $opts->{genome}) combined.fa");
+    run_cmd("tr 'a-z' 'A-Z' < combined.fa > tmp.fa");
+    run_cmd("clean_seq tmp.fa genome.fa") unless -e "genome.fa";
+    run_cmd("samtools faidx genome.fa");
     run_cmd("index genome");
-    create_checkpoint("../genome.ok");
+
+    unlink("tmp.fa");
+    unlink("combined.fa");
+    `rm -rf tmp`;
+
+    chdir "../";
+    create_checkpoint("genome.ok");
 }
+
+sub process_one_vcf {
+    my ($file, $threads) = @_;
+    print "  [RUN] Processing $file using $threads \n";
+    run_cmd("decode_gfa.pl $file $threads");
+    print "  [DONE] $file Finished\n";
+}
+
+sub process_vcfs {
+    my ($vcf_files_ref, $total_threads) = @_;
+    my @vcf_files = @$vcf_files_ref;
+
+    my @non_empty_files = grep { -s $_ > 0 } @vcf_files;
+    if (!@non_empty_files) {
+        print "[INFO] All files are empty (or no files to process), skip.\n";
+        return;
+    }
+
+    if ($total_threads <= scalar(@non_empty_files)) {
+        print "[INFO] Number of Threads: $total_threads <= Number of Files: "
+              . scalar(@non_empty_files)
+              . ", one by one in order...\n";
+
+        for my $file (@non_empty_files) {
+            print "[INFO] Processing: $file with 1 thread\n";
+            process_one_vcf($file, 1);
+        }
+    }
+    else {
+        print "[INFO] Number of Threads: $total_threads > Number of Files: "
+              . scalar(@non_empty_files)
+              . ", proportionally distributing based on file size (balanced approach)...\n";
+
+        my @files_info = map {
+            {
+                path => $_,
+                size => -s $_,
+                thr  => 0,   
+            }
+        } @non_empty_files;
+
+        my $total_size = sum(map { $_->{size} } @files_info);
+
+        if ($total_size == 0) {
+            print "[WARN] All file sizes are 0. Skip.\n";
+            return;
+        }
+
+        my @ideal_values;
+        my $used_threads = 0;
+        for my $info (@files_info) {
+            my $ideal = $total_threads * ($info->{size} / $total_size);
+            my $floor_val = int($ideal);
+
+            $floor_val = 1 if $floor_val < 1;
+
+            $info->{thr} = $floor_val;
+            push @ideal_values, { info => $info, fraction => ($ideal - $floor_val) };
+            $used_threads += $floor_val;
+        }
+
+        my $leftover = $total_threads - $used_threads;
+
+        if ($leftover > 0) {
+            @ideal_values = sort { $b->{fraction} <=> $a->{fraction} } @ideal_values;
+            for my $i (0 .. $#ideal_values) {
+                last if $leftover <= 0;
+                $ideal_values[$i]{info}{thr}++;
+                $leftover--;
+            }
+        }
+
+        my $pm = Parallel::ForkManager->new($total_threads);
+
+        for my $info (@files_info) {
+            print "[INFO] Allocate $info->{thr} threads to $info->{path}\n";
+            $pm->start and next;
+
+            process_one_vcf($info->{path}, $info->{thr});
+
+            $pm->finish;
+        }
+        $pm->wait_all_children;
+
+        print "[INFO] All non-empty files processed!\n";
+    }
+}
+
 
 sub run_parallel_processes {
     my ($opts, $current_dir, $file_stats) = @_;
@@ -221,9 +324,9 @@ sub run_parallel_processes {
         my ($pid, $exit_code, $id) = @_;
         if ($exit_code == 0) {
             $process_status{$id} = 1;
-            print STDERR "$id completed successfully\n";
+            print STDERR "$id completed successfully! (" . localtime() . ")\n";
         } else {
-            print STDERR "WARNING: $id failed with exit code $exit_code\n";
+            print STDERR "WARNING: $id failed with exit code $exit_code! (" . localtime() . ")\n";
         }
     });
     
@@ -250,7 +353,7 @@ sub run_parallel_processes {
         
         my $pid = $pm->start($process->{name});
         if ($pid == 0) { # Child process
-            print STDERR "Starting $process->{name} process\n";
+            print STDERR "Starting $process->{name} process! (" . localtime() . ")\n";
             my $start_time = time();
             
             eval {
@@ -258,12 +361,12 @@ sub run_parallel_processes {
             };
             
             if ($@) {
-                print STDERR "Error in $process->{name}: $@\n";
+                print STDERR "Error in $process->{name}: $@! (" . localtime() . ")\n";
                 $pm->finish(1);
             }
             
             my $duration = time() - $start_time;
-            printf STDERR "Completed %s in %.2f seconds\n", $process->{name}, $duration;
+            printf STDERR "Completed %s in %.2f seconds! (" . localtime() . ")\n", $process->{name}, $duration;
             $pm->finish(0);
         }
     }
@@ -273,7 +376,7 @@ sub run_parallel_processes {
     my $all_completed = 1;
     foreach my $process (@processes) {
         unless (-e $process->{checkpoint}) {
-            print STDERR "ERROR: $process->{name} process did not complete successfully\n";
+            print STDERR "ERROR: $process->{name} process did not complete successfully! (" . localtime() . ")\n";
             $all_completed = 0;
         }
     }
@@ -281,7 +384,7 @@ sub run_parallel_processes {
     # Double-check the process status
     foreach my $proc (keys %process_status) {
         unless ($process_status{$proc}) {
-            print STDERR "ERROR: $proc did not finish successfully according to status tracking\n";
+            print STDERR "ERROR: $proc did not finish successfully according to status tracking! (" . localtime() . ")\n";
             $all_completed = 0;
         }
     }
@@ -299,7 +402,7 @@ sub process_ltrs {
     chdir $ltr_dir or die "Cannot change to look4ltrs directory: $!\n";
     
     # Run LTR command
-    my $cmd = $opts->{list}
+    my $cmd = $opts->{dir}
     ? "timeout " . TIMEOUT_LTR . " look4ltrs --fasta $opts->{genome} --out ./ --parallel $opts->{cpu}"
         : "para_look4ltrs $opts->{genome} $opts->{cpu} $current_dir";
 
@@ -311,7 +414,7 @@ sub process_ltrs {
     my $waited = 0;
     while (!-e "$ltr_dir/consensi.fa") {
         if ($waited >= $max_wait) {
-            die "ERROR: Timeout waiting for para_look4ltrs to create consensi.fa\n";
+            die "ERROR: Timeout waiting for para_look4ltrs to create consensi.fa! (" . localtime() . ")\n";
         }
         sleep 60; # Check every minute
         $waited += 60;
@@ -319,7 +422,7 @@ sub process_ltrs {
     
     # Verify the file is not empty
     unless (-s "$ltr_dir/consensi.fa") {
-        die "ERROR: para_look4ltrs completed but consensi.fa is empty\n";
+        die "ERROR: para_look4ltrs completed but consensi.fa is empty!\n";
     }
     
     print STDERR "para_look4ltrs completed successfully at " . localtime() . "\n";
@@ -337,7 +440,7 @@ sub process_repeatscout {
 
     my $size_param = $file_stats->[7] > 500_000_000 ? "400" : "all";
     my $cmd = "build_RS $rs_dir/tmp $opts->{genome} " .
-              "$opts->{cpu} $size_param $opts->{rm_dir} $current_dir";
+              "$opts->{cpu} $size_param $RM_dir $current_dir";
 
     print STDERR "Starting build_RS at " . localtime() . "\n";
     run_cmd($cmd . " &> $rs_dir/build.log", $verbose);
@@ -347,7 +450,7 @@ sub process_repeatscout {
     my $waited = 0;
     while (!-e "$rs_dir/consensi.fa") {
         if ($waited >= $max_wait) {
-            die "ERROR: Timeout waiting for build_RS to create consensi.fa\n";
+            die "ERROR: Timeout waiting for build_RS to create consensi.fa! (" . localtime() . ")\n";
         }
         sleep 60; # Check every minute
         $waited += 60;
@@ -355,7 +458,7 @@ sub process_repeatscout {
 
     # Verify the file is not empty
     unless (-s "$rs_dir/consensi.fa") {
-        die "ERROR: build_RS completed but consensi.fa is empty\n";
+        die "ERROR: build_RS completed but consensi.fa is empty!\n";
     }
 
     print STDERR "build_RS completed successfully at " . localtime() . "\n";
@@ -409,7 +512,7 @@ sub process_recon_rounds {
     make_path("round-1") unless -e "round-1";
     
     run_cmd("run_RECON 1 $opts->{cpu} $opts->{genome} " .
-            "$config->{sample_size} $config->{batch_size} $opts->{rm_dir}");
+            "$config->{sample_size} $config->{batch_size} $RM_dir");
     
     chdir "../";
 }
@@ -494,7 +597,7 @@ sub determine_length_params {
 
 sub run_cmd {
     my ($cmd, $verbose) = @_;
-    print STDERR "Running command: $cmd\n" if $verbose;
+    print STDERR "Running command: $cmd! (" . localtime() . ")\n" if $verbose;
     
     $cmd =~ s/[`;\$]/\\$&/g;  # Basic shell metacharacter escaping
     
@@ -504,11 +607,11 @@ sub run_cmd {
     my $duration = time() - $start_time;
     
     if ($exit_code != 0) {
-        die sprintf("Command failed (exit code %d): %s\nDuration: %.2f seconds\n", 
+        die sprintf("Command failed (exit code %d): %s\nDuration: %.2f seconds! (" . localtime() . ")\n";
                    $exit_code, $cmd, $duration);
     }
     
-    printf STDERR "Command completed in %.2f seconds\n", $duration if $verbose;
+    printf STDERR "Command completed in %.2f seconds! (" . localtime() . ")\n", $duration if $verbose;
     return $exit_code;
 }
 
