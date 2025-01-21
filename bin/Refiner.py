@@ -273,31 +273,7 @@ class TEConsensusBuilder:
             logger.error(f"Error in consensus building: {str(e)}")
             raise
 
-class Config:
-    def __init__(self):
-        import shutil
-        
-        self.rmblastn = shutil.which('rmblastn')
-        self.makeblastdb = shutil.which('makeblastdb')
-        
-        if not self.rmblastn:
-            raise FileNotFoundError("rmblastn not found in PATH")
-        if not self.makeblastdb:
-            raise FileNotFoundError("makeblastdb not found in PATH")
-
-        conda_env_dir = os.path.dirname(os.path.dirname(self.rmblastn))
-
-        possible_matrix_paths = [
-            os.path.join(conda_env_dir, 'share/RepeatModeler/Matrices/ncbi/nt/comparison.matrix'),
-            os.path.join(conda_env_dir, 'share/RepeatMasker/Libraries/Dfam.hmm'),
-            '/usr/share/RepeatMasker/Matrices/nt',
-            '/usr/local/share/RepeatMasker/Matrices/nt',
-            os.path.join(conda_env_dir, 'share/RepeatMasker/Matrices/BLOSUM62')
-        ]
-        
-        self.matrix_path = None
-        for path in possible_matrix_paths:
-            if os.path.exists(path):class Config:
+class Config:    
     def __init__(self):
         import shutil
         

@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 use strict;
 use warnings;
 use Cwd qw(abs_path getcwd);
@@ -91,7 +91,7 @@ my @file_stats = stat($opts{genome} || $opts{dir});
 
 $opts{genome} 
     and ( $opts{dir} 
-        ? process_graph_genome(\%opts, \@file_stats) ;
+        ? process_graph_genome(\%opts, \@file_stats)
         : process_genome(\%opts, \@file_stats) 
     );
 $current_dir = "$current_dir/$opts{out}";
@@ -155,7 +155,7 @@ Parameters:
     --D <string>              Default: NA. Path file for vcf.
     --out <string>            Default: current directory. Work directory.
     -M <int>                  Memory limit (MB), default: 0 (unlimited).
-    --cpu <int>               Default: 4. Number of threads.
+     <int>               Default: 4. Number of threads.
     --fragment_size <int>     Default: 40000. Fragment length.
     --help|-h                 Display this help.
 
@@ -594,11 +594,11 @@ sub run_cmd {
     my $duration = time() - $start_time;
     
     if ($exit_code != 0) {
-        die sprintf("Command failed (exit code %d): %s\nDuration: %.2f seconds! (" . localtime() . ")\n";
-                   $exit_code, $cmd, $duration);
+        die(sprintf("Command failed (exit code %d): %s\nDuration: %.2f seconds\n",
+            $exit_code, $cmd, $duration));
     }
     
-    printf STDERR "Command completed in %.2f seconds! (" . localtime() . ")\n", $duration if $verbose;
+    printf STDERR "Command completed in %.2f seconds! \n", $duration if $verbose;
     return $exit_code;
 }
 
