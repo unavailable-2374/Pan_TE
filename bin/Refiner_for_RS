@@ -38,6 +38,7 @@ die "Usage: $0 roundTmpDir consensiFile sampleFastaFile combFamiliesFile threads
 my ($roundTmpDir, $consensiFile, $sampleFastaFile, $combFamiliesFile, 
     $total_threads, $RMBLASTN_PRGM, $work_dir) = @ARGV;
 our %families; 
+
 # Calculate max parallel Refiners
 my $max_parallel_refiners = int($total_threads / THREADS_PER_REFINER);
 $max_parallel_refiners = 1 if $max_parallel_refiners < 1;
@@ -131,32 +132,31 @@ sub setup_blast_engine {
     return $engine;
 }
 
-sub collect_families {
-    my ($engine, $work_dir, $sample_file) = @_;
-    my @families;
+sub process_single_family {
+    my ($family_id, $work_dir) = @_;
     
-    $engine->setQuery($sample_file);
-    $engine->setSubject("$work_dir/consensi.fa");
-    my ($status, $results) = $engine->search();
-    die "BLAST search failed\n" if $status;
-    
-    my %family_data;
-    for (my $i = 0; $i < $results->size(); $i++) {
-        my $result = $results->get($i);
-        push @{$family_data{$result->getSubjName()}}, $result;
-    }
-    
-    @families = sort { 
-        scalar(@{$family_data{$b}}) <=> scalar(@{$family_data{$a}}) 
-    } keys %family_data;
-    
-    return @families;
+    my $family_file = "$work_dir/family-$family_id.fa";
+    print "Processing family $family_id using file $family_file\n";
+
+    # Run Refiner directly on family file
+    my $cmd = "$FindBin::RealBin/Refiner.py"
+            . " $family_file"
+            . " $family_file.refiner_cons"
+            . " -t " . THREADS_PER_REFINER
+            . " --min-score 150"
+            . " --gap-init 20"
+            . " --gap-ext 5";
+              
+    print "Starting Refiner for family $family_id using " . THREADS_PER_REFINER . " threads\n";
+    system($cmd) == 0 or die "Refiner failed for family $family_id\n";
 }
 
 sub process_families_parallel {
     my ($families, $work_dir, $max_parallel) = @_;
 
     my %process_status;
+    my $pm = Parallel::ForkManager->new($max_parallel);
+    
     $pm->run_on_finish(sub {
         my ($pid, $exit_code, $id) = @_;
         $process_status{$id} = $exit_code == 0;
@@ -167,35 +167,7 @@ sub process_families_parallel {
         }
     });
 
-    my @family_batch;
     foreach my $family_id (@$families) {
-        push @family_batch, $family_id;
-
-        if (@family_batch >= $max_parallel) {
-            process_family_batch(\@family_batch, $work_dir);
-            @family_batch = ();
-        }
-    }
-
-    process_family_batch(\@family_batch, $work_dir) if @family_batch;
-
-    $pm->wait_all_children;
-
-    my $all_completed = 1;
-    foreach my $family_id (@$families) {
-        unless ($process_status{$family_id}) {
-            warn "Family $family_id did not complete successfully\n";
-            $all_completed = 0;
-        }
-    }
-
-    return $all_completed;
-}
-
-sub process_family_batch {
-    my ($batch, $work_dir) = @_;
-    
-    foreach my $family_id (@$batch) {
         my $pid = $pm->start($family_id);
         next if $pid;
         
@@ -208,79 +180,18 @@ sub process_family_batch {
             $pm->finish(1);
         }
     }
-}
 
-sub process_single_family {
-    my ($family_id, $work_dir) = @_;
-    
-    my $family_dir = "$work_dir/family-$family_id";
-    make_path($family_dir);
+    $pm->wait_all_children;
 
-    print "Processing family $family_id\n";
-
-    # Save family instances to file
-    open(my $fh_fam, '>', "$family_dir/instances.fa")
-        or die "Cannot create instances file for family $family_id: $!\n";
-
-    my $giID = 1;
-    foreach my $element (
-        sort { $b->{score} <=> $a->{score} } 
-        @{$families{$family_id}{elements}}
-    ) {
-        last if $giID > 100;  # Limit to top 100 instances
-        
-        print $fh_fam ">" . $element->{seqID} . "\n";
-        
-        my $sequence = $element->{seq};
-        $sequence =~ s/[\s\r\n-]//g;  # Clean sequence
-        
-        # Print sequence in blocks of 50
-        while($sequence =~ /(.{1,50})/g) {
-            print $fh_fam "$1\n";
-        }
-        $giID++;
-    }
-    close $fh_fam;
-
-    # Run Refiner
-    my $cmd = "$FindBin::RealBin/Refiner " .
-              "-threads " . THREADS_PER_REFINER . " " .
-              "-noTmp " .
-              "-giToID $sampleFastaFile.translation " .
-              "$family_dir/instances.fa " .
-              "-rm_dir $RMBLASTN_PRGM > Refiner.log";
-              
-    print "Starting Refiner for family $family_id using " . THREADS_PER_REFINER . " threads\n";
-    system($cmd) == 0 or die "Refiner failed for family $family_id\n";
-    `mv $family_dir/instances.fa.refiner_cons $family_dir.fa.refiner_cons`;
-    `mv $family_dir/instances.fa.refiner.stk $family_dir.fa.refiner.stk`;
-}
-
-sub collect_family_instances {
-    my ($family_id, $work_dir) = @_;
-    my @sequences;
-    
-    # Read the BLAST results file
-    open(my $fh_results, '<', "$work_dir/RSalign.out") 
-        or die "Cannot open alignment results: $!\n";
-        
-    while (<$fh_results>) {
-        chomp;
-        next unless /^>/;  # Process only headers
-        if (/^>family-$family_id\s+/) {
-            # Read sequence after header
-            my $header = $_;
-            my $seq = <$fh_results>;
-            chomp $seq;
-            push @sequences, {
-                header => $header,
-                sequence => $seq
-            };
+    my $all_completed = 1;
+    foreach my $family_id (@$families) {
+        unless ($process_status{$family_id}) {
+            warn "Family $family_id did not complete successfully\n";
+            $all_completed = 0;
         }
     }
-    close $fh_results;
-    
-    return \@sequences;
+
+    return $all_completed;
 }
 
 sub buildRSConsensiParallel {
@@ -305,21 +216,12 @@ sub buildRSConsensiParallel {
     my ($status, $resultCollection) = $engine->search();
     die "BLAST search failed\n" if $status;
 
-    open my $outc_fh, ">", "$params{workDir}/consensi-refined.fa"
-        or die "Cannot open consensi-refined.fa: $!\n";
-    open my $indx_fh, ">", "$params{workDir}/index.html"
-        or die "Cannot open index.html: $!\n";
-
-	$resultCollection->write("$params{workDir}/RSalign.out", SearchResult::NoAlign);
     # Process results to populate %families hash
-    my %localizedToSeqNames;
     for (my $k = 0; $k < $resultCollection->size(); $k++) {
         my $resultRef = $resultCollection->get($k);
         my $orient = $resultRef->getOrientation();
         my $sampleID = $resultRef->getQueryName();
         my $seqID = "gi|" . ($k + 1) . " ";
-        
-        $localizedToSeqNames{$sampleID}++;
         
         if ($orient eq "C" || $orient eq "-") {
             $seqID .= $sampleID . ":" . 
@@ -334,15 +236,14 @@ sub buildRSConsensiParallel {
         my $sequence = $resultRef->getQueryString();
         $sequence =~ s/-//g;
         
-        # Store in families hash
         push @{$families{$resultRef->getSubjName()}->{elements}}, {
             seqID => $seqID,
             seq   => $sequence,
-            score => $resultRef->getScore() || 0  # Default to 0 if undefined
+            score => $resultRef->getScore() || 0
         };
     }
     
-    # Safe sorting of families by size
+    # Sort families by size
     my @sortedKeys = sort {
         my $size_a = defined $families{$a}->{elements} ? scalar(@{$families{$a}->{elements}}) : 0;
         my $size_b = defined $families{$b}->{elements} ? scalar(@{$families{$b}->{elements}}) : 0;
@@ -354,9 +255,9 @@ sub buildRSConsensiParallel {
     # Process refinable families
     my %refinableFamilies;
     my $familyID = 0;
+    my @family_ids;
     
     foreach my $key (@sortedKeys) {
-        # Check if elements array exists and has enough members
         next unless defined $families{$key}->{elements} 
                    && @{$families{$key}->{elements}} >= $params{familyCutoff};
         
@@ -368,13 +269,12 @@ sub buildRSConsensiParallel {
             or die "Cannot open $family_file: $!\n";
             
         my $numElements = 0;
-        # Safe sorting of elements by score
         foreach my $ele (
             sort {
                 ($b->{score} || 0) <=> ($a->{score} || 0)
             } @{$families{$key}->{elements}}
         ) {
-            last if $numElements >= 100;  # Limit to top 100 elements
+            last if $numElements >= MAX_ELEMENTS;
             print $fam_fh ">$ele->{seqID}\n$ele->{seq}\n";
             $numElements++;
         }
@@ -382,68 +282,21 @@ sub buildRSConsensiParallel {
         
         $families{$key}->{numOfEles} = $numElements;
         $refinableFamilies{$key}++;
+        push @family_ids, $familyID;
         $familyID++;
     }
 
+    # Process families in parallel
     my $success = process_families_parallel(
-        [sort keys %refinableFamilies],
+        \@family_ids,
         $params{workDir},
         $params{max_parallel}
     );
 
     die "Family processing failed\n" unless $success;
 
-    # Process results and create final files
-    my @indices;
-    for my $key (keys %refinableFamilies) {
-        my ($cons, $maSize) = get_family_consensus(
-            $params{workDir},
-            $families{$key}->{roundfam}
-        );
-        
-        next unless $cons;
-        
-        $families{$key}->{consensus} = $cons;
-        $families{$key}->{finalElementCount} = $maSize;
-        
-        my $familyID = $families{$key}->{roundfam};
-        my $numElements = $families{$key}->{numOfEles};
-
-        # Create Stockholm alignment if available
-        if (-s "$params{workDir}/family-$familyID.fa.refiner.stk") {
-            process_stockholm_file($params{workDir}, $familyID, $key, $maSize, $numElements);
-        }
-
-        # Write consensus
-        print $outc_fh ">family-$familyID ( RepeatScout Family = $key, " .
-              "Size = " . (@{$families{$key}->{elements}} + 1) .
-              ", Refiner Input Size = $numElements, " .
-              "Final Multiple Alignment Size = $maSize )\n$cons\n";
-
-        # Create index entry
-        my $indexStr = "<a href=\"family-$familyID-cons.html\">family-$familyID" .
-                      " ( RepeatScout Family $key, Size = " . 
-                      (@{$families{$key}->{elements}} + 1) .
-                      ", Refiner Input Size = $numElements, " .
-                      "Final Multiple Alignment Size = $maSize)</a><br>\n";
-        push @indices, [$maSize, $indexStr];
-    }
-
-    # Write final index file
-    close $outc_fh;
-    close $indx_fh;
-    
-    open $indx_fh, ">$params{workDir}/index.html" 
-        or die "Cannot open index.html: $!\n";
-    foreach my $index (sort {$b->[0] <=> $a->[0]} @indices) {
-        print $indx_fh $index->[1];
-    }
-    close $indx_fh;
-
-    # Create final files
-    write_final_files($params{workDir}, $params{consensiFile}, 
-                     $params{combFamiliesFile}, $params{familyCutoff});
-	     collect_final_results($params{workDir});
+    # Process results and write final files
+    collect_final_results($params{workDir});
 }
 
 sub collect_final_results {
@@ -462,10 +315,11 @@ sub collect_final_results {
             or die "Cannot open $parent_dir/consensi.fa: $!\n";
         
         foreach my $cons_file (@cons_files) {
-            if (-s $cons_file) {  # Check if file exists and is not empty
+            if (-s $cons_file) {
                 open my $in, '<', $cons_file 
                     or die "Cannot open $cons_file: $!\n";
-                my $content = do { local $/; <$in> };  # Read entire file
+                my $content = do { local $/; <$in> };
+                print $cons_out $content;
                 close $in;
             } else {
                 warn "Warning: $cons_file is empty or doesn't exist\n";
@@ -476,125 +330,18 @@ sub collect_final_results {
         warn "No refiner_cons files found in $work_dir\n";
     }
     
-    # Collect all refiner.stk files into consensi.stk
-    my @stk_files = glob("$work_dir/family-*.fa.refiner.stk");
-    
-    if (@stk_files) {
-        open my $stk_out, '>', "$parent_dir/consensi.stk" 
-            or die "Cannot open $parent_dir/consensi.stk: $!\n";
-        
-        foreach my $stk_file (@stk_files) {
-            if (-s $stk_file) {  # Check if file exists and is not empty
-                open my $in, '<', $stk_file 
-                    or die "Cannot open $stk_file: $!\n";
-                my $content = do { local $/; <$in> };  # Read entire file
-                close $in;
-            } else {
-                warn "Warning: $stk_file is empty or doesn't exist\n";
-            }
-        }
-        close $stk_out;
-    } else {
-        warn "No refiner.stk files found in $work_dir\n";
-    }
-    
     # Verify output files
     my $cons_size = -s "$parent_dir/consensi.fa";
-    my $stk_size = -s "$parent_dir/consensi.stk";
-    
     print "\nFinal results:\n";
     print "- consensi.fa size: " . ($cons_size || 0) . " bytes\n";
-    print "- consensi.stk size: " . ($stk_size || 0) . " bytes\n";
-}
-
-sub get_family_consensus {
-    my ($work_dir, $family_id) = @_;
-    my ($cons, $maSize) = ('', 1);
-
-    my $cons_file = "$work_dir/family-$family_id.fa.refiner_cons";
-    return unless -s $cons_file;
-
-    open my $fh, '<', $cons_file or return;
-    while (<$fh>) {
-        if (/Final Multiple Alignment Size = (\d+)/) {
-            $maSize = $1;
-        } else {
-            $cons .= $_;
-        }
-    }
-    close $fh;
-
-    $cons =~ s/^[Nn]*([^Nn].*[^Nn])[Nn]*$/$1/;
-    return ($cons, $maSize);
-}
-
-sub process_stockholm_file {
-    my ($work_dir, $family_id, $key, $maSize, $numElements) = @_;
-
-    my $stockholmFile = SeedAlignmentCollection->new();
-    open my $in_fh, "<$work_dir/family-$family_id.fa.refiner.stk"
-        or die "Cannot open refiner.stk: $!\n";
-    open my $out_fh, ">>$work_dir/families.stk"
-        or die "Cannot open families.stk: $!\n";
-
-    $stockholmFile->read_stockholm($in_fh);
-    close $in_fh;
-
-    my $seedAlign = $stockholmFile->get(0);
-    $seedAlign->setDescription("RepeatModeler Generated - rnd-DB_family-$family_id, " .
-                              "RepeatScout: [ Index = $key, RS Size = " .
-                              (@{$families{$key}->{elements}} + 1) .
-                              ", Refiner Input Size = $numElements, " .
-                              "Final Multiple Alignment Size = $maSize ]");
-
-    print $out_fh $seedAlign->toString();
-    close $out_fh;
-}
-
-sub write_final_files {
-    my ($work_dir, $consensi_file, $comb_families_file, $cutoff) = @_;
-
-    my %seedAlnById;
-    if (-s "$work_dir/families.stk") {
-        process_stockholm_alignments($work_dir, \%seedAlnById);
-    }
-
-    open my $cons_fh, ">>$consensi_file" or die "Cannot open $consensi_file: $!\n";
-    open my $stk_fh, ">>$comb_families_file" or die "Cannot open $comb_families_file: $!\n";
-
-    foreach my $key (
-    sort {
-        # Default to 0 if finalElementCount is not defined
-        my $count_b = defined $families{$b}{finalElementCount} ?
-                     $families{$b}{finalElementCount} : 0;
-        my $count_a = defined $families{$a}{finalElementCount} ?
-                     $families{$a}{finalElementCount} : 0;
-        $count_b <=> $count_a
-    } keys %families
-) {
-    # Only process if finalElementCount exists and meets cutoff
-    next unless defined $families{$key}{finalElementCount}
-                && $families{$key}{finalElementCount} >= $cutoff;
-
-    print $stk_fh $seedAlnById{$families{$key}{roundfam}}->toString();
-    print $cons_fh ">rnd-DB_family-" . $families{$key}{roundfam} .
-                   " ( RepeatScout Family Size = " .
-                   (@{$families{$key}{elements}} + 1) .
-                   ", Final Multiple Alignment Size = " .
-                   $families{$key}{finalElementCount} . " )\n" .
-                   $families{$key}{consensus} . "\n";
-}
-    close $cons_fh;
-    close $stk_fh;
 }
 
 sub filter_satellites {
-	my ($work_dir, $thread_count) = @_;
+    my ($work_dir, $thread_count) = @_;
     
     my $searchEngineN = NCBIBlastSearchEngine->new(pathToEngine => $RMBLASTN_PRGM);
     die "Cannot execute $RMBLASTN_PRGM\n" unless defined $searchEngineN;
     
-    # Set up search engine
     $searchEngineN->setMatrix("$FindBin::RealBin/Matrices/ncbi/nt/comparison.matrix");
     $searchEngineN->setTempDir($work_dir);
     $searchEngineN->setMinScore(250);
@@ -656,7 +403,7 @@ sub filter_satellites {
             unless (exists $satelliteSeqIDs{$seqID}) {
                 my $seq = $consDB->getSequence($seqID);
                 my $desc = $consDB->getDescription($seqID);
-                print $outc_fh ">$seqID\n";
+                print $outc_fh ">$seqID $desc\n";
                 $seq =~ s/(.{50})/$1\n/g;
                 print $outc_fh "$seq\n";
             }
@@ -676,77 +423,4 @@ sub filter_satellites {
     undef $searchEngineN;
 }
 
-sub collect_families_with_sequences {
-    my ($engine, $work_dir, $sample_file) = @_;
-    my %family_data;
-    my %family_sequences;
-
-    $engine->setQuery($sample_file);
-    $engine->setSubject("$work_dir/consensi.fa");
-    my ($status, $results) = $engine->search();
-    die "BLAST search failed\n" if $status;
-
-    # Process search results and collect sequences
-    for (my $i = 0; $i < $results->size(); $i++) {
-        my $result = $results->get($i);
-        my $family_id = $result->getSubjName();
-        push @{$family_data{$family_id}}, $result;
-
-        # Store sequence data
-        push @{$family_sequences{$family_id}}, {
-            seqID => $result->getQueryName(),
-            sequence => $result->getQueryString(),
-            score => $result->getScore()
-        };
-    }
-
-    my @sorted_families = sort {
-        scalar(@{$family_data{$b}}) <=> scalar(@{$family_data{$a}})
-    } keys %family_data;
-
-    return (\@sorted_families, \%family_sequences);
-}
-
-sub combine_results {
-    my ($families, $consensus_file, $stockholm_file) = @_;
-    
-    open(my $cons_fh, '>>', $consensus_file) 
-        or die "Cannot open $consensus_file: $!\n";
-    open(my $stock_fh, '>>', $stockholm_file) 
-        or die "Cannot open $stockholm_file: $!\n";
-    
-    foreach my $family (@$families) {
-        my $family_cons = read_family_consensus($family);
-        print $cons_fh $family_cons if $family_cons;
-        
-        my $family_align = read_family_alignment($family);
-        print $stock_fh $family_align if $family_align;
-    }
-    
-    close $cons_fh;
-    close $stock_fh;
-}
-
-sub read_family_consensus {
-    my ($family) = @_;
-    my $cons_file = "family-$family.fa.refiner_cons";
-    return '' unless -s $cons_file;
-    
-    open(my $fh, '<', $cons_file) or return '';
-    local $/ = undef;
-    my $content = <$fh>;
-    close $fh;
-    return $content;
-}
-
-sub read_family_alignment {
-    my ($family) = @_;
-    my $align_file = "family-$family.fa.refiner.stk";
-    return '' unless -s $align_file;
-    
-    open(my $fh, '<', $align_file) or return '';
-    local $/ = undef;
-    my $content = <$fh>;
-    close $fh;
-    return $content;
-}
+1;

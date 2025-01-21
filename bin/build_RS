@@ -103,7 +103,7 @@ sub runRepeatScout {
     $ENV{'DUSTMASKER_COMMAND'} = $DUSTMASKER_PRGM;
     $cmd                       =
           "filter-stage-1.prl $fastaFile.rscons > "
-        . "$fastaFile.rscons.filtered 2>> filter-stage-1.log";
+        . "$fastaFile.rscons.filtered > filter-stage-1.log";
     `$cmd`;
 
     my $finalFams = 0;

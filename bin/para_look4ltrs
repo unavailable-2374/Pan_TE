@@ -4,7 +4,6 @@ use strict;
 use warnings;
 use Cwd;
 
-# 检查命令行参数
 my $fasta_file = $ARGV[0];
 unless ($fasta_file) {
     die "Usage: $0 <fasta_file>\n";
@@ -13,23 +12,20 @@ unless ($fasta_file) {
 my $i=0;
 chdir $ARGV[2];
 chdir "look4ltrs"; 
-# 打开FASTA文件
+
 open(my $fh, '<', "$fasta_file") or die "Cannot open file $fasta_file: $!";
 
-my $out_fh; # 文件句柄用于输出文件
+my $out_fh; 
 my $length = 0;
 while (my $line = <$fh>) {
     chomp $line;
 	
-    # 如果行以大于号开头，表明是新的染色体
     if ($line =~ /^>(\S+)/) {
         my $chromosome = $1;
 
-        # 关闭之前染色体的文件句柄（如果有的话）
         close($out_fh) if $out_fh;
 		$i++;
         mkdir "chr$i" unless -e "chr$i";
-        # 为新染色体打开新的输出文件
         open($out_fh, '>>', "chr$i/chr$i.fasta") or die "Cannot open file $chromosome.fasta: $!";
         print $out_fh "$line\n";
     } else {
@@ -38,7 +34,6 @@ while (my $line = <$fh>) {
 			#$i++;
 		#	$length = 0;
 		#}
-        # 否则，将序列行写入当前染色体的文件
         print $out_fh "$line\n";
     }
 }
@@ -85,3 +80,63 @@ system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
 }
 $cmdString="cd-hit-est -i raw.fa -o consensi.fa -c 0.8 -aS 0.8 -M 0 -d 0 -T 0 -n 5 -g 1 -b 500 -G 0 -A 80 -l 30 > cd.log";
 system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
+
+	def process_alignments(self, alignments, reference):
+		"""
+		更灵活的对齐片段合并示例:
+		- 对同一个 query 可能有多个 hits（分段或重叠）,
+		- 将它们合并到同一条“对齐序列”中,
+		- 如果重叠，优先保留得分更高的对齐片段。
+		"""
+		ref_length = len(reference.seq)
+		# 记录：query_id -> [一个字符数组（长 = ref_length），初始全为 '-']
+		query_aln_dict = {}
+
+		# 还要记录每个 query、每个 ref-position 上的分数 (便于重叠时优先保留)
+		query_score_dict = {}
+
+		# 初始化
+		all_query_ids = set([aln.query_id for aln in alignments])
+		for qid in all_query_ids:
+			query_aln_dict[qid] = ['-' for _ in range(ref_length)]
+			query_score_dict[qid] = [0.0 for _ in range(ref_length)]
+
+		# 依次处理每条比对
+		for aln in alignments:
+			qid = aln.query_id
+			# 如果方向是 'minus'，要先反向互补
+			if aln.orientation == 'plus':
+				qseq = aln.alignment[0]
+			else:
+				qseq = str(Seq(aln.alignment[0]).reverse_complement())
+
+			# subject_start, subject_end 基于 1-based 坐标
+			# Python list 是 0-based，所以要注意减1
+			subj_start = aln.subject_start - 1
+			subj_end   = aln.subject_end   - 1
+
+			# 注意：如果 qseq 长度和 (subj_end-subj_start+1) 不一致，要做一些保护
+			# 这里假设它们相等，即无内部 gap
+			aligned_len = len(qseq)
+			expected_len = (subj_end - subj_start + 1)
+			if aligned_len != expected_len:
+				# 如果不匹配，你需要做额外处理或跳过这个对齐
+				continue
+
+			# 现在把 qseq 的每个碱基放到 query_aln_dict[qid] 的正确位置上
+			# 并比较 alignment score，若当前位置已有碱基且新对齐分数更高，就替换
+			for i in range(aligned_len):
+				ref_pos = subj_start + i
+				base    = qseq[i]
+				# 如果当前对齐分数更高，就替换
+				if aln.score > query_score_dict[qid][ref_pos]:
+					query_aln_dict[qid][ref_pos] = base
+					query_score_dict[qid][ref_pos] = aln.score
+
+		# 最后，把每个 query_id 的字符数组变成字符串
+		final_seqs = []
+		for qid in all_query_ids:
+			merged_seq = ''.join(query_aln_dict[qid])
+			final_seqs.append(merged_seq)
+
+		return final_seqs

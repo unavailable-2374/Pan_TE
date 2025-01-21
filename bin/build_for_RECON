@@ -176,11 +176,11 @@ sub run_parallel_refiners {
         my $instancesFile = "family-$familyID.fa";
         my $cmd = "$FindBin::RealBin/Refiner.py"
                 . " $instancesFile "
-		. $instancesFile .".refiner_cons"
-		. " -t 4"
-		. " -c 0.3"
-		. " -f 0.5"
-                . " -s 0.6";
+		        . $instancesFile .".refiner_cons"
+		        . " -t 4"
+                . " --min-score 150"
+                . " --gap-init 20"
+                . " --gap-ext 5";
         system($cmd);
         $pm->finish;
     }
