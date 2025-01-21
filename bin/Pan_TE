@@ -116,11 +116,10 @@ sub parse_arguments {
         "genome=s" => \$opts{genome},
         "cpu=i" => \$opts{cpu},
         "out=s" => \$opts{out},
-        "list=s" => \$opts{list},
+        "D=s" => \$opts{dir},
         "M=i" => \$opts{mem},
         "ClassifyTE_dir=s" => \$opts{model_dir},
         "RM_dir=s" => \$opts{rm_dir},
-        "flag=s" => \$opts{style},
         "fragment_size=i" => \$opts{fragment_size}
     ) or usage();
 
@@ -143,13 +142,12 @@ Parameters:
     --RM_dir <string>         Path to rmblastn for classification.
 
 [Other]
-    --list <string>           Default: NA. Path file for GFA.
-    --out <string>           Default: current directory. Work directory.
-    -M <int>                 Memory limit (MB), default: 0 (unlimited).
-    --flag <string>          PGGB or Minigraph-Cactus.
-    --cpu <int>             Default: 4. Number of threads.
-    --fragment_size <int>    Default: 40000. Fragment length.
-    --help|-h               Display this help.
+    --D <string>              Default: NA. Path file for VCF.
+    --out <string>            Default: current directory. Work directory.
+    -M <int>                  Memory limit (MB), default: 0 (unlimited).
+    --cpu <int>               Default: 4. Number of threads.
+    --fragment_size <int>     Default: 40000. Fragment length.
+    --help|-h                 Display this help.
 
 Version: $VERSION
 END_USAGE
@@ -174,6 +172,9 @@ sub process_genome {
     create_checkpoint("genome.ok");
 }
 
+use File::Path qw(make_path);
+use Parallel::ForkManager;
+
 sub process_graph_genome {
     my ($opts, $file_stats) = @_;
 
@@ -188,13 +189,19 @@ sub process_graph_genome {
     make_path("genome") unless -e "genome";
     chdir "genome" or die "Cannot change to genome directory: $!\n";
 
-    my $cmd = $opts->{style} eq "PGGB"
-        ? "Process_For_PGGB"
-        : "Process_For_MC";
+    my @vcf_files = glob("$opts->{dir}/*.vcf");
+    die "No VCF files found in $opts->{dir}\n" unless @vcf_files;
 
-    run_cmd("$cmd $opts->{list} ./ $min_length $max_length " .
-            MIN_CORE_LENGTH . " $min_length " . CORE_UNIQ_LENGTH .
-            " $opts->{cpu} &> decode_for_" . lc($opts->{style}) . ".log");
+    my $pm = Parallel::ForkManager->new($opts->{cpu});
+
+    foreach my $vcf (@vcf_files) {
+        $pm->start and next; 
+        run_cmd("decode_gfa.pl $vcf"); 
+        $pm->finish;          
+    }
+    $pm->wait_all_children;
+
+    run_cmd("cat *.fa > combined.fa");
 
     run_cmd("index genome");
     create_checkpoint("../genome.ok");

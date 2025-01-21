@@ -1,9 +1,12 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
+use File::Basename;
 
-open(LIST,$ARGV[0]);
-open(OUT,">>SV.fa");
+my $out = basename($ARGV[0], ".vcf");
+
+open(LIST,$ARGV[0];);
+open(OUT,">>$out");
 while(<LIST>){
     chomp;
     if(/^#/){next;}
@@ -20,8 +23,8 @@ while(<LIST>){
                 }
             }if($num > 1){
                 system("cd-hit-est -i tmp.fa -o tmp.fasta -c 0.8 -aS 0.8 -M 0 -d 0 -T 0 -n 5 -g 1 -b 500 -G 0 -A 80 -l 30 &>> tmp.log");
-                `cat tmp.fasta >> SVs.fa`;
-            }elsif($num==1){`cat tmp.fa >> SVs.fa`;}
+                `cat tmp.fasta >> $out`;
+            }elsif($num==1){`cat tmp.fa >> $out`;}
             unlink "tmp.fa";
         }else{print OUT ">SV\n".$arr[4]."\n";}
     }
