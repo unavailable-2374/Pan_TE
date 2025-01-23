@@ -48,7 +48,7 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
         --ClassifyTE_dir <string> Provide path to ClassifyTE for classification.
     
     [Other]
-        --D <string>           Default: NA. Path for VCF, see gfa.list for format.
+        --D <string>              Default: NA. Path for VCF, see gfa.list for format.
         --out <string>            Default: current directory. The work directory.
         -M <int>                  Memory limit (in MB), default: 0 (unlimited).
         --cpu <int>               Default: 4. Number of threads, preferably in multiples of 4.
