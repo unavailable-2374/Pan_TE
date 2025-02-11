@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+
+import os
+import logging
+import subprocess
+from collections import defaultdict
+import networkx as nx
+from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
+from Bio.Seq import Seq
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+from statistics import mean
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class LTRClusteringPipeline:
+    def __init__(self, input_fasta, output_dir, 
+                 identity_threshold=0.8, coverage_threshold=0.8,
+                 seq_count_threshold=1000, seq_length_threshold=10000,
+                 threads=1):
+        """Initialize the LTR clustering pipeline"""
+        self.input_fasta = input_fasta
+        self.output_dir = output_dir
+        self.identity_threshold = identity_threshold
+        self.coverage_threshold = coverage_threshold
+        self.seq_count_threshold = seq_count_threshold
+        self.seq_length_threshold = seq_length_threshold
+        self.threads = threads
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+
+    def run_initial_clustering(self, input_fasta, output_paf):
+        """Run initial fast clustering using minimap2"""
+        cmd = [
+            "minimap2",
+            "-k", "15",          # smaller k-mer for higher sensitivity
+            "-w", "10",          # window size
+            "-A", "4",           # matching score
+            "-B", "8",           # mismatch penalty
+            "-O", "4,24",        # gap open penalties
+            "-E", "2,1",         # gap extension penalties
+            "-z", "400",         # Z-drop score
+            "-N", "150",         # minimum chain score
+            "--no-long-join",    # disable joining long gaps
+            "-F", "1000",        # max fragment length
+            "-p", "0.6",         # min secondary-to-primary score ratio
+            "--secondary=no",    # disable secondary alignments
+            "-t", str(self.threads),
+            "-o", output_paf,
+            input_fasta,
+            input_fasta
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info(f"Completed minimap2 alignment: {output_paf}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Minimap2 alignment failed: {e.stderr.decode()}")
+            raise
+
+    def build_multiple_alignment_large_cluster(self, input_fasta, output_file):
+        """Build multiple alignment for large clusters using MAFFT"""
+        # First run LAST to generate pairwise alignments
+        db_prefix = f"{output_file}.lastdb"
+        last_cmd = [
+            "lastdb",
+            "-v",
+            "-R01",
+            db_prefix,
+            input_fasta
+        ]
+        
+        try:
+            result = subprocess.run(last_cmd, check=True, capture_output=True, text=True)
+            logger.info(f"Created LAST database: {db_prefix}")
+            logger.debug(f"lastdb output: {result.stdout}")
+            
+            # Run LAST alignment with correct parameters
+            last_out = f"{output_file}.maf"
+            align_cmd = [
+                "lastal",
+                "-v",
+                "-m", "50",
+                "-e", "30",
+                "-a", "7",
+                "-j", "3",
+                "-q", "3",
+                "-r", "2",
+                "-b", "1", 
+                "-f", "1",
+                db_prefix,
+                input_fasta
+            ]
+            
+            with open(last_out, 'w') as f:
+                result = subprocess.run(align_cmd, check=True, stdout=f, stderr=subprocess.PIPE, text=True)
+                logger.debug(f"lastal stderr: {result.stderr}")
+                
+            convert_cmd = ["maf-convert", "sam", last_out]
+            with open(f"{output_file}.sam", 'w') as f:
+                subprocess.run(convert_cmd, check=True, stdout=f)
+            
+            mafft_cmd = [
+                "mafft",
+                "--localpair",
+                "--maxiterate", "1000",
+                "--quiet",
+                "--ep", "0.123",
+                "--retree", "2",
+                "--thread", str(self.threads),
+                "--adjustdirection",
+                input_fasta
+            ]
+            
+            with open(output_file, 'w') as f:
+                subprocess.run(mafft_cmd, check=True, stdout=f)
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Alignment failed: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            raise
+        finally:
+            # Clean up temporary files
+            for ext in [".lastdb", ".maf", ".sam"]:
+                try:
+                    os.remove(f"{output_file}{ext}")
+                except OSError:
+                    pass
+
+    def parse_paf(self, paf_file):
+        graph = nx.Graph()
+        edge_weights = defaultdict(list)
+        
+        with open(paf_file) as f:
+            for line in f:
+                fields = line.strip().split('\t')
+                query_name = fields[0]
+                target_name = fields[5]
+                
+                if query_name == target_name:
+                    continue
+                    
+                matches = int(fields[9])        # 匹配数
+                aln_length = int(fields[10])    # 比对长度
+                query_length = int(fields[1])   # 查询序列长度
+                target_length = int(fields[6])  # 目标序列长度
+                
+                identity = matches / aln_length
+                coverage = aln_length / min(query_length, target_length)
+                
+                length_ratio = min(query_length, target_length) / max(query_length, target_length)
+                terminal_score = self._calculate_terminal_score(fields)
+                
+                if (identity >= self.identity_threshold and 
+                    coverage >= self.coverage_threshold):
+                    weight = self._calculate_combined_weight(
+                        identity, coverage, length_ratio, terminal_score
+                    )
+                    edge_weights[(query_name, target_name)].append(weight)
+        
+        for (node1, node2), weights in edge_weights.items():
+            avg_weight = sum(weights) / len(weights)
+            graph.add_edge(node1, node2, weight=avg_weight)
+        
+        return graph
+
+    def _calculate_terminal_score(self, paf_fields):
+        try:
+            cigar_str = [f for f in paf_fields if f.startswith('cg:Z:')]
+            if cigar_str:
+                cigar = cigar_str[0].split(':')[2]
+                return self._analyze_terminal_matches(cigar)
+        except (IndexError, ValueError):
+            pass
+        return 0.5  
+
+    def _analyze_terminal_matches(self, cigar):
+        TERMINAL_LENGTH = 100  # 考虑的末端长度
+        operations = []
+        current_num = ""
+        
+        for char in cigar:
+            if char.isdigit():
+                current_num += char
+            else:
+                if current_num:
+                    operations.append((char, int(current_num)))
+                    current_num = ""
+                    
+        left_matches = 0
+        right_matches = 0
+        current_pos = 0
+        
+        for op, length in operations:
+            if current_pos >= TERMINAL_LENGTH:
+                break
+            if op == 'M':  
+                left_matches += min(length, TERMINAL_LENGTH - current_pos)
+            current_pos += length
+            
+        current_pos = 0
+        for op, length in reversed(operations):
+            if current_pos >= TERMINAL_LENGTH:
+                break
+            if op == 'M':  # 匹配
+                right_matches += min(length, TERMINAL_LENGTH - current_pos)
+            current_pos += length
+            
+        terminal_score = (left_matches + right_matches) / (2 * TERMINAL_LENGTH)
+        return min(1.0, terminal_score)
+
+    def _calculate_combined_weight(self, identity, coverage, length_ratio, terminal_score):
+        w1, w2, w3, w4 = 0.4, 0.3, 0.1, 0.2
+        return (w1 * identity + 
+                w2 * coverage + 
+                w3 * length_ratio + 
+                w4 * terminal_score)
+
+    def cluster_sequences(self, graph):
+        """Perform clustering using connected components"""
+        return list(nx.connected_components(graph))
+
+    def is_large_cluster(self, cluster, sequences):
+        """Determine if a cluster is 'large' based on sequence count and length"""
+        if len(cluster) >= self.seq_count_threshold:
+            return True
+            
+        avg_length = mean(len(sequences[seq_id].seq) for seq_id in cluster)
+        if avg_length >= self.seq_length_threshold:
+            return True
+            
+        return False
+
+    def build_consensus_for_cluster(self, cluster, sequences, cluster_idx):
+        """Build consensus sequence for a cluster"""
+        if len(cluster) == 1:
+            seq_id = list(cluster)[0]
+            consensus_file = os.path.join(self.output_dir, f"consensus_{cluster_idx}.fa")
+            
+            with open(consensus_file, "w") as f:
+                SeqIO.write(sequences[seq_id], f, "fasta")
+            
+            logger.info(f"Single sequence cluster {cluster_idx}, direct output")
+            return consensus_file
+            
+        cluster_fasta = os.path.join(self.output_dir, f"cluster_{cluster_idx}.fa")
+        cluster_seqs = []
+        for seq_id in cluster:
+            cluster_seqs.append(sequences[seq_id])
+            
+        with open(cluster_fasta, "w") as f:
+            SeqIO.write(cluster_seqs, f, "fasta")
+            
+        consensus_file = os.path.join(self.output_dir, f"consensus_{cluster_idx}.fa")
+        
+        # 检查是否是大簇
+        is_large = self.is_large_cluster(cluster, sequences)
+        
+        if is_large:
+            logger.info(f"Processing large cluster {cluster_idx} "
+                    f"(size={len(cluster)}) using MAFFT")
+            self.build_multiple_alignment_large_cluster(cluster_fasta, consensus_file)
+            
+            alignment = list(SeqIO.parse(consensus_file, "fasta"))
+            consensus_seq = self.build_consensus_from_mafft(alignment)
+            
+            with open(consensus_file, "w") as f:
+                SeqIO.write(consensus_seq, f, "fasta")
+        else:
+            logger.info(f"Processing cluster {cluster_idx} using Refiner_for_Graph")
+            from Refiner_for_Graph import TEConsensusBuilder, Config
+            config = Config()
+            builder = TEConsensusBuilder(
+                rmblast_dir=os.path.dirname(config.rmblastn),
+                makeblastdb_path=config.makeblastdb,
+                matrix_path=config.matrix_path,
+                threads=self.threads
+            )
+            builder.build_clustered_consensus(cluster_fasta, consensus_file)
+            
+        return consensus_file
+
+    def build_consensus_from_mafft(self, alignment):
+        """Build consensus sequence from MAFFT multiple alignment"""
+        if not alignment:
+            return None
+            
+        aln_length = len(alignment[0].seq)
+        consensus = []
+        
+        for i in range(aln_length):
+            bases = [record.seq[i] for record in alignment if i < len(record.seq)]
+            base_counts = defaultdict(int)
+            for base in bases:
+                if base != '-':
+                    base_counts[base] += 1
+                    
+            if base_counts:
+                max_base = max(base_counts.items(), key=lambda x: x[1])[0]
+                consensus.append(max_base)
+                
+        consensus_seq = SeqRecord(
+            Seq(''.join(consensus)),
+            id=f"consensus",
+            description=f"consensus from {len(alignment)} sequences"
+        )
+        
+        return consensus_seq
+
+    def run(self):
+        """Run the complete pipeline"""
+        logger.info("Starting LTR clustering pipeline")
+        
+        sequences = SeqIO.to_dict(SeqIO.parse(self.input_fasta, "fasta"))
+        initial_count = len(sequences)
+        logger.info(f"Read {initial_count} input sequences")
+        
+        paf_file = os.path.join(self.output_dir, "initial_alignment.paf")
+        self.run_initial_clustering(self.input_fasta, paf_file)
+        
+        graph = self.parse_paf(paf_file)
+        clusters = self.cluster_sequences(graph)
+        
+        clustered_seqs = set()
+        for cluster in clusters:
+            clustered_seqs.update(cluster)
+            
+        missing_seqs = set(sequences.keys()) - clustered_seqs
+        if missing_seqs:
+            logger.warning(f"Found {len(missing_seqs)} unclustered sequences")
+            for seq_id in missing_seqs:
+                clusters.append({seq_id})
+        
+        logger.info(f"Found {len(clusters)} clusters")
+        logger.info(f"Total sequences in clusters: {sum(len(c) for c in clusters)}")
+        
+        assert sum(len(c) for c in clusters) == initial_count, \
+            "Some sequences were lost during clustering"
+        
+        logger.info("Building consensus sequences for clusters...")
+        consensus_files = []
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures = []
+            for idx, cluster in enumerate(clusters):
+                future = executor.submit(self.build_consensus_for_cluster, 
+                                    cluster, sequences, idx)
+                futures.append(future)
+                
+            for future in futures:
+                try:
+                    consensus_file = future.result()
+                    if consensus_file:
+                        consensus_files.append(consensus_file)
+                except Exception as e:
+                    logger.error(f"Error building consensus: {e}")
+                    
+        final_consensus = os.path.join(self.output_dir, "consensi.fa")
+        with open(final_consensus, "w") as outf:
+            for cons_file in consensus_files:
+                try:
+                    for record in SeqIO.parse(cons_file, "fasta"):
+                        SeqIO.write(record, outf, "fasta")
+                except Exception as e:
+                    logger.error(f"Error writing consensus {cons_file}: {e}")
+                        
+        logger.info(f"Pipeline complete. Final consensus: {final_consensus}")
+        return final_consensus
+
+def main():
+    parser = argparse.ArgumentParser(description="LTR Clustering Pipeline")
+    parser.add_argument("input_fasta", help="Input FASTA file")
+    parser.add_argument("output_dir", help="Output directory")
+    parser.add_argument("--identity", type=float, default=0.6,
+                      help="Minimum sequence identity (default: 0.6)")
+    parser.add_argument("--coverage", type=float, default=0.6,
+                      help="Minimum alignment coverage (default: 0.6)")
+    parser.add_argument("--seq-count", type=int, default=1000,
+                      help="Sequence count threshold for large clusters (default: 1000)")
+    parser.add_argument("--seq-length", type=int, default=10000,
+                      help="Sequence length threshold for large clusters (default: 10000)")
+    parser.add_argument("--threads", type=int, default=1,
+                      help="Number of threads (default: 1)")
+    
+    args = parser.parse_args()
+    
+    pipeline = LTRClusteringPipeline(
+        args.input_fasta,
+        args.output_dir,
+        identity_threshold=args.identity,
+        coverage_threshold=args.coverage,
+        seq_count_threshold=args.seq_count,
+        seq_length_threshold=args.seq_length,
+        threads=args.threads
+    )
+    
+    pipeline.run()
+
+if __name__ == "__main__":
+    main()

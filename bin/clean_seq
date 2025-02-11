@@ -3,14 +3,20 @@ import sys
 
 def replace_degenerate_symbols(input_file, output_file):
     degenerate_symbols = set('WRMKYSHBVDXNwrmkyshbvd')
-
-    with open(input_file, 'r') as infile:
-        sequence = infile.read()
-
-    converted_sequence = ''.join('C' if base in degenerate_symbols else base for base in sequence)
-
-    with open(output_file, 'w') as outfile:
-        outfile.write(converted_sequence)
+    
+    with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
+        is_sequence = False
+        for line in infile:
+            line = line.strip()
+            if line.startswith('>'):
+                is_sequence = False
+                outfile.write(line + '\n')
+            else:
+                is_sequence = True
+                if is_sequence:
+                    converted_line = ''.join('N' if base in degenerate_symbols else base 
+                                          for base in line)
+                    outfile.write(converted_line + '\n')
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
@@ -19,5 +25,5 @@ if __name__ == "__main__":
 
     input_file = sys.argv[1]
     output_file = sys.argv[2]
-
+    
     replace_degenerate_symbols(input_file, output_file)

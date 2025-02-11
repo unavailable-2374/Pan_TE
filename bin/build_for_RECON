@@ -180,7 +180,7 @@ sub run_parallel_refiners {
 		        . " -t 4"
                 . " --min-score 150"
                 . " --gap-init 20"
-                . " --gap-ext 5";
+                . " --gap-ext 5 2> refine.log";
         system($cmd);
         $pm->finish;
     }

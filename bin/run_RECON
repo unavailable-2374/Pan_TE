@@ -10,17 +10,16 @@ use constant {
     BLAST_DB_TYPE => 'nucl'
 };
 
-die "Usage: $0 round_num threads genome_file genome_size batch_size rm_dir\n"
-    unless @ARGV == 6;
+die "Usage: $0 round_num threads genome_file genome_size batch_size\n"
+    unless @ARGV == 5;
 
-my ($round_num, $threads, $genome_file, $genome_size, $batch_size, $rm_dir) = @ARGV;
+my ($round_num, $threads, $genome_file, $genome_size, $batch_size) = @ARGV;
 
 die "Round number must be positive\n" unless $round_num > 0;
 die "Threads must be at least " . MIN_THREADS . "\n" unless $threads >= MIN_THREADS;
 die "Genome file $genome_file not found\n" unless -f $genome_file;
 die "Invalid genome size\n" unless $genome_size =~ /^\d+$/;
 die "Invalid batch size\n" unless $batch_size =~ /^\d+$/;
-die "RM directory $rm_dir not found\n" unless -f $rm_dir;
 
 my $tmp_dir = "round-$round_num";
 chdir $tmp_dir or die "Cannot change to directory $tmp_dir: $!\n";
@@ -32,11 +31,13 @@ $cpu_threads = MIN_THREADS if $cpu_threads < MIN_THREADS;
 process_repeat_masker($genome_file, $cpu_threads, $times, $batch_size);
 process_blast_db($threads);
 run_recon_pipeline();
-build_final_output($threads, $rm_dir);
+build_final_output($threads);
 
 my $ok_file = "../round-${round_num}.ok";
 open(my $fh_ok, '>', $ok_file) or die "Cannot create $ok_file: $!\n";
 close $fh_ok;
+
+chdir "../";
 
 exit 0;
 
@@ -57,9 +58,8 @@ sub process_repeat_masker {
         }
     }
     
-    # Run RepeatMasker
     run_cmd("RepeatMasker -lib lib.fa -e rmblast -lcambig -dir repeat " . 
-            "-pa $cpu_threads -q tmp.fa -div 10");
+            "-pa $cpu_threads -q tmp.fa -div 10 2> rm.log");
 }
 
 sub process_blast_db {
@@ -84,7 +84,7 @@ sub run_recon_pipeline {
         make_path($dir) unless -d $dir;
     }
     
-    run_cmd("imagespread seq_name.list msp.out");
+    run_cmd("imagespread seq_name.list msp.out > imagespread.log 2> imagespread.log");
     move_gmon("imagespread");
     
     run_cmd("sort -k 3,3 -k 4n,4n -k 5nr,5nr images/spread1 > images/images_sorted");
@@ -96,7 +96,7 @@ sub run_recon_pipeline {
     
     process_edge_redefinition();
     
-    run_cmd("famdef seq_name.list");
+    run_cmd("famdef seq_name.list > famdef.log 2> famdef.log");
     move_gmon("famdef");
 }
 
@@ -104,7 +104,7 @@ sub process_element_definition {
     remove_tree('ele_def_res');
     make_path('ele_def_res');
     
-    run_cmd("eledef seq_name.list msp.out single");
+    run_cmd("eledef seq_name.list msp.out single > eledef.log 2> eledef.log");
     move_gmon("eledef");
 }
 
@@ -113,7 +113,7 @@ sub process_element_redefinition {
     make_path('ele_redef_res');
     
     create_symlinks('ele_def_res', 'ele_redef_res');
-    run_cmd("eleredef seq_name.list");
+    run_cmd("eleredef seq_name.list > eleredef.log  2> eleredef.log");
     move_gmon("eleredef");
     remove_symlinks();
 }
@@ -123,7 +123,7 @@ sub process_edge_redefinition {
     make_path('edge_redef_res');
     
     create_symlinks('ele_redef_res', 'edge_redef_res');
-    run_cmd("edgeredef seq_name.list");
+    run_cmd("edgeredef seq_name.list > edgeredef.log 2> edgeredef.log");
     move_gmon("edgeredef");
     remove_symlinks();
     
@@ -206,8 +206,8 @@ sub move_gmon {
 }
 
 sub build_final_output {
-    my ($threads, $rm_dir) = @_;
-    run_cmd("build_for_RECON ./ ../../genome/genome.fa $threads $rm_dir");
+    my ($threads) = @_;
+    run_cmd("build_for_RECON ./ ../../genome/genome.fa $threads");
 }
 
 sub run_cmd {

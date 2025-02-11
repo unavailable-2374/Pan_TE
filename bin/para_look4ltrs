@@ -50,10 +50,10 @@ my $cmdString;
 
 if($i>$ARGV[1]){
 	$threads = 1;
-	$cmdString="ParaFly -c command.list -CPU $ARGV[1] > /dev/null";
+	$cmdString="ParaFly -c command.list -CPU $ARGV[1] > look4ltr.err 2> look4ltr.log";
 }else{
 	$threads = int($ARGV[1]/$i);
-	$cmdString="ParaFly -c command.list -CPU $i > /dev/null";
+	$cmdString="ParaFly -c command.list -CPU $i > look4ltr.err 2> look4ltr.log";
 }
 
 for(my $j = 1;$j<=$i;$j++){
@@ -64,79 +64,26 @@ for(my $j = 1;$j<=$i;$j++){
 unless ( -e "raw.fa"){
    system("$cmdString") ;
 for(my $j = 1;$j<=$i;$j++){
-	`cat $current_dir/chr$j/Bed/*.bed >> $current_dir/genome.bed`;
+	`cat $current_dir/chr$j/Rtr/*.rtr | grep -v "RightEnd" >> $current_dir/genome.rtr`;
+}
+open(IN,"$current_dir/genome.rtr");
+open(OUT,">$current_dir/genome.bed");
+
+while(<IN>){
+	chomp;
+	my @arr=split(/\t/);
+	if($arr[15]>0.9){
+		if($arr[5] eq "NA"){
+			print OUT $arr[0]."\t".$arr[2]."\t".$arr[3]."\n";
+		}elsif($arr[2] eq "NA"){print OUT $arr[0]."\t".$arr[4]."\t".$arr[5]."\n";}
+		else{print OUT $arr[0]."\t".$arr[2]."\t".$arr[5]."\n";}
+	}
+}
 	`sort -k1,1 -k2,2n $current_dir/genome.bed > $current_dir/genome.sorted.bed`;
 	`clean_list $current_dir/genome.sorted.bed $current_dir/genome.cleaned.bed`;
 	`seqtk subseq $fasta_file/genome.fa $current_dir/genome.cleaned.bed > $current_dir/LTR.fa`;
 }
 
-`filter-stage-1.prl LTR.fa > LTR.fa.filter`;
-$cmdString="minimap2 -t $ARGV[1] -n 1 -p 0.5 -B 2 -O 4,12 -z 300,200 -a ../genome/genome.fa LTR.fa.filter > LTR.sam";
+`filter-stage-1.prl LTR.fa > LTR.fa.filter 2>> look4ltr.log`;
+$cmdString="Refiner_for_LTR LTR.fa.filter ./ --threads $ARGV[1] > refine.log 2> refine.err";
 system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-$cmdString="check.py > list.txt";
-system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-$cmdString="seqtk subseq LTR.fa.filter list.txt > raw.fa ";
-system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-}
-$cmdString="cd-hit-est -i raw.fa -o consensi.fa -c 0.8 -aS 0.8 -M 0 -d 0 -T 0 -n 5 -g 1 -b 500 -G 0 -A 80 -l 30 > cd.log";
-system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-
-	def process_alignments(self, alignments, reference):
-		"""
-		更灵活的对齐片段合并示例:
-		- 对同一个 query 可能有多个 hits（分段或重叠）,
-		- 将它们合并到同一条“对齐序列”中,
-		- 如果重叠，优先保留得分更高的对齐片段。
-		"""
-		ref_length = len(reference.seq)
-		# 记录：query_id -> [一个字符数组（长 = ref_length），初始全为 '-']
-		query_aln_dict = {}
-
-		# 还要记录每个 query、每个 ref-position 上的分数 (便于重叠时优先保留)
-		query_score_dict = {}
-
-		# 初始化
-		all_query_ids = set([aln.query_id for aln in alignments])
-		for qid in all_query_ids:
-			query_aln_dict[qid] = ['-' for _ in range(ref_length)]
-			query_score_dict[qid] = [0.0 for _ in range(ref_length)]
-
-		# 依次处理每条比对
-		for aln in alignments:
-			qid = aln.query_id
-			# 如果方向是 'minus'，要先反向互补
-			if aln.orientation == 'plus':
-				qseq = aln.alignment[0]
-			else:
-				qseq = str(Seq(aln.alignment[0]).reverse_complement())
-
-			# subject_start, subject_end 基于 1-based 坐标
-			# Python list 是 0-based，所以要注意减1
-			subj_start = aln.subject_start - 1
-			subj_end   = aln.subject_end   - 1
-
-			# 注意：如果 qseq 长度和 (subj_end-subj_start+1) 不一致，要做一些保护
-			# 这里假设它们相等，即无内部 gap
-			aligned_len = len(qseq)
-			expected_len = (subj_end - subj_start + 1)
-			if aligned_len != expected_len:
-				# 如果不匹配，你需要做额外处理或跳过这个对齐
-				continue
-
-			# 现在把 qseq 的每个碱基放到 query_aln_dict[qid] 的正确位置上
-			# 并比较 alignment score，若当前位置已有碱基且新对齐分数更高，就替换
-			for i in range(aligned_len):
-				ref_pos = subj_start + i
-				base    = qseq[i]
-				# 如果当前对齐分数更高，就替换
-				if aln.score > query_score_dict[qid][ref_pos]:
-					query_aln_dict[qid][ref_pos] = base
-					query_score_dict[qid][ref_pos] = aln.score
-
-		# 最后，把每个 query_id 的字符数组变成字符串
-		final_seqs = []
-		for qid in all_query_ids:
-			merged_seq = ''.join(query_aln_dict[qid])
-			final_seqs.append(merged_seq)
-
-		return final_seqs

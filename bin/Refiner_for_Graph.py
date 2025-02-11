@@ -7,10 +7,12 @@ import numpy as np
 from collections import defaultdict, Counter
 import subprocess
 import os
-import logging
 import time
 import random
+import logging
 from itertools import combinations
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,6 +29,110 @@ class RMBlastAlignment:
         self.subject_end = subject_end
         self.alignment = alignment
         self.orientation = orientation
+
+class SequenceClusterer:
+    def __init__(self, te_builder, distance_threshold=0.7):
+        self.te_builder = te_builder
+        self.distance_threshold = distance_threshold
+    
+    def calculate_distance_matrix(self, sequences):
+        n_seqs = len(sequences)
+        distances = np.zeros((n_seqs, n_seqs))
+        unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        
+        if not os.path.exists('tmp'):
+            os.makedirs('tmp')
+        temp_name = os.path.join('tmp', f'ref_sequences_{unique_id}.fa')
+        with open(temp_name, 'w') as temp_file:
+            SeqIO.write(sequences, temp_file, "fasta")
+            
+        try:
+            alignments = self.te_builder.run_rmblast(temp_name, temp_name)
+            
+            seq_lengths = {seq.id: len(seq.seq) for seq in sequences}
+            seq_id_to_idx = {seq.id: idx for idx, seq in enumerate(sequences)}
+            
+            similarities = np.zeros((n_seqs, n_seqs))
+            
+            for aln in alignments:
+                if aln.query_id != aln.subject_id:
+                    i = seq_id_to_idx[aln.query_id]
+                    j = seq_id_to_idx[aln.subject_id]
+                    
+                    min_len = min(seq_lengths[aln.query_id], seq_lengths[aln.subject_id])
+                    norm_score = aln.score / (min_len * 2)  
+                    
+                    similarities[i,j] = max(similarities[i,j], norm_score)
+                    similarities[j,i] = similarities[i,j]  
+            
+            np.fill_diagonal(similarities, 1.0)
+            
+            distances = 1.0 - similarities
+            
+            distances = np.maximum(distances, 0.0)
+            
+            logger.info(f"Distance matrix shape: {distances.shape}")
+            logger.info(f"Distance range: [{distances.min()}, {distances.max()}]")
+            
+            return distances
+            
+        finally:
+            try:
+                os.remove(temp_name)
+                for ext in ['.nin', '.nsq', '.nhr']:
+                    db_file = temp_name + ext
+                    if os.path.exists(db_file):
+                        os.remove(db_file)
+            except OSError as e:
+                logger.warning(f"Error cleaning up temporary files: {e}")
+    
+    def cluster_sequences(self, sequences):
+        if len(sequences) == 1:
+            return [[sequences[0]]]
+            
+        logger.info("Calculating distance matrix...")
+        distances = self.calculate_distance_matrix(sequences)
+        
+        logger.info("Performing hierarchical clustering...")
+        try:
+            distances = np.maximum(distances, distances.T)
+            
+            condensed_distances = squareform(distances)
+            
+            linkage_matrix = linkage(condensed_distances, method='average')
+            
+            clusters = fcluster(linkage_matrix, t=self.distance_threshold, 
+                              criterion='distance')
+            
+            cluster_dict = defaultdict(list)
+            for seq, cluster_id in zip(sequences, clusters):
+                cluster_dict[cluster_id].append(seq)
+                
+            return list(cluster_dict.values())
+            
+        except Exception as e:
+            logger.error(f"Clustering error: {str(e)}")
+            logger.error(f"Distance matrix stats - min: {distances.min()}, max: {distances.max()}, mean: {distances.mean()}")
+            raise
+
+    def cluster_sequences(self, sequences):
+        if len(sequences) == 1:
+            return [[sequences[0]]]
+            
+        logger.info("Calculating distance matrix...")
+        distances = self.calculate_distance_matrix(sequences)
+        
+        logger.info("Performing hierarchical clustering...")
+        linkage_matrix = linkage(squareform(distances), method='average')
+        
+        clusters = fcluster(linkage_matrix, t=self.distance_threshold, 
+                          criterion='distance')
+        
+        cluster_dict = defaultdict(list)
+        for seq, cluster_id in zip(sequences, clusters):
+            cluster_dict[cluster_id].append(seq)
+            
+        return list(cluster_dict.values())
 
 class TEConsensusBuilder:
     def __init__(self, rmblast_dir, makeblastdb_path, matrix_path,
@@ -54,7 +160,6 @@ class TEConsensusBuilder:
             raise
 
     def run_rmblast(self, query_file, subject_file):
-
         self.prepare_blast_db(subject_file)
 
         cmd = [
@@ -113,12 +218,10 @@ class TEConsensusBuilder:
 
     def find_best_reference(self, sequences):
         unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
-        
         if not os.path.exists('tmp'):
             os.makedirs('tmp')
         
         temp_name = os.path.join('tmp', f'ref_sequences_{unique_id}.fa')
-        
         with open(temp_name, 'w') as temp_file:
             SeqIO.write(sequences, temp_file, "fasta")
 
@@ -148,13 +251,12 @@ class TEConsensusBuilder:
 
     def build_multiple_alignment(self, sequences, reference):
         unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
-        
         if not os.path.exists('tmp'):
             os.makedirs('tmp')
 
         ref_name = os.path.join('tmp', f'reference_{unique_id}.fa')
         query_name = os.path.join('tmp', f'queries_{unique_id}.fa')
-        
+
         with open(ref_name, 'w') as ref_file, open(query_name, 'w') as query_file:
             SeqIO.write([reference], ref_file, "fasta")
             SeqIO.write(sequences, query_file, "fasta")
@@ -176,10 +278,8 @@ class TEConsensusBuilder:
                     logger.warning(f"Error cleaning up temporary files: {e}")
 
     def process_alignments(self, alignments, reference):
-
         ref_length = len(reference.seq)
         query_aln_dict = {}
-
         query_score_dict = {}
 
         all_query_ids = set([aln.query_id for aln in alignments])
@@ -195,7 +295,7 @@ class TEConsensusBuilder:
                 qseq = str(Seq(aln.alignment[0]).reverse_complement())
 
             subj_start = aln.subject_start - 1
-            subj_end   = aln.subject_end   - 1
+            subj_end = aln.subject_end - 1
 
             aligned_len = len(qseq)
             expected_len = (subj_end - subj_start + 1)
@@ -203,7 +303,7 @@ class TEConsensusBuilder:
                 continue
             for i in range(aligned_len):
                 ref_pos = subj_start + i
-                base    = qseq[i]
+                base = qseq[i]
                 if aln.score > query_score_dict[qid][ref_pos]:
                     query_aln_dict[qid][ref_pos] = base
                     query_score_dict[qid][ref_pos] = aln.score
@@ -214,6 +314,7 @@ class TEConsensusBuilder:
             final_seqs.append(merged_seq)
 
         return final_seqs
+
     def build_consensus(self, aligned_sequences):
         if not aligned_sequences:
             return ""
@@ -232,7 +333,7 @@ class TEConsensusBuilder:
                 
         return ''.join(consensus).replace('-', '')
 
-    def build_te_consensus(self, input_file, output_file):
+    def build_clustered_consensus(self, input_file, output_file):
         try:
             logger.info("Reading sequences...")
             sequences = list(SeqIO.parse(input_file, "fasta"))
@@ -240,31 +341,39 @@ class TEConsensusBuilder:
                 raise ValueError(f"No sequences found in {input_file}")
             logger.info(f"Read {len(sequences)} sequences")
 
-            logger.info("Finding best reference sequence...")
-            reference = self.find_best_reference(sequences)
-            logger.info(f"Selected {reference.id} as reference sequence")
+            clusterer = SequenceClusterer(self)
+            clusters = clusterer.cluster_sequences(sequences)
+            logger.info(f"Found {len(clusters)} clusters")
 
-            logger.info("Building multiple alignment...")
-            aligned_seqs = self.build_multiple_alignment(sequences, reference)
-            logger.info("Completed alignment")
+            consensus_records = []
+            for i, cluster in enumerate(clusters, 1):
+                logger.info(f"Processing cluster {i} with {len(cluster)} sequences")
+                
+                if len(cluster) == 1:
+                    consensus_seq = str(cluster[0].seq)
+                    consensus_desc = f"single sequence from cluster {i}"
+                else:
+                    reference = self.find_best_reference(cluster)
+                    aligned_seqs = self.build_multiple_alignment(cluster, reference)
+                    consensus_seq = self.build_consensus(aligned_seqs)
+                    consensus_desc = f"consensus from {len(cluster)} sequences in cluster {i}"
 
-            logger.info("Building consensus sequence...")
-            consensus = self.build_consensus(aligned_seqs)
-            logger.info(f"Generated consensus sequence of length {len(consensus)}")
+                consensus_record = SeqRecord(
+                    Seq(consensus_seq),
+                    id=f"{os.path.splitext(os.path.basename(input_file))[0]}_cluster_{i}",
+                    description=consensus_desc
+                )
+                consensus_records.append(consensus_record)
 
-            consensus_record = SeqRecord(
-                Seq(consensus),
-                id=os.path.splitext(os.path.basename(input_file))[0],
-                description=f"consensus from {len(sequences)} sequences"
-            )
-            SeqIO.write(consensus_record, output_file, "fasta")
-            logger.info(f"Written consensus to {output_file}")
+            SeqIO.write(consensus_records, output_file, "fasta")
+            logger.info(f"Written {len(consensus_records)} consensus sequences to {output_file}")
 
             stats_file = f"{output_file}.stats"
             with open(stats_file, "w") as f:
                 f.write(f"Original sequences: {len(sequences)}\n")
-                f.write(f"Consensus length: {len(consensus)}\n")
-                f.write(f"Reference sequence: {reference.id}\n")
+                f.write(f"Number of clusters: {len(clusters)}\n")
+                for i, cluster in enumerate(clusters, 1):
+                    f.write(f"Cluster {i} size: {len(cluster)}\n")
             logger.info(f"Written statistics to {stats_file}")
 
         except Exception as e:
@@ -312,7 +421,6 @@ class Config:
         logger.info(f"Using scoring matrix: {self.matrix_path}")
 
     def get_current_conda_env(self):
-
         conda_prefix = os.environ.get('CONDA_PREFIX')
         if conda_prefix:
             return conda_prefix
@@ -340,7 +448,7 @@ if __name__ == "__main__":
     import sys
 
     parser = argparse.ArgumentParser(
-        description='Build consensus sequence for transposable element family using RMBlast')
+        description='Build consensus sequences for clustered transposable element families using RMBlast')
     parser.add_argument('input', help='Input FASTA file')
     parser.add_argument('output', help='Output FASTA file')
     parser.add_argument('-t', '--threads', type=int,
@@ -351,6 +459,8 @@ if __name__ == "__main__":
                        help='Gap initiation penalty (default: 20)')
     parser.add_argument('--gap-ext', type=int, default=5,
                        help='Gap extension penalty (default: 5)')
+    parser.add_argument('--distance-threshold', type=float, default=0.7,
+                       help='Distance threshold for clustering (default: 0.7)')
     
     args = parser.parse_args()
     
@@ -366,7 +476,7 @@ if __name__ == "__main__":
             gap_ext=args.gap_ext,
             threads=args.threads
         )
-        builder.build_te_consensus(args.input, args.output)
+        builder.build_clustered_consensus(args.input, args.output)
         
     except Exception as e:
         logger.error(str(e))

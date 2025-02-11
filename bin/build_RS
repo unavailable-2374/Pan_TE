@@ -71,8 +71,9 @@ sub runRepeatScout {
   my $lmerSize = ceil( ( log( $seqSize ) / log( 4 ) ) + 1 );
 
   print "   - RepeatScout: Running build_lmer_table ( l = $lmerSize )..\n";
+
   my $cmd ="build_lmer_table -l $lmerSize -sequence "
-      . "$fastaFile -freq $fastaFile.lfreq 2>&1 > repeatscout.log";
+      . "$fastaFile -freq $fastaFile.lfreq 2>&1 repeatscout.log";
   `$cmd`;
   if ( $? ) { die "build_lmer_table failed. Exit code $?\n"; }
 
@@ -103,7 +104,7 @@ sub runRepeatScout {
     $ENV{'DUSTMASKER_COMMAND'} = $DUSTMASKER_PRGM;
     $cmd                       =
           "filter-stage-1.prl $fastaFile.rscons > "
-        . "$fastaFile.rscons.filtered > filter-stage-1.log";
+        . "$fastaFile.rscons.filtered 2> filter-stage-1.out";
     `$cmd`;
 
     my $finalFams = 0;
@@ -117,9 +118,9 @@ sub runRepeatScout {
       close IN;
     }
     else {
-      if ( -s "filter-stage-1.log" ) {
-        open IN, "<filter-stage-1.log"
-            or die "Could not open $tmpDir/filter-stage-1.log for reading!\n";
+      if ( -s "filter-stage-1.err" ) {
+        open IN, "<filter-stage-1.err"
+            or die "Could not open $tmpDir/filter-stage-1.err for reading!\n";
         my $errMsg = "";
         while ( <IN> ) {
           if ( /ERROR/ || /Can\'t locate/ || /BEGIN failed/ ) {
@@ -129,7 +130,7 @@ sub runRepeatScout {
         close IN;
         if ( $errMsg ne "" ) {
           die "RepeatScout filter-stage-1 failed:\n$errMsg"
-              . "Please see $tmpDir/filter-stage-1.log for details.\n";
+              . "Please see $tmpDir/filter-stage-1.err for details.\n";
         }
       }
     }

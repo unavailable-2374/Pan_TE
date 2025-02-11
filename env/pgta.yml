@@ -21,4 +21,4 @@ dependencies:
  - Biopython
  - mafft
  - perl-Parallel-ForkManager
- - mmseqs2
+ - java-jdk
