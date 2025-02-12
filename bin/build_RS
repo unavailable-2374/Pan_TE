@@ -38,7 +38,7 @@ if($rsSampleSize eq "all"){
 	`mv $genomeDB.rscons.filtered raw_lib.fa`;
 }else{
 	`mv DB.fa.rscons.filtered raw_lib.fa`;
-}print "111\n";
+}
 }
 $cmdString="Refiner_for_RS $TmpDir consensi.fa $genomeDB consensi.stk $threads $ARGV[4] $ARGV[5]";
 system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
