@@ -1,6 +1,15 @@
 # Zhou Lab @ AGIS Pan_TE 
 Design for linear or graph genome TE detection and annotation
 
+## Update Log & Future Plans
+
+### 2025-02-14
+- **Rewrote the entire workflow**: Completed a thorough overhaul of the previous process, significantly improving stability and readability.
+- **Coming Soon**:
+  - **Ultra-large Genome Processing**: We will optimize and upgrade the analysis mode for ultra-large genomes to enable more efficient handling of massive sequencing datasets.
+
+---
+
 ## Software Installation 
 
 ### 1.Download the latest Pipeline:
