@@ -61,12 +61,18 @@ sub get_and_validate_args {
         exit(0);
     }
 
+    # Try to locate rmblast directory through multiple methods
     $config{rmblast_dir} = $ENV{RMBLAST_DIR};
     unless ($config{rmblast_dir}) {
         eval {
             use RepModelConfig;
             $config{rmblast_dir} = $RepModelConfig::configuration->{'RMBLAST_DIR'}->{'value'};
         };
+    }
+
+    # If still not found, try locating rmblastn
+    unless ($config{rmblast_dir} && -x "$config{rmblast_dir}/rmblastn") {
+        $config{rmblast_dir} = locate_rmblastn();
     }
 
     my @required = qw(tmp_dir genome_file work_dir); 
@@ -88,6 +94,39 @@ sub get_and_validate_args {
     $logger->info("  Threads: $config{threads}");
     $logger->info("  Working directory: $config{work_dir}");
     $logger->info("  RMBlast directory: $config{rmblast_dir}");
+}
+
+sub locate_rmblastn {
+    $logger->info("Attempting to locate rmblastn...");
+    
+    # Try whereis command
+    my $whereis_out = `whereis rmblastn`;
+    if ($whereis_out =~ /rmblastn:\s+(\S+)/) {
+        my $path = $1;
+        if (-x $path) {
+            $logger->info("Found rmblastn via whereis: $path");
+            return dirname($path);
+        }
+    }
+    
+    # Try find command in common locations
+    for my $base_dir ("/usr/local", "/usr", $ENV{HOME}, "/opt") {
+        my $cmd = "find $base_dir -name rmblastn -type f 2>/dev/null";
+        my $find_out = `$cmd`;
+        if ($find_out) {
+            chomp($find_out);
+            my @paths = split(/\n/, $find_out);
+            foreach my $path (@paths) {
+                if (-x $path) {
+                    $logger->info("Found rmblastn via find: $path");
+                    return dirname($path);
+                }
+            }
+        }
+    }
+    
+    $logger->error("Could not locate rmblastn executable");
+    die "Error: rmblastn not found in system\n";
 }
 
 sub setup_environment {
@@ -131,8 +170,8 @@ sub run_pipeline {
     $logger->info("Calculated l-mer size: $lmer_size");
 
     # Check for RepeatScout results
-    my $rs_consensus = "$config{work_dir}/consensi.fa";
-    my $filtered_consensus = "$config{work_dir}/consensi.filtered.fa";
+    my $rs_consensus = "$config{tmp_dir}/repeats.fa";
+    my $filtered_consensus = "$config{tmp_dir}/repeats.filtered.fa";
 
     if (-s $filtered_consensus) {
         $logger->info("Found existing filtered consensus sequences, skipping to refinement...");
@@ -149,10 +188,10 @@ sub run_pipeline {
             # Generate genome samples if needed
             if ($genome_size > 500_000_000) {
                 $logger->info("Generating genome samples...");
-                run_cmd("sample_for_genome $config{genome_file} out.bed $sample_times $batch_size");
-                run_cmd("seqtk subseq $config{genome_file} out.bed > tmp.fa");
+                run_cmd("sample_for_genome $config{genome_file} $config{tmp_dir}/out.bed $sample_times $batch_size");
+                run_cmd("seqtk subseq $config{genome_file} $config{tmp_dir}/out.bed > $config{tmp_dir}/tmp.fa");
             } else {
-                run_cmd("cp $config{genome_file} tmp.fa");
+                run_cmd("cp $config{genome_file} $config{tmp_dir}/tmp.fa");
             }
             
             run_build_lmer_table($lmer_size);
@@ -183,7 +222,7 @@ sub run_build_lmer_table {
     my $cmd = join(" ",
         "build_lmer_table",
         "-l $lmer_size",
-        "-sequence tmp.fa",
+        "-sequence $config{tmp_dir}/tmp.fa",
         "-freq $freq_file",
         "2> $config{tmp_dir}/build_lmer.log"
     );
@@ -195,13 +234,13 @@ sub run_build_lmer_table {
 sub run_repeat_scout {
     my ($lmer_size) = @_;
     my $freq_file = "$config{tmp_dir}/lmer.freq";
-    my $output = "$config{work_dir}/consensi.fa";
+    my $output = "$config{tmp_dir}/repeats.fa";
 
     $logger->info("Running RepeatScout...");
 
     my $cmd = join(" ",
         "RepeatScout",
-        "-sequence tmp.fa",
+        "-sequence $config{tmp_dir}/tmp.fa",
         "-output $output",
         "-freq $freq_file",
         "-l $lmer_size",
@@ -217,8 +256,8 @@ sub run_repeat_scout {
 sub filter_repeats {
     $logger->info("Filtering repeat sequences...");
 
-    my $input = "$config{work_dir}/consensi.fa";
-    my $output = "$config{work_dir}/consensi.filtered.fa";
+    my $input = "$config{tmp_dir}/repeats.fa";
+    my $output = "$config{tmp_dir}/repeats.filtered.fa";
 
     $ENV{TRF_COMMAND} = which('trf');
     $ENV{RMBLAST_DIR} = $config{rmblast_dir};
@@ -230,7 +269,7 @@ sub filter_repeats {
 sub refine_consensus {
     $logger->info("Refining consensus sequences...");
 
-    my $input = "$config{work_dir}/consensi.filtered.fa";
+    my $input = "$config{tmp_dir}/repeats.filtered.fa";
     my $output = "$config{work_dir}/consensi.fa";
     my $families_file = "$config{tmp_dir}/families.txt";
 
@@ -273,5 +312,18 @@ sub which {
 sub run_cmd {
     my $cmd = shift;
     $cmd =~ s/[`;\$]/\\$&/g;
-    system($cmd) == 0 or die "Failed to execute: $cmd\n";
+    $logger->info("Executing command: $cmd");
+    
+    my $output = `$cmd 2>&1`;
+    my $exit_code = $? >> 8;
+    
+    if ($exit_code != 0) {
+        $logger->error("Command failed with exit code: $exit_code");
+        $logger->error("Command output:");
+        $logger->error($output);
+        die "Command execution failed\n";
+    }
+    
+    $logger->debug("Command completed successfully");
+    return $output;
 }
