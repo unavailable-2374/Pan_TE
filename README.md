@@ -6,7 +6,7 @@ Design for linear or graph genome TE detection and annotation
 ### 2025-02-14
 - **Rewrote the entire workflow**: Completed a thorough overhaul of the previous process, significantly improving stability and readability.
 - **Coming Soon**:
-  - **Ultra-large Genome Processing**: We will optimize and upgrade the analysis mode for ultra-large genomes to enable more efficient handling of massive sequencing datasets.
+  - **Ultra-large Genome Processing**: We will optimize and upgrade the analysis mode for ultra-large genomes to enable more efficient handling of massive genome datasets.
 
 ---
 
