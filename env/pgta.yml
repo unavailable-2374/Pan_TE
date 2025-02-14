@@ -22,3 +22,4 @@ dependencies:
  - mafft
  - perl-Parallel-ForkManager
  - java-jdk
+ - perl-log-log4perl
