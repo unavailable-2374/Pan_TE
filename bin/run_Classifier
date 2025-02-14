@@ -53,25 +53,71 @@ for dir in features nodes models; do
     fi
 done
 
-# Generate feature file
-log "Generating feature file"
-if ! python "$CLASSIFYTE_DIR/generate_feature_file.py" -f re.fa -d sup_features -o sup.csv; then
-    error "Failed to generate feature file"
+# Get number of CPU cores for RepeatClassifier
+CORES=$(nproc)
+if [ $CORES -gt 1 ]; then
+    RC_THREADS=$((CORES - 1))
+else
+    RC_THREADS=1
 fi
 
-# Evaluate features
-log "Evaluating features"
-if ! python "$CLASSIFYTE_DIR/evaluate.py" -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb; then
-    error "Feature evaluation failed"
+# Create temporary files to track completion
+RC_DONE="/tmp/rc_done.$$"
+CT_DONE="/tmp/ct_done.$$"
+
+# Run RepeatClassifier in background
+log "Starting RepeatClassifier with $RC_THREADS threads"
+(
+    RepeatClassifier -consensi data/re.fa -pa $RC_THREADS
+    touch "$RC_DONE"
+) &
+RC_PID=$!
+
+# Run parallel feature generation and evaluation
+log "Starting feature generation and evaluation"
+(
+    # Generate feature file
+    if ! python "$CLASSIFYTE_DIR/generate_feature_file.py" -f re.fa -d sup_features -o sup.csv; then
+        error "Failed to generate feature file"
+    fi
+
+    # Evaluate features
+    if ! python "$CLASSIFYTE_DIR/evaluate.py" -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb; then
+        error "Feature evaluation failed"
+    fi
+    touch "$CT_DONE"
+) &
+CT_PID=$!
+
+# Wait for both processes to complete
+log "Waiting for classification processes to complete..."
+
+wait_with_timeout() {
+    local pid=$1
+    local timeout=7200  # 2 hours timeout
+    local count=0
+    while kill -0 $pid 2>/dev/null; do
+        sleep 10
+        count=$((count + 10))
+        if [ $count -ge $timeout ]; then
+            kill $pid 2>/dev/null || true
+            error "Process $pid timed out after $timeout seconds"
+        fi
+    done
+}
+
+wait_with_timeout $RC_PID
+wait_with_timeout $CT_PID
+
+# Check if both processes completed successfully
+if [ ! -f "$RC_DONE" ] || [ ! -f "$CT_DONE" ]; then
+    error "One or more classification processes failed"
 fi
 
-# Run RepeatClassifier
-log "Running RepeatClassifier"
-if ! RepeatClassifier -consensi data/re.fa; then
-    error "RepeatClassifier failed"
-fi
+# Clean up temporary files
+rm -f "$RC_DONE" "$CT_DONE"
 
-# Process classification results
+# Process and combine results
 log "Processing classification results"
 if ! process_for_classify.py output/predicted_out_sup_features.csv result.txt; then
     error "Failed to process classification results"

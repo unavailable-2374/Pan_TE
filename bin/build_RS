@@ -44,7 +44,6 @@ run_pipeline();
 
 exit(0);
 
-# 在 build_RS 中修改
 sub get_and_validate_args {
     GetOptions(
         'help|h'        => \my $help,
@@ -131,25 +130,40 @@ sub run_pipeline {
     my $lmer_size = calculate_lmer_size($genome_size);
     $logger->info("Calculated l-mer size: $lmer_size");
 
-    # Run pipeline steps
-    eval {
-        # Generate genome samples if needed
-        if ($genome_size > 500_000_000) {
-            $logger->info("Generating genome samples...");
-            run_cmd("sample_for_genome $config{genome_file} out.bed $sample_times $batch_size");
-            run_cmd("seqtk subseq $config{genome_file} out.bed > tmp.fa");
-        } else {
-            run_cmd("cp $config{genome_file} tmp.fa");
-        }
-        
-        run_build_lmer_table($lmer_size);
-        run_repeat_scout($lmer_size);
+    # Check for RepeatScout results
+    my $rs_consensus = "$config{work_dir}/consensi.fa";
+    my $filtered_consensus = "$config{work_dir}/consensi.filtered.fa";
+
+    if (-s $filtered_consensus) {
+        $logger->info("Found existing filtered consensus sequences, skipping to refinement...");
+        refine_consensus();
+    }
+    elsif (-s $rs_consensus) {
+        $logger->info("Found existing RepeatScout results, skipping to filtering...");
         filter_repeats();
         refine_consensus();
-    };
-    if ($@) {
-        $logger->error("Pipeline failed: $@");
-        die "Pipeline execution failed\n";
+    }
+    else {
+        # Run complete pipeline
+        eval {
+            # Generate genome samples if needed
+            if ($genome_size > 500_000_000) {
+                $logger->info("Generating genome samples...");
+                run_cmd("sample_for_genome $config{genome_file} out.bed $sample_times $batch_size");
+                run_cmd("seqtk subseq $config{genome_file} out.bed > tmp.fa");
+            } else {
+                run_cmd("cp $config{genome_file} tmp.fa");
+            }
+            
+            run_build_lmer_table($lmer_size);
+            run_repeat_scout($lmer_size);
+            filter_repeats();
+            refine_consensus();
+        };
+        if ($@) {
+            $logger->error("Pipeline failed: $@");
+            die "Pipeline execution failed\n";
+        }
     }
 
     $logger->info("Pipeline completed successfully");
@@ -181,7 +195,7 @@ sub run_build_lmer_table {
 sub run_repeat_scout {
     my ($lmer_size) = @_;
     my $freq_file = "$config{tmp_dir}/lmer.freq";
-    my $output = "$config{tmp_dir}/repeats.fa";
+    my $output = "$config{work_dir}/consensi.fa";
 
     $logger->info("Running RepeatScout...");
 
@@ -203,8 +217,8 @@ sub run_repeat_scout {
 sub filter_repeats {
     $logger->info("Filtering repeat sequences...");
 
-    my $input = "$config{tmp_dir}/repeats.fa";
-    my $output = "$config{tmp_dir}/repeats.filtered.fa";
+    my $input = "$config{work_dir}/consensi.fa";
+    my $output = "$config{work_dir}/consensi.filtered.fa";
 
     $ENV{TRF_COMMAND} = which('trf');
     $ENV{RMBLAST_DIR} = $config{rmblast_dir};
@@ -216,7 +230,7 @@ sub filter_repeats {
 sub refine_consensus {
     $logger->info("Refining consensus sequences...");
 
-    my $input = "$config{tmp_dir}/repeats.filtered.fa";
+    my $input = "$config{work_dir}/consensi.filtered.fa";
     my $output = "$config{work_dir}/consensi.fa";
     my $families_file = "$config{tmp_dir}/families.txt";
 
