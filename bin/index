@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 use strict;
 
-open(IN,"$ARGV[0].fa");
+open(IN,"$ARGV[0]");
 open(OUT,">$ARGV[0].fa.translation");
 
 my $i=1;

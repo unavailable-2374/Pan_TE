@@ -22,14 +22,15 @@ die "Invalid genome size\n" unless $genome_size =~ /^\d+$/;
 die "Invalid batch size\n" unless $batch_size =~ /^\d+$/;
 
 my $tmp_dir = "round-$round_num";
+make_path($tmp_dir) unless -d $tmp_dir;
 chdir $tmp_dir or die "Cannot change to directory $tmp_dir: $!\n";
 
-my $times = int($genome_size) / int($batch_size);
+my $times = int($genome_size / $batch_size);
 my $cpu_threads = int($threads/4);
 $cpu_threads = MIN_THREADS if $cpu_threads < MIN_THREADS;
 
 process_repeat_masker($genome_file, $cpu_threads, $times, $batch_size);
-process_blast_db($threads);
+process_blast_db($threads,$genome_file);
 run_recon_pipeline();
 build_final_output($threads);
 
@@ -49,24 +50,20 @@ sub process_repeat_masker {
     run_cmd("sample_for_genome $genome_file.fai out.bed $times $batch_size");
     run_cmd("seqtk subseq $genome_file out.bed > tmp.fa");
     
-    system("cat ../lib.fa > lib.fa") == 0 
-        or die "Failed to create initial lib.fa\n";
+    system("Refiner_for_LTR ../raw.fa ./ --threads $threads > refine.log 2> refine.err") == 0 
+        or die "Failed to Combine LTR & RepeatScout\n";
     
-    if($round_num > 1) {
-        for(my $i = 1; $i < $round_num; $i++) {
-            run_cmd("cat ../round-$i/consensi.fa >> lib.fa");
-        }
-    }
+    `mv consensi.fa lib.fa`;
     
     run_cmd("RepeatMasker -lib lib.fa -e rmblast -lcambig -dir repeat " . 
             "-pa $cpu_threads -q tmp.fa -div 10 2> rm.log");
 }
 
 sub process_blast_db {
-    my ($threads) = @_;
+    my ($threads,$genome_file) = @_;
     return if -e "msp.out";
     
-    my %id_mapping = load_translation_table();
+    my %id_mapping = load_translation_table($genome_file);
     
     process_masked_file(\%id_mapping);
     
@@ -131,8 +128,9 @@ sub process_edge_redefinition {
 }
 
 sub load_translation_table {
+    my ($genome_file) = @_;
     my %id_mapping;
-    open(my $fh_trans, '<', "../../genome/genome.fa.translation") 
+    open(my $fh_trans, '<', "$genome_file.translation") 
         or die "Cannot open translation file: $!\n";
     while(<$fh_trans>) {
         chomp;
@@ -156,10 +154,10 @@ sub process_masked_file {
         chomp $line;
         if($line =~ /^>/) {
             $line =~ s/^>//;
-            my ($id) = split(/:/, $line);
+            my @arr = split(/:/, $line);
             print $fh_out ">gi|${counter} gi|" . 
-                  $id_mapping_ref->{$id} . ":" . 
-                  (split(/:/, $line, 2))[1] . "\n";
+                  $id_mapping_ref->{$arr[0]} . ":" . 
+                 $arr[1] . "\n";
             $counter++;
         } else {
             print $fh_out "$line\n";
@@ -188,13 +186,15 @@ close $out;
 
 sub create_symlinks {
     my ($src, $dst) = @_;
-    unlink('tmp', 'tmp2');
+    remove_tree("tmp");
+    remove_tree("tmp2");
     symlink($src, 'tmp') or die "Cannot create symlink tmp: $!\n";
     symlink($dst, 'tmp2') or die "Cannot create symlink tmp2: $!\n" if $dst;
 }
 
 sub remove_symlinks {
-    unlink('tmp', 'tmp2');
+    remove_tree("tmp");
+    remove_tree("tmp2");
 }
 
 sub move_gmon {

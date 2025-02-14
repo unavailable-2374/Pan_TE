@@ -1,144 +1,263 @@
-#!/usr/bin/perl
-
-use warnings;
+#!/usr/bin/env perl
 use strict;
-use Cwd;
+use warnings;
+use Cwd qw(getcwd);
+use FindBin;
+use lib $FindBin::RealBin;
+use File::Path qw(make_path);
+use File::Spec;
+use Getopt::Long;
+use Pod::Usage;
 use POSIX qw(:sys_wait_h ceil floor);
+use File::Basename;
+use Log::Log4perl qw(:easy);
 
-my $TmpDir = $ARGV[0];
-my $sampleFastaFile = "DB.fa";
-my $genomeDB = $ARGV[1];
-my $threads = $ARGV[2];
-my $rsSampleSize = $ARGV[3];
-my $DUSTMASKER_PRGM = "dustmasker";
-my $cmdString;
+# Configure logging
+Log::Log4perl->easy_init({
+    level   => $INFO,
+    layout  => '[%d] %p %m%n',
+    file    => '>>' . getcwd() . '/build_rs.log'
+});
+my $logger = Log::Log4perl->get_logger();
 
-my @filestat = stat ($genomeDB);
-chdir $ARGV[5];
-mkdir "RepeatScout" unless -e "RepeatScout";
-chdir "RepeatScout";
-mkdir "tmp" unless -e "tmp";
-unless(-e "raw_lib.fa"){
-if($rsSampleSize eq "all"){
-  $sampleFastaFile = $genomeDB;
-}else{
-  $cmdString="sample_for_genome $genomeDB.fai out.bed 12000 50001";
-  system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-  $cmdString="seqtk subseq ../genome/genome.fa out.bed > $sampleFastaFile";
-  system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
-}
-&runRepeatScout(
-  workDir     => $TmpDir,
-  trfPrgm     => "trf",
-  dustmskPrgm => $DUSTMASKER_PRGM,
-  fastaFile   => $sampleFastaFile,
-  seqSize     => $filestat[7]
+our $VERSION = '1.0.0';
+
+# Program Configuration
+my %config = (
+    tmp_dir => undef,
+    genome_file => undef,
+    threads => 4,
+    sample_size => 'all',
+    rmblast_dir => undef,
+    work_dir => undef
 );
-if($rsSampleSize eq "all"){
-	`mv $genomeDB.rscons.filtered raw_lib.fa`;
-}else{
-	`mv DB.fa.rscons.filtered raw_lib.fa`;
-}print "111\n";
+
+# Parse and validate arguments
+get_and_validate_args();
+
+# Set up environment
+$logger->info("Setting up environment...");
+setup_environment();
+
+# Main execution flow
+run_pipeline();
+
+exit(0);
+
+# 在 build_RS 中修改
+sub get_and_validate_args {
+    GetOptions(
+        'help|h'        => \my $help,
+        'version|v'     => \my $version,
+        'tmp=s'         => \$config{tmp_dir},
+        'genome=s'      => \$config{genome_file},
+        'threads=i'     => \$config{threads},
+        'sample=s'      => \$config{sample_size},
+        'workdir=s'     => \$config{work_dir}
+    ) or pod2usage(2);
+
+    pod2usage(1) if $help;
+    if ($version) {
+        print "build_RS version $VERSION\n";
+        exit(0);
+    }
+
+    $config{rmblast_dir} = $ENV{RMBLAST_DIR};
+    unless ($config{rmblast_dir}) {
+        eval {
+            use RepModelConfig;
+            $config{rmblast_dir} = $RepModelConfig::configuration->{'RMBLAST_DIR'}->{'value'};
+        };
+    }
+
+    my @required = qw(tmp_dir genome_file work_dir); 
+    for my $req (@required) {
+        unless (defined $config{$req}) {
+            $logger->error("Missing required parameter: --$req");
+            die "Error: --$req is required\n";
+        }
+    }
+
+    unless ($config{rmblast_dir}) {
+        $logger->error("RMBLAST_DIR environment variable or configuration not found");
+        die "Error: RMBLAST_DIR must be set in environment or configuration\n";
+    }
+
+    # Log configuration
+    $logger->info("Configuration:");
+    $logger->info("  Genome file: $config{genome_file}");
+    $logger->info("  Threads: $config{threads}");
+    $logger->info("  Working directory: $config{work_dir}");
+    $logger->info("  RMBlast directory: $config{rmblast_dir}");
 }
-$cmdString="Refiner_for_RS $TmpDir consensi.fa $genomeDB consensi.stk $threads $ARGV[4] $ARGV[5]";
-system("$cmdString") == 0 or die "failed to execute: $cmdString\n";
 
-sub runRepeatScout {
-  my %parameters = @_;
-
-  die "runRepeatScout() missing trfPrgm parameter!\n"
-      if ( !defined $parameters{'trfPrgm'} );
-  my $TRF_PRGM = $parameters{'trfPrgm'};
-
-  die "runRepeatScout() missing dustmskPrgm parameter!\n"
-      if ( !defined $parameters{'dustmskPrgm'} );
-  my $DUSTMASKER_PRGM = $parameters{'dustmskPrgm'};
-
-  die "runRepeatScout() missing workDir parameter!\n"
-      if ( !defined $parameters{'workDir'} );
-  my $tmpDir = $parameters{'workDir'};
-
-  die "runRepeatScout() missing fastaFile parameter!\n"
-      if ( !defined $parameters{'fastaFile'} );
-  my $fastaFile = $parameters{'fastaFile'};
-
-  die "runRepeatScout() missing seqSize parameter!\n"
-      if ( !defined $parameters{'seqSize'} );
-  my $seqSize = $parameters{'seqSize'};
-
-  my $origDir = getcwd();
-
-  my $lmerSize = ceil( ( log( $seqSize ) / log( 4 ) ) + 1 );
-
-  print "   - RepeatScout: Running build_lmer_table ( l = $lmerSize )..\n";
-
-  my $cmd ="build_lmer_table -l $lmerSize -sequence "
-      . "$fastaFile -freq $fastaFile.lfreq 2>&1 repeatscout.log";
-  `$cmd`;
-  if ( $? ) { die "build_lmer_table failed. Exit code $?\n"; }
-
-  print "   - RepeatScout: Running RepeatScout..";
-  $cmd =
-        "RepeatScout -l $lmerSize -sequence $fastaFile"
-      . " -tandemdist 500 -output $fastaFile.rscons -freq $fastaFile.lfreq "
-      . "-stopafter 100 2>&1 >> repeatscout.log";
-
-  `$cmd`;
-  if ( $? || -s "repeatscout.log" ) {
-    die
-"RepeatScout failed. Exit code $?.\n  Check $tmpDir/repeatscout.log for more details.\n";
-  }
-
-  if ( -s "$fastaFile.rscons" ) {
-    my $rawFams = 0;
-    open IN, "<$fastaFile.rscons"
-        or die "Could not open $tmpDir/$fastaFile.rscon for reading!\n";
-    while ( <IN> ) {
-      $rawFams++ if ( /^>/ );
-    }
-    close IN;
-    print " : $rawFams raw families identified\n";
-
-    print "   - RepeatScout: Running filtering stage..";
-    $ENV{'TRF_COMMAND'}        = $TRF_PRGM;
-    $ENV{'DUSTMASKER_COMMAND'} = $DUSTMASKER_PRGM;
-    $cmd                       =
-          "filter-stage-1.prl $fastaFile.rscons > "
-        . "$fastaFile.rscons.filtered 2> filter-stage-1.out";
-    `$cmd`;
-
-    my $finalFams = 0;
-    if ( -s "$fastaFile.rscons.filtered" ) {
-      open IN, "<$fastaFile.rscons.filtered"
-          or die
-          "Could not open $tmpDir/$fastaFile.rscon.filtered for reading!\n";
-          while ( <IN> ) {
-        $finalFams++ if ( /^>/ );
-      }
-      close IN;
-    }
-    else {
-      if ( -s "filter-stage-1.err" ) {
-        open IN, "<filter-stage-1.err"
-            or die "Could not open $tmpDir/filter-stage-1.err for reading!\n";
-        my $errMsg = "";
-        while ( <IN> ) {
-          if ( /ERROR/ || /Can\'t locate/ || /BEGIN failed/ ) {
-            $errMsg .= $_;
-          }
+sub setup_environment {
+    # Create necessary directories
+    for my $dir ($config{tmp_dir}, $config{work_dir}) {
+        unless (-d $dir) {
+            $logger->info("Creating directory: $dir");
+            make_path($dir) or die "Failed to create directory $dir: $!\n";
         }
-        close IN;
-        if ( $errMsg ne "" ) {
-          die "RepeatScout filter-stage-1 failed:\n$errMsg"
-              . "Please see $tmpDir/filter-stage-1.err for details.\n";
-        }
-      }
     }
-    print " $finalFams families remaining\n";
-  }
-  else {
-    print " : no families identified\n";
-  }
 
-  return;
+    # Change to work directory
+    chdir $config{work_dir} or die "Cannot change to work directory: $!\n";
+    $logger->info("Changed to working directory: " . getcwd());
+}
+
+sub run_pipeline {
+    $logger->info("Starting RepeatScout pipeline...");
+
+    # Get genome size and calculate parameters
+    my $genome_size = -s $config{genome_file};
+    my $readable_size = sprintf("%.2f", $genome_size/1e9) . " Gb";
+    $logger->info("Processing genome of size: $readable_size");
+
+    # Calculate sample size based on genome size
+    my $sample_size = $genome_size;
+    my $sample_times = 1;
+    my $batch_size = $genome_size;
+    
+    # If genome size > 500M, sample 400M
+    if ($genome_size > 500_000_000) {
+        $sample_size = 400_000_000;
+        $batch_size = 200_000;
+        $sample_times = int($sample_size / $batch_size);
+        $logger->info("Genome size > 500M, sampling 400M in $sample_times batches of $batch_size bp");
+    } else {
+        $logger->info("Genome size <= 500M, using full genome");
+    }
+
+    my $lmer_size = calculate_lmer_size($genome_size);
+    $logger->info("Calculated l-mer size: $lmer_size");
+
+    # Run pipeline steps
+    eval {
+        # Generate genome samples if needed
+        if ($genome_size > 500_000_000) {
+            $logger->info("Generating genome samples...");
+            run_cmd("sample_for_genome $config{genome_file} out.bed $sample_times $batch_size");
+            run_cmd("seqtk subseq $config{genome_file} out.bed > tmp.fa");
+        } else {
+            run_cmd("cp $config{genome_file} tmp.fa");
+        }
+        
+        run_build_lmer_table($lmer_size);
+        run_repeat_scout($lmer_size);
+        filter_repeats();
+        refine_consensus();
+    };
+    if ($@) {
+        $logger->error("Pipeline failed: $@");
+        die "Pipeline execution failed\n";
+    }
+
+    $logger->info("Pipeline completed successfully");
+}
+
+sub calculate_lmer_size {
+    my ($genome_size) = @_;
+    return ceil(log($genome_size)/log(4) + 1);
+}
+
+sub run_build_lmer_table {
+    my ($lmer_size) = @_;
+    my $freq_file = "$config{tmp_dir}/lmer.freq";
+
+    $logger->info("Building l-mer frequency table (l=$lmer_size)...");
+    
+    my $cmd = join(" ",
+        "build_lmer_table",
+        "-l $lmer_size",
+        "-sequence tmp.fa",
+        "-freq $freq_file",
+        "2> $config{tmp_dir}/build_lmer.log"
+    );
+
+    run_cmd($cmd);
+    $logger->info("L-mer table building completed");
+}
+
+sub run_repeat_scout {
+    my ($lmer_size) = @_;
+    my $freq_file = "$config{tmp_dir}/lmer.freq";
+    my $output = "$config{tmp_dir}/repeats.fa";
+
+    $logger->info("Running RepeatScout...");
+
+    my $cmd = join(" ",
+        "RepeatScout",
+        "-sequence tmp.fa",
+        "-output $output",
+        "-freq $freq_file",
+        "-l $lmer_size",
+        "-tandemdist 50",
+        "-minthresh 3",
+        "2>> $config{tmp_dir}/repeatscout.log"
+    );
+
+    run_cmd($cmd);
+    $logger->info("RepeatScout processing completed");
+}
+
+sub filter_repeats {
+    $logger->info("Filtering repeat sequences...");
+
+    my $input = "$config{tmp_dir}/repeats.fa";
+    my $output = "$config{tmp_dir}/repeats.filtered.fa";
+
+    $ENV{TRF_COMMAND} = which('trf');
+    $ENV{RMBLAST_DIR} = $config{rmblast_dir};
+
+    run_cmd("filter-stage-1.prl $input > $output 2> $config{tmp_dir}/filter.log");
+    $logger->info("Repeat filtering completed");
+}
+
+sub refine_consensus {
+    $logger->info("Refining consensus sequences...");
+
+    my $input = "$config{tmp_dir}/repeats.filtered.fa";
+    my $output = "$config{work_dir}/consensi.fa";
+    my $families_file = "$config{tmp_dir}/families.txt";
+
+    # Create required directories
+    make_path($config{work_dir}) unless -d $config{work_dir};
+    
+    # Ensure all input files exist
+    die "Input file missing: $input\n" unless -f $input;
+    
+    my $cmd = join(" ",
+        "$FindBin::RealBin/Refiner_for_RS",
+        $config{tmp_dir},               # work_dir
+        $output,                        # consensi_file 
+        $config{genome_file},           # sample_file
+        $families_file,                 # families_file
+        $config{threads},               # threads
+        $config{rmblast_dir},           # rmblast_path
+        $config{work_dir}               # output_dir
+    );
+
+    system($cmd) == 0 
+        or do {
+            $logger->error("Consensus refinement failed with status: $?");
+            die "Consensus refinement failed\n";
+        };
+    
+    $logger->info("Consensus refinement completed");
+}
+
+sub which {
+    my ($program) = @_;
+    for my $path (split /:/, $ENV{PATH}) {
+        my $file = "$path/$program";
+        return $file if -x $file;
+    }
+    $logger->error("Cannot find $program in PATH");
+    die "Cannot find $program in PATH\n";
+}
+
+sub run_cmd {
+    my $cmd = shift;
+    $cmd =~ s/[`;\$]/\\$&/g;
+    system($cmd) == 0 or die "Failed to execute: $cmd\n";
 }

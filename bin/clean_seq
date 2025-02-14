@@ -1,29 +1,92 @@
 #!/usr/bin/env python3
 import sys
+import logging
+from typing import Dict, Set
+from pathlib import Path
+from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
 
-def replace_degenerate_symbols(input_file, output_file):
-    degenerate_symbols = set('WRMKYSHBVDXNwrmkyshbvd')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    handlers=[
+        logging.FileHandler('clean_seq.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class SequenceCleaner:
+    """Clean degenerate symbols from sequence files."""
     
-    with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
-        is_sequence = False
-        for line in infile:
-            line = line.strip()
-            if line.startswith('>'):
-                is_sequence = False
-                outfile.write(line + '\n')
-            else:
-                is_sequence = True
-                if is_sequence:
-                    converted_line = ''.join('N' if base in degenerate_symbols else base 
-                                          for base in line)
-                    outfile.write(converted_line + '\n')
+    def __init__(self):
+        self.degenerate_symbols: Set[str] = set('WRMKYSHBVDXNwrmkyshbvd')
+        
+    def clean_sequence(self, sequence: str) -> str:
+        """Replace degenerate symbols with N."""
+        return ''.join('N' if base in self.degenerate_symbols else base 
+                      for base in sequence)
+    
+    def process_file(self, input_file: Path, output_file: Path) -> None:
+        """Process input file and write cleaned sequences."""
+        try:
+            logger.info(f"Processing file: {input_file}")
+            stats = {
+                'total_sequences': 0,
+                'cleaned_sequences': 0,
+                'total_bases': 0,
+                'cleaned_bases': 0
+            }
+            
+            with open(output_file, 'w') as out:
+                for record in SeqIO.parse(input_file, 'fasta'):
+                    stats['total_sequences'] += 1
+                    original_seq = str(record.seq)
+                    stats['total_bases'] += len(original_seq)
+                    
+                    cleaned_seq = self.clean_sequence(original_seq)
+                    if cleaned_seq != original_seq:
+                        stats['cleaned_sequences'] += 1
+                        stats['cleaned_bases'] += sum(1 for a, b in zip(original_seq, cleaned_seq) 
+                                                    if a != b)
+                    
+                    # Write cleaned sequence
+                    out.write(f">{record.id}\n{cleaned_seq}\n")
+            
+            # Log statistics
+            logger.info("Cleaning completed:")
+            logger.info(f"Total sequences processed: {stats['total_sequences']}")
+            logger.info(f"Sequences containing degenerate bases: {stats['cleaned_sequences']}")
+            logger.info(f"Total bases: {stats['total_bases']}")
+            logger.info(f"Bases replaced: {stats['cleaned_bases']}")
+            
+        except Exception as e:
+            logger.error(f"Error processing file: {e}")
+            raise
 
-if __name__ == "__main__":
+def main():
+    """Main execution function."""
     if len(sys.argv) != 3:
+        logger.error("Incorrect number of arguments")
         print("Usage: python script.py <input_file> <output_file>")
         sys.exit(1)
 
-    input_file = sys.argv[1]
-    output_file = sys.argv[2]
+    input_file = Path(sys.argv[1])
+    output_file = Path(sys.argv[2])
     
-    replace_degenerate_symbols(input_file, output_file)
+    if not input_file.exists():
+        logger.error(f"Input file not found: {input_file}")
+        sys.exit(1)
+        
+    try:
+        cleaner = SequenceCleaner()
+        cleaner.process_file(input_file, output_file)
+        logger.info(f"Results written to: {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Processing failed: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

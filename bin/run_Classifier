@@ -1,17 +1,92 @@
-mkdir data
-renameTE TE raw_TEs.fa data/re.fa 
+#!/usr/bin/env bash
 
-ln -s $1/features ./
-ln -s $1/nodes ./
-ln -s $1/models
-python $1/generate_feature_file.py -f re.fa -d sup_features -o sup.csv
-python $1/evaluate.py -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb
+# Enable error handling
+set -e
+set -o pipefail
 
-RepeatClassifier -consensi data/re.fa 
+# Configuration
+LOG_FILE="classifier.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
-process_for_classify.py output/predicted_out_sup_features.csv result.txt
-Combine_for_Two
+# Logging function
+log() {
+    echo "[$TIMESTAMP] $1" | tee -a "$LOG_FILE"
+}
 
+error() {
+    echo "[$TIMESTAMP] ERROR: $1" | tee -a "$LOG_FILE" >&2
+    exit 1
+}
+
+# Check arguments
+if [ "$#" -ne 1 ]; then
+    error "Usage: $0 <ClassifyTE_dir>"
+fi
+
+CLASSIFYTE_DIR="$1"
+
+# Verify directory exists
+if [ ! -d "$CLASSIFYTE_DIR" ]; then
+    error "ClassifyTE directory not found: $CLASSIFYTE_DIR"
+fi
+
+log "Starting TE classification process"
+log "ClassifyTE directory: $CLASSIFYTE_DIR"
+
+# Create data directory
+log "Setting up environment"
+mkdir -p data || error "Failed to create data directory"
+
+# Rename TEs
+log "Renaming TE sequences"
+if ! renameTE TE raw_TEs.fa data/re.fa; then
+    error "Failed to rename TE sequences"
+fi
+
+# Create symbolic links
+log "Creating required symbolic links"
+for dir in features nodes models; do
+    if [ -e "$CLASSIFYTE_DIR/$dir" ]; then
+        ln -sf "$CLASSIFYTE_DIR/$dir" ./ || error "Failed to link $dir directory"
+    else
+        error "Required directory not found: $CLASSIFYTE_DIR/$dir"
+    fi
+done
+
+# Generate feature file
+log "Generating feature file"
+if ! python "$CLASSIFYTE_DIR/generate_feature_file.py" -f re.fa -d sup_features -o sup.csv; then
+    error "Failed to generate feature file"
+fi
+
+# Evaluate features
+log "Evaluating features"
+if ! python "$CLASSIFYTE_DIR/evaluate.py" -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb; then
+    error "Feature evaluation failed"
+fi
+
+# Run RepeatClassifier
+log "Running RepeatClassifier"
+if ! RepeatClassifier -consensi data/re.fa; then
+    error "RepeatClassifier failed"
+fi
+
+# Process classification results
+log "Processing classification results"
+if ! process_for_classify.py output/predicted_out_sup_features.csv result.txt; then
+    error "Failed to process classification results"
+fi
+
+# Combine results
+log "Combining results"
+if ! Combine_for_Two; then
+    error "Failed to combine results"
+fi
+
+# Post-process classifications
+log "Post-processing classifications"
 sed -i 's:#I:#LINE:' TEs.fa
 sed -i 's:gypsy:LTR/Gypsy:' TEs.fa
 sed -i 's:#Unknown#:#:' TEs.fa
+
+log "Classification process completed successfully"

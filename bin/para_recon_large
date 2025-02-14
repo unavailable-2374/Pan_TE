@@ -1,0 +1,231 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Cwd;
+use File::Path qw(make_path remove_tree);
+use Parallel::ForkManager;
+use File::Basename;
+use Log::Log4perl qw(:easy);
+use Time::HiRes qw(time);
+use POSIX qw(strftime);
+
+# Initialize logging
+Log::Log4perl->easy_init({
+    level   => $INFO,
+    layout  => '[%d] %p %m%n',
+    file    => '>>' . getcwd() . '/para_recon_large.log'
+});
+my $logger = Log::Log4perl->get_logger();
+
+die "Usage: $0 <genome_file> <threads> <output_dir> <sample_size> <batch_size>\n" 
+    unless @ARGV == 5;
+    
+my ($genome_file, $threads, $out_dir, $sample_size, $batch_size) = @ARGV;
+
+# Convert to absolute paths
+$genome_file = Cwd::abs_path($genome_file);
+$out_dir = Cwd::abs_path($out_dir);
+
+$logger->info("Starting parallel RECON processing for large genome");
+$logger->info("Parameters:");
+$logger->info("  Genome file: $genome_file");
+$logger->info("  Threads: $threads");
+$logger->info("  Output directory: $out_dir");
+$logger->info("  Sample size: $sample_size bp");
+$logger->info("  Batch size: $batch_size bp");
+
+# Create output directory
+make_path($out_dir) unless -e $out_dir;
+chdir $out_dir or die "Cannot change to directory $out_dir: $!\n";
+
+# Get chromosome information
+$logger->info("Reading genome index");
+my $chromosomes = get_chromosome_info($genome_file);
+my $total_chroms = scalar @$chromosomes;
+$logger->info("Found $total_chroms chromosomes");
+
+# Calculate total genome size and adjust sampling
+my $total_genome_size = sum_genome_size($chromosomes);
+my $readable_size = sprintf("%.2f", $total_genome_size/1e9) . " Gb";
+$logger->info("Total genome size: $readable_size");
+
+# Calculate threads per chromosome
+my $threads_per_chr = int($threads / $total_chroms);
+$threads_per_chr = 1 if $threads_per_chr < 1;
+$logger->info("Allocating $threads_per_chr thread(s) per chromosome");
+
+# Process chromosomes in parallel
+my $chr_pm = Parallel::ForkManager->new($total_chroms);
+
+# Setup completion tracking
+my %completed = ();
+$chr_pm->run_on_finish(sub {
+    my ($pid, $exit_code, $ident) = @_;
+    if ($exit_code == 0) {
+        $completed{$ident} = 1;
+        my $progress = scalar(keys %completed);
+        $logger->info("Completed chromosome $ident ($progress/$total_chroms)");
+    } else {
+        $logger->error("Processing failed for chromosome $ident (pid: $pid)");
+    }
+});
+
+foreach my $chr (@$chromosomes) {
+    $chr_pm->start($chr->{name}) and next;
+    
+    eval {
+        process_chromosome_recon($chr, $genome_file, $threads_per_chr, $sample_size, $batch_size);
+        $chr_pm->finish(0);
+    };
+    if ($@) {
+        $logger->error("Error processing chromosome $chr->{name}: $@");
+        $chr_pm->finish(1);
+    }
+}
+
+$chr_pm->wait_all_children;
+
+# Verify all chromosomes completed
+my $success = scalar(keys %completed) == $total_chroms;
+if ($success) {
+    $logger->info("All chromosomes processed successfully");
+    # Combine and process final results
+    combine_results();
+    $logger->info("RECON processing completed successfully");
+} else {
+    $logger->error("Some chromosomes failed to process");
+    die "RECON processing failed\n";
+}
+
+sub get_chromosome_info {
+    my ($genome_file) = @_;
+    my @chromosomes;
+    
+    open my $fai, '<', "$genome_file.fai" or die "Cannot open genome index file: $!";
+    while (<$fai>) {
+        chomp;
+        my ($name, $length) = split /\t/;
+        my $readable_len = sprintf("%.2f", $length/1e6) . " Mb";
+        push @chromosomes, {
+            name => $name,
+            length => $length
+        };
+        $logger->debug("Found chromosome $name ($readable_len)");
+    }
+    close $fai;
+    
+    return \@chromosomes;
+}
+
+sub sum_genome_size {
+    my ($chromosomes) = @_;
+    my $total = 0;
+    $total += $_->{length} for @$chromosomes;
+    return $total;
+}
+
+sub process_chromosome_recon {
+    my ($chr, $genome_file, $threads, $sample_size, $batch_size) = @_;
+    
+    my $start_time = time;
+    $logger->info("Starting RECON processing of $chr->{name}");
+    
+    my $chr_dir = "chr_$chr->{name}";
+    make_path($chr_dir);
+    
+    # Calculate chromosome-specific sample size
+    my $chr_sample_size = int($sample_size * ($chr->{length} / $total_genome_size));
+    my $num_batches = int($chr_sample_size / $batch_size) + 1;
+    $logger->info("Processing $chr->{name} in $num_batches batches");
+    
+    # Process in batches
+    my $batch_pm = Parallel::ForkManager->new($threads);
+    
+    my %batch_status;
+    $batch_pm->run_on_finish(sub {
+        my ($pid, $exit_code, $batch_id) = @_;
+        $batch_status{$batch_id} = $exit_code == 0;
+    });
+    
+    for my $i (0..$num_batches-1) {
+        $batch_pm->start($i) and next;
+        
+        eval {
+            process_batch($chr, $chr_dir, $genome_file, $i, $batch_size);
+            $batch_pm->finish(0);
+        };
+        if ($@) {
+            $logger->error("Error processing batch $i: $@");
+            $batch_pm->finish(1);
+        }
+    }
+    
+    $batch_pm->wait_all_children;
+    
+    # Check if all batches completed successfully
+    my $all_batches_ok = 1;
+    for my $i (0..$num_batches-1) {
+        unless ($batch_status{$i}) {
+            $logger->error("Batch $i of chromosome $chr->{name} failed");
+            $all_batches_ok = 0;
+        }
+    }
+    
+    if ($all_batches_ok) {
+        # Combine batches for this chromosome
+        $logger->info("Combining batches for chromosome $chr->{name}");
+        system("cat $chr_dir/batch_*/consensi.fa > $chr_dir/consensi.fa") == 0
+            or die "Failed to combine batch results\n";
+            
+        # Clean up
+        $logger->info("Cleaning up temporary batch directories");
+        remove_tree("$chr_dir/batch_$_") for 0..$num_batches-1;
+        
+        my $duration = time - $start_time;
+        $logger->info(sprintf("Completed chromosome %s in %.2f minutes", 
+                            $chr->{name}, $duration/60));
+    } else {
+        die "Failed to process all batches for chromosome $chr->{name}\n";
+    }
+}
+
+sub process_batch {
+    my ($chr, $chr_dir, $genome_file, $batch_id, $batch_size) = @_;
+    
+    my $batch_dir = "$chr_dir/batch_$batch_id";
+    make_path($batch_dir);
+    
+    $logger->info("Processing batch $batch_id of $chr->{name}");
+    
+    # Generate sample for this batch
+    my $cmd = "sample_for_genome $genome_file $batch_dir/sample.fa $batch_size " .
+              "--chr $chr->{name} --seed $batch_id";
+    system($cmd) == 0 or die "Failed to generate sample: $!\n";
+    
+    # Run RECON on batch
+    $cmd = "run_RECON 1 1 $batch_dir/sample.fa $batch_size $batch_size";
+    system($cmd) == 0 or die "Failed to process batch with RECON: $!\n";
+    
+    $logger->info("Completed batch $batch_id of $chr->{name}");
+}
+
+sub combine_results {
+    $logger->info("Combining results from all chromosomes");
+    
+    # Combine all chromosome results
+    system("cat chr_*/consensi.fa > all_consensi.fa") == 0
+        or die "Failed to combine chromosome results\n";
+        
+    # Final clustering
+    $logger->info("Performing final clustering of results");
+    system("cd-hit-est -i all_consensi.fa -o consensi.fa " .
+           "-c 0.8 -n 5 -T 8 -M 0 -d 0") == 0
+        or die "Failed to cluster final results\n";
+        
+    # Clean up
+    unlink "all_consensi.fa";
+    $logger->info("Cleaning up chromosome directories");
+    remove_tree("chr_$_->{name}") for @$chromosomes;
+    
+    $logger->info("Results successfully combined and clustered");
+}

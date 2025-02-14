@@ -33,7 +33,7 @@ Design for linear or graph genome TE detection and annotation
 go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89mfh/view?usp=sharing)
     
 - Click on **ClassifyTE_Models.zip**. This will automatically download models built with TE datasets.
-- Unzip and copy all the models from "ClassifyTE_Models" directory into the folder **model** inside the root folder **ClassifyTE**
+- Unzip and copy all the models from "ClassifyTE_Models" directory into the folder **models** inside the root folder **ClassifyTE**
  
 ## Usage
     Usage:
@@ -48,7 +48,7 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
         --ClassifyTE_dir <string> Provide path to ClassifyTE for classification.
     
     [Other]
-        --D <string>           Default: NA. Path for VCF, see gfa.list for format.
+        --D <string>              Default: NA. Path for VCF, see gfa.list for format.
         --out <string>            Default: current directory. The work directory.
         -M <int>                  Memory limit (in MB), default: 0 (unlimited).
         --cpu <int>               Default: 4. Number of threads, preferably in multiples of 4.

@@ -2,24 +2,27 @@
 use strict;
 use warnings;
 use FindBin;
-use lib $FindBin::RealBin;
 use File::Path qw(make_path);
-use File::Spec;
-use File::Basename qw(dirname);
-use Cwd qw(abs_path);
+use File::Basename qw(dirname basename);
 use Parallel::ForkManager;
+use Log::Log4perl qw(:easy);
 
 # Import essential RepeatMasker modules
 use RepModelConfig;
 use lib $RepModelConfig::configuration->{'REPEATMASKER_DIR'}->{'value'};
-use SeedAlignment;
-use SeedAlignmentCollection;
 use SearchResult;
 use SearchResultCollection;
 use NCBIBlastSearchEngine;
-use SeqDBI;
 use FastaDB;
 
+Log::Log4perl->easy_init({
+    level   => $INFO,
+    layout  => '[%d] %p %m%n',
+    file    => 'refiner_rs.log'
+});
+my $logger = Log::Log4perl->get_logger();
+
+# Constants
 use constant {
     FAMILY_SIZE_CUTOFF => 15,
     THREADS_PER_REFINER => 4,
@@ -28,373 +31,259 @@ use constant {
     DEFAULT_GAP_EXT => -5,
     DEFAULT_MIN_MATCH => 7,
     MAX_ELEMENTS => 100,
+    READ_MODE => 'r',    # Replace SeqDBI::ReadOnly
 };
 
-die "Usage: $0 roundTmpDir consensiFile sampleFastaFile combFamiliesFile threads rmblastn_path work_dir\n"
-    unless @ARGV == 7;
+our $VERSION = '1.0.0';
 
-my ($roundTmpDir, $consensiFile, $sampleFastaFile, $combFamiliesFile, 
-    $total_threads, $RMBLASTN_PRGM, $work_dir) = @ARGV;
-our %families; 
+# Configuration
+my %config;
+my %families;
 
-my $max_parallel_refiners = int($total_threads / THREADS_PER_REFINER);
-$max_parallel_refiners = 1 if $max_parallel_refiners < 1;
-
-my $NCBIBLASTDB_PRGM = "makeblastdb";
-my $pm = Parallel::ForkManager->new($max_parallel_refiners);
-
-chdir $work_dir or die "Cannot change to directory $work_dir: $!\n";
-chdir "RepeatScout" or die "Cannot change to RepeatScout directory: $!\n";
-
-my ($sampleContigs, $actualGenomeSampleSize) = process_sample_database($sampleFastaFile);
-
-$sampleFastaFile = abs_path($sampleFastaFile);
-my $roundConsensiFile = abs_path("$roundTmpDir/consensi.fa");
-
-if (-s "raw_lib.fa") {
-    process_raw_library($roundConsensiFile, $sampleFastaFile, $roundTmpDir);
-    buildRSConsensiParallel(
-        workDir => $roundTmpDir,
-        consensiFile => $consensiFile,
-        combFamiliesFile => $combFamiliesFile,
-        familyCutoff => FAMILY_SIZE_CUTOFF,
-        threads_per_refiner => THREADS_PER_REFINER,
-        max_parallel => $max_parallel_refiners,
-        numContigs => scalar(keys %$sampleContigs),
-    );
+sub validate_inputs {
+    my ($config) = @_;
+    
+    if(defined $config->{sample_file} && !-f $config->{sample_file}) {
+        $logger->error("Sample file not found: $config->{sample_file}");
+        return 0;
+    }
+    
+    for my $dir ($config->{work_dir}, $config->{output_dir}) {
+        if(!-d $dir) {
+            eval { make_path($dir) };
+            if($@) {
+                $logger->error("Failed to create directory $dir: $@");
+                return 0;
+            }
+        }
+        if(!-w $dir) {
+            $logger->error("Directory not writable: $dir");
+            return 0;
+        }
+    }
+    
+    if($config->{threads} !~ /^\d+$/ || $config->{threads} < 1) {
+        $logger->error("Invalid thread count: $config->{threads}");
+        return 0;
+    }
+    
+    return 1;
 }
 
+$logger->info("Starting Refiner_for_RS");
+$logger->info("Command line arguments: " . join(" ", @ARGV));
+
+# Usage check
+die usage() unless @ARGV == 7;
+
+# Parse command line arguments
+($config{work_dir}, $config{consensi_file}, $config{sample_file}, 
+ $config{families_file}, $config{threads}, $config{rmblast_path},
+ $config{output_dir}) = @ARGV;
+
+ unless(validate_inputs(\%config)) {
+    die "Input validation failed. Check refiner_rs.log for details.\n";
+}
+
+die "Invalid thread count\n" unless $config{threads} > 0;
+
+# Setup directories
+make_path($config{work_dir}) unless -d $config{work_dir};
+chdir $config{work_dir} or die "Cannot change to working directory: $!\n";
+
+# Calculate parallel processing settings
+$config{max_parallel} = int($config{threads} / THREADS_PER_REFINER);
+$config{max_parallel} = 1 if $config{max_parallel} < 1;
+
+# Main execution
+my $sample_contigs = process_sample_database();
+if (-s "raw_lib.fa") {
+    process_raw_library();
+    build_consensus_parallel();
+}
+
+exit(0);
+
+###############################################################################
+# Core Functions
+###############################################################################
+
 sub process_sample_database {
-    my ($sample_file) = @_;
     my %sample_contigs;
     my $genome_size = 0;
     
     my $sample_db = FastaDB->new(
-        fileName => $sample_file,
-        openMode => SeqDBI::ReadOnly
-    );
+        fileName => $config{sample_file},
+        openMode => READ_MODE
+    ) or die "Could not open $config{sample_file}: $!\n";
     
+    print "Processing sample database...\n";
     foreach my $seq_id ($sample_db->getIDs()) {
-        my $tmp_name = $sample_db->getDescription($seq_id);
-        $tmp_name = $1 if $tmp_name =~ /(\S+):\d+-\d+/;
-        $sample_contigs{$tmp_name}++;
+        $sample_contigs{$seq_id}++;
         $genome_size += $sample_db->getSeqLength($seq_id);
     }
     
-    undef $sample_db;
-    return (\%sample_contigs, $genome_size);
+    print "Processed ", scalar(keys %sample_contigs), " contigs ($genome_size bp)\n";
+    return \%sample_contigs;
 }
 
 sub process_raw_library {
-    my ($round_consensi, $sample_fasta, $tmp_dir) = @_;
+    print "Processing raw library...\n";
     
-    system("cp raw_lib.fa $round_consensi") == 0
-        or die "Failed to move raw_lib.fa: $!\n";
-    run_makeblastdb($sample_fasta, $tmp_dir);
-    run_makeblastdb($round_consensi, $tmp_dir);
+    run_cmd("cp raw_lib.fa $config{consensi_file}");
+    create_blast_db($config{sample_file});
+    create_blast_db($config{consensi_file});
 }
 
-sub run_makeblastdb {
-    my ($input_file, $output_dir) = @_;
-    my $cmd = "$NCBIBLASTDB_PRGM -out $input_file " .
-              "-parse_seqids -dbtype nucl -in $input_file >> " .
-              "$output_dir/makeblastdb.log";
-    system($cmd) == 0 or die "Failed to run makeblastdb: $!\n";
+sub create_blast_db {
+    my ($input_file) = @_;
+    run_cmd("makeblastdb -out $input_file -parse_seqids -dbtype nucl -in $input_file");
+}
+
+sub build_consensus_parallel {
+    print "Building consensus sequences...\n";
+    
+    my $engine = setup_blast_engine();
+    my $results = run_blast_search($engine);
+    process_blast_results($results);
+    
+    my $pm = Parallel::ForkManager->new($config{max_parallel});
+    process_families($pm);
+    collect_results();
 }
 
 sub setup_blast_engine {
-    my ($rm_path, $work_dir, $thread_count) = @_;
+    my $engine = NCBIBlastSearchEngine->new(
+        pathToEngine => "$config{rmblast_path}/rmblastn"  # 修改这一行，添加 /rmblastn
+    ) or die "Cannot initialize BLAST engine\n";
     
-    my $engine = NCBIBlastSearchEngine->new(pathToEngine => $rm_path)
-        or die "Cannot execute $rm_path\n";
-        
     $engine->setMatrix("$FindBin::RealBin/Matrices/ncbi/nt/comparison.matrix");
-    $engine->setTempDir($work_dir);
+    $engine->setTempDir($config{work_dir});
     $engine->setMinScore(DEFAULT_MIN_SCORE);
     $engine->setGenerateAlignments(1);
     $engine->setGapInit(DEFAULT_GAP_INIT);
     $engine->setInsGapExt(DEFAULT_GAP_EXT);
     $engine->setDelGapExt(DEFAULT_GAP_EXT);
     $engine->setMinMatch(DEFAULT_MIN_MATCH);
-    $engine->setCores($thread_count);
+    $engine->setCores($config{threads});
     $engine->setScoreMode(SearchEngineI::complexityAdjustedScoreMode);
     
     return $engine;
 }
 
-sub process_single_family {
-    my ($family_id, $work_dir) = @_;
+sub run_blast_search {
+    my ($engine) = @_;
     
-    my $family_file = "$work_dir/family-$family_id.fa";
-    print "Processing family $family_id using file $family_file\n";
-
-    my $cmd = "$FindBin::RealBin/Refiner.py"
-            . " $family_file"
-            . " $family_file.refiner_cons"
-            . " -t " . THREADS_PER_REFINER
-            . " --min-score 150"
-            . " --gap-init 20"
-            . " --gap-ext 5 2> refine.log";
-              
-    print "Starting Refiner for family $family_id using " . THREADS_PER_REFINER . " threads\n";
-    system($cmd) == 0 or die "Refiner failed for family $family_id\n";
-}
-
-sub process_families_parallel {
-    my ($families, $work_dir, $max_parallel) = @_;
-
-    my %process_status;
-    my $pm = Parallel::ForkManager->new($max_parallel);
+    $engine->setQuery($config{sample_file});
+    $engine->setSubject($config{consensi_file});
     
-    $pm->run_on_finish(sub {
-        my ($pid, $exit_code, $id) = @_;
-        $process_status{$id} = $exit_code == 0;
-        if ($exit_code == 0) {
-            print "Family $id completed successfully\n";
-        } else {
-            print "WARNING: Family $id failed with exit code $exit_code\n";
-        }
-    });
-
-    foreach my $family_id (@$families) {
-        my $pid = $pm->start($family_id);
-        next if $pid;
-        
-        eval {
-            process_single_family($family_id, $work_dir);
-            $pm->finish(0);
-        };
-        if ($@) {
-            warn "Error processing family $family_id: $@\n";
-            $pm->finish(1);
-        }
-    }
-
-    $pm->wait_all_children;
-
-    my $all_completed = 1;
-    foreach my $family_id (@$families) {
-        unless ($process_status{$family_id}) {
-            warn "Family $family_id did not complete successfully\n";
-            $all_completed = 0;
-        }
-    }
-
-    return $all_completed;
-}
-
-sub buildRSConsensiParallel {
-    my %params = @_;
-    
-    filter_satellites($params{workDir}, $total_threads);
-    
-    print "Collecting repeat instances...\n";
-    
-    my $engine = setup_blast_engine(
-        $RMBLASTN_PRGM, 
-        $params{workDir},
-        $total_threads
-    );
-
-    $engine->setMaskLevel(80);
-    $engine->setQuery($sampleFastaFile);
-    $engine->setSubject($roundConsensiFile);
-    run_makeblastdb($roundConsensiFile, $params{workDir});
-    my ($status, $resultCollection) = $engine->search();
+    my ($status, $results) = $engine->search();
     die "BLAST search failed\n" if $status;
-
-    for (my $k = 0; $k < $resultCollection->size(); $k++) {
-        my $resultRef = $resultCollection->get($k);
-        my $orient = $resultRef->getOrientation();
-        my $sampleID = $resultRef->getQueryName();
-        my $seqID = "gi|" . ($k + 1) . " ";
-        
-        if ($orient eq "C" || $orient eq "-") {
-            $seqID .= $sampleID . ":" . 
-                     ($resultRef->getQueryEnd() + 0) . "-" .
-                     ($resultRef->getQueryStart() + 0);
-        } else {
-            $seqID .= $sampleID . ":" . 
-                     ($resultRef->getQueryStart() + 0) . "-" .
-                     ($resultRef->getQueryEnd() + 0);
-        }
-        
-        my $sequence = $resultRef->getQueryString();
-        $sequence =~ s/-//g;
-        
-        push @{$families{$resultRef->getSubjName()}->{elements}}, {
-            seqID => $seqID,
-            seq   => $sequence,
-            score => $resultRef->getScore() || 0
-        };
-    }
     
-    my @sortedKeys = sort {
-        my $size_a = defined $families{$a}->{elements} ? scalar(@{$families{$a}->{elements}}) : 0;
-        my $size_b = defined $families{$b}->{elements} ? scalar(@{$families{$b}->{elements}}) : 0;
-        $size_b <=> $size_a;
+    return $results;
+}
+
+sub process_blast_results {
+    my ($results) = @_;
+    
+    for (my $i = 0; $i < $results->size(); $i++) {
+        my $result = $results->get($i);
+        store_result($result, $i);
+    }
+}
+
+sub store_result {
+    my ($result, $index) = @_;
+    
+    my $orient = $result->getOrientation();
+    my $seq_id = sprintf("gi|%d", $index + 1);
+    my $coords = get_coords_string($result, $orient);
+    my $seq = $result->getQueryString();
+    $seq =~ s/-//g;
+    
+    push @{$families{$result->getSubjName()}->{elements}}, {
+        seqID => "$seq_id $coords",
+        seq   => $seq,
+        score => $result->getScore() || 0
+    };
+}
+
+sub get_coords_string {
+    my ($result, $orient) = @_;
+    
+    my ($start, $end) = ($orient eq "C" || $orient eq "-") 
+        ? ($result->getQueryEnd(), $result->getQueryStart())
+        : ($result->getQueryStart(), $result->getQueryEnd());
+        
+    return sprintf("%s:%d-%d", $result->getQueryName(), $start, $end);
+}
+
+sub process_families {
+    my ($pm) = @_;
+    
+    my @sorted = sort {
+        @{$families{$b}->{elements}} <=> @{$families{$a}->{elements}}
     } keys %families;
-
-    print "Found " . scalar(@sortedKeys) . " families\n";
-
-    my %refinableFamilies;
-    my $familyID = 0;
-    my @family_ids;
     
-    foreach my $key (@sortedKeys) {
-        next unless defined $families{$key}->{elements} 
-                   && @{$families{$key}->{elements}} >= $params{familyCutoff};
+    foreach my $family (@sorted) {
+        next unless @{$families{$family}->{elements}} >= FAMILY_SIZE_CUTOFF;
         
-        $families{$key}->{roundfam} = $familyID;
-        
-        my $family_file = "$params{workDir}/family-$familyID.fa";
-        open my $fam_fh, ">", $family_file
-            or die "Cannot open $family_file: $!\n";
-            
-        my $numElements = 0;
-        foreach my $ele (
-            sort {
-                ($b->{score} || 0) <=> ($a->{score} || 0)
-            } @{$families{$key}->{elements}}
-        ) {
-            last if $numElements >= MAX_ELEMENTS;
-            print $fam_fh ">$ele->{seqID}\n$ele->{seq}\n";
-            $numElements++;
-        }
-        close $fam_fh;
-        
-        $families{$key}->{numOfEles} = $numElements;
-        $refinableFamilies{$key}++;
-        push @family_ids, $familyID;
-        $familyID++;
+        $pm->start and next;
+        process_family($family);
+        $pm->finish;
     }
-
-    my $success = process_families_parallel(
-        \@family_ids,
-        $params{workDir},
-        $params{max_parallel}
-    );
-
-    die "Family processing failed\n" unless $success;
-
-    collect_final_results($params{workDir});
+    
+    $pm->wait_all_children;
 }
 
-sub collect_final_results {
-    my ($work_dir) = @_;
-    my $parent_dir = dirname($work_dir);
+sub process_family {
+    my ($family) = @_;
     
-    print "Work directory: $work_dir\n";
-    print "Parent directory: $parent_dir\n";
+    # Write family sequences
+    my $file = "family-$family.fa";
+    open my $fh, '>', $file or die "Cannot open $file: $!\n";
     
-    my @cons_files = glob("$work_dir/family-*.fa.refiner_cons");
-    
-    if (@cons_files) {
-        open my $cons_out, '>', "$parent_dir/consensi.fa" 
-            or die "Cannot open $parent_dir/consensi.fa: $!\n";
-        
-        foreach my $cons_file (@cons_files) {
-            if (-s $cons_file) {
-                open my $in, '<', $cons_file 
-                    or die "Cannot open $cons_file: $!\n";
-                my $content = do { local $/; <$in> };
-                print $cons_out $content;
-                close $in;
-            } else {
-                warn "Warning: $cons_file is empty or doesn't exist\n";
-            }
-        }
-        close $cons_out;
-    } else {
-        warn "No refiner_cons files found in $work_dir\n";
+    my $count = 0;
+    for my $elem (sort { ($b->{score}||0) <=> ($a->{score}||0) } 
+                 @{$families{$family}->{elements}}) {
+        last if $count >= MAX_ELEMENTS;
+        print $fh ">$elem->{seqID}\n$elem->{seq}\n";
+        $count++;
     }
+    close $fh;
     
-    my $cons_size = -s "$parent_dir/consensi.fa";
-    print "\nFinal results:\n";
-    print "- consensi.fa size: " . ($cons_size || 0) . " bytes\n";
+    # Run Refiner
+    run_cmd(join(" ",
+        "$FindBin::RealBin/Refiner.py",
+        $file,
+        "$file.refiner_cons",
+        "-t", THREADS_PER_REFINER,
+        "--min-score", "150",
+        "--gap-init", "20",
+        "--gap-ext", "5",
+        "2> refine.log"
+    ));
 }
 
-sub filter_satellites {
-    my ($work_dir, $thread_count) = @_;
+sub collect_results {
+    my $outfile = "$config{output_dir}/consensi.fa";
+    open my $out, '>', $outfile or die "Cannot open $outfile: $!\n";
     
-    my $searchEngineN = NCBIBlastSearchEngine->new(pathToEngine => $RMBLASTN_PRGM);
-    die "Cannot execute $RMBLASTN_PRGM\n" unless defined $searchEngineN;
-    
-    $searchEngineN->setMatrix("$FindBin::RealBin/Matrices/ncbi/nt/comparison.matrix");
-    $searchEngineN->setTempDir($work_dir);
-    $searchEngineN->setMinScore(250);
-    $searchEngineN->setGenerateAlignments(1);
-    $searchEngineN->setGapInit(-25);
-    $searchEngineN->setInsGapExt(-5);
-    $searchEngineN->setDelGapExt(-5);
-    $searchEngineN->setMinMatch(7);
-    $searchEngineN->setCores($thread_count);
-    $searchEngineN->setScoreMode(SearchEngineI::complexityAdjustedScoreMode);
-
-    system("$NCBIBLASTDB_PRGM -out $work_dir/consensi.fa " .
-           "-parse_seqids -dbtype nucl -in $work_dir/consensi.fa >> " .
-           "$work_dir/makeblastdb.log 2>&1");
-    
-    $searchEngineN->setSubject("$work_dir/consensi.fa");
-    $searchEngineN->setQuery("$work_dir/consensi.fa");
-    
-    my %satelliteSeqIDs;
-    my ($status, $resultCollection) = $searchEngineN->search();
-    if ($status) {
-        print STDERR "\nERROR from search engine (", $? >> 8, ") \n";
-        return;
-    }
-    
-    print "   - Large Satellite Filtering.. ";
-    my %coverage;
-    for (my $k = 0; $k < $resultCollection->size(); $k++) {
-        my $resultRef = $resultCollection->get($k);
-        next if ($resultRef->getQueryName() ne $resultRef->getSubjName() ||
-                ($resultRef->getQueryStart() == 1 && 
-                 $resultRef->getQueryRemaining() == 0 &&
-                 $resultRef->getSubjStart() == 1 && 
-                 $resultRef->getSubjRemaining() == 0));
-                 
-        my $ID = $resultRef->getQueryName();
-        my $familyLen = $resultRef->getQueryEnd() + $resultRef->getQueryRemaining();
-        next if ($familyLen < 3000);
-        
-        $coverage{$ID} += $resultRef->getQueryEnd() - $resultRef->getQueryStart() + 1;
-        if ($coverage{$ID} > 0.9 * $familyLen) {
-            $satelliteSeqIDs{$ID} = 1;
+    for my $cons_file (glob("family-*.fa.refiner_cons")) {
+        if (-s $cons_file) {
+            open my $in, '<', $cons_file or die "Cannot open $cons_file: $!\n";
+            print $out $_ while <$in>;
+            close $in;
         }
     }
-    
-    if (keys %satelliteSeqIDs) {
-        my $consDB = FastaDB->new(
-            fileName => "$work_dir/consensi.fa",
-            openMode => SeqDBI::ReadOnly
-        );
-        
-        open my $outc_fh, ">$work_dir/consensi-filtered.fa" 
-            or die "Could not open consensi-filtered.fa: $!\n";
-
-        foreach my $seqID ($consDB->getIDs()) {
-            unless (exists $satelliteSeqIDs{$seqID}) {
-                my $seq = $consDB->getSequence($seqID);
-                my $desc = $consDB->getDescription($seqID);
-                print $outc_fh ">$seqID $desc\n";
-                $seq =~ s/(.{50})/$1\n/g;
-                print $outc_fh "$seq\n";
-            }
-        }
-        close $outc_fh;
-        undef $consDB;
-
-        system("mv $work_dir/consensi-filtered.fa $work_dir/consensi.fa");
-    }
-    
-    foreach my $suffix (qw(nhr nin nnd nni nog nsq)) {
-        unlink("$work_dir/consensi.fa.$suffix") if -e "$work_dir/consensi.fa.$suffix";
-    }
-    
-    undef $resultCollection;
-    undef $searchEngineN;
+    close $out;
 }
 
-1;
+sub run_cmd {
+    my $cmd = shift;
+    system($cmd) == 0 or die "Command failed: $cmd\n";
+}
+
+sub usage {
+    return "Usage: $0 workDir consensiFile sampleFile familiesFile threads rmblast_path output_dir\n";
+}

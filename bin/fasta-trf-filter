@@ -162,7 +162,6 @@ if ( -s $outFile ) {
       if ( $seq ) {
         my ( $seqLen, $nCount, $maxUnmaskedSubseqLen ) = getStats($seq);          
         my $unmaskedRatio = ($seqLen - $nCount) / $seqLen;
-        # If both the sequence is mostly masked and there are no long regions left, filter it!
         if ( $unmaskedRatio < $minUnmaskedFractionThreshold && 
              $maxUnmaskedSubseqLen < $minUnmaskedContigBPThreshold ) {
           $filteredSeqs{$id} = 1;

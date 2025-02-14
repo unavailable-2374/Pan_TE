@@ -1,45 +1,138 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 use strict;
 use warnings;
+use Log::Log4perl qw(:easy);
+use Getopt::Long;
+use File::Basename;
+use Time::HiRes qw(time);
+use POSIX qw(strftime);
 
-open(IN, $ARGV[0]);
-open(OUT, ">$ARGV[1]");
+# Initialize logging
+Log::Log4perl->easy_init({
+    level   => $INFO,
+    layout  => '[%d] %p %m%n',
+    file    => '>>' . 'sample_genome.log'
+});
+my $logger = Log::Log4perl->get_logger();
 
-my %hash;
-my %record;
-my $sum = 0;
+# Parse command line options
+my $specific_chr;
+my $seed;
+GetOptions(
+    "chr=s" => \$specific_chr,
+    "seed=i" => \$seed
+) or die "Error in command line arguments\n";
 
-my $sample_times = $ARGV[2];
-my $sample_length = $ARGV[3];
+# Validate arguments
+die "Usage: $0 <genome.fai> <output.bed> <sample_times> <sample_length> [--chr chr_name] [--seed number]\n"
+    unless @ARGV == 4;
 
-while (<IN>) {
+my ($fai_file, $output_file, $sample_times, $sample_length) = @ARGV;
+
+# Validate input values
+die "Sample times must be a positive integer\n" unless $sample_times =~ /^\d+$/ && $sample_times > 0;
+die "Sample length must be a positive integer\n" unless $sample_length =~ /^\d+$/ && $sample_length > 0;
+
+# Set random seed if provided
+srand($seed) if defined $seed;
+
+$logger->info("Starting genome sampling");
+$logger->info("Parameters:");
+$logger->info("  FAI file: $fai_file");
+$logger->info("  Output file: $output_file");
+$logger->info("  Sample times: $sample_times");
+$logger->info("  Sample length: $sample_length bp");
+$logger->info("  Specific chromosome: " . ($specific_chr || "None"));
+$logger->info("  Random seed: " . (defined $seed ? $seed : "Not set"));
+
+# Read genome index
+my %chromosomes;
+my $total_length = 0;
+my $start_time = time;
+
+open my $fai_fh, '<', $fai_file or die "Cannot open FAI file: $!\n";
+while (<$fai_fh>) {
     chomp;
-    my @arr = split(/\t/);
-    if ($arr[1] * 0.8 < $sample_length) {
-        next;
-    }
-    $sum += $arr[1];
-    $hash{$arr[0]} = [$sum - $arr[1] + 1, $sum]; 
-    $record{$arr[0]} = $arr[1];
+    my @fields = split(/\t/);
+    next unless @fields >= 2;  # Ensure we have at least chr name and length
+    
+    my ($chr, $length) = @fields;
+    # Skip if length is not a valid number
+    next unless defined $length && $length =~ /^\d+$/;
+    
+    # Skip if specific chromosome requested and this isn't it
+    next if $specific_chr && $chr ne $specific_chr;
+    # Skip if chromosome is too short
+    next if $length * 0.8 < $sample_length;
+    
+    $total_length += $length;
+    $chromosomes{$chr} = {
+        start => $total_length - $length + 1,
+        end => $total_length,
+        length => $length
+    };
+    
+    $logger->debug("Processed chromosome $chr (length: $length)");
+}
+close $fai_fh;
+
+# Verify we have valid chromosomes
+unless (%chromosomes) {
+    $logger->error("No valid chromosomes found in FAI file");
+    die "No valid chromosomes found for sampling\n";
 }
 
-my $used = 0;
+$logger->info(sprintf("Genome size: %.2f Gb", $total_length/1e9));
+$logger->info("Found " . scalar(keys %chromosomes) . " usable chromosomes");
+
+# Open output file
+open my $out_fh, '>', $output_file or die "Cannot open output file: $!\n";
+
+# Generate samples
+my $used_length = 0;
+my $samples_generated = 0;
+my $remaining_length = $total_length;  # Track remaining length separately
 
 for (my $i = $sample_times; $i > 0; $i--) {
-    my $region = int($sum / $i);
-    my $begin = int(rand($region - $sample_length));
-    my $start = $begin + $used;
-    my $end = $start + $sample_length - 1;
-
-    foreach my $key (sort keys %hash) {
-        my ($chr_start, $chr_end) = @{$hash{$key}};
-        if ($start >= $chr_start && $end <= $chr_end) {
-			my $rel_start = $start - $chr_start + 1;
-            my $rel_end = $end - $chr_start + 1;
-            print OUT "$key\t$rel_start\t$rel_end\n";
-            last; 
+    # Calculate region size from remaining length
+    my $region_size = int($remaining_length / $i);
+    next unless $region_size > $sample_length;  # Skip if region too small
+    
+    my $begin = int(rand($region_size - $sample_length));
+    my $sample_start = $begin + $used_length;
+    my $sample_end = $sample_start + $sample_length - 1;
+    
+    # Find corresponding chromosome
+    my $found = 0;
+    for my $chr (sort keys %chromosomes) {
+        my $chr_info = $chromosomes{$chr};
+        if ($sample_start >= $chr_info->{start} && $sample_end <= $chr_info->{end}) {
+            my $rel_start = $sample_start - $chr_info->{start} + 1;
+            my $rel_end = $sample_end - $chr_info->{start} + 1;
+            
+            # Verify coordinates are valid
+            if ($rel_start > 0 && $rel_end <= $chr_info->{length}) {
+                print $out_fh "$chr\t$rel_start\t$rel_end\n";
+                $samples_generated++;
+                $logger->debug("Generated sample on $chr: $rel_start-$rel_end");
+                $found = 1;
+            }
+            last;
         }
     }
-    $used += $region;
-    $sum -= $region;
+    
+    $logger->warn("Could not place sample $i") unless $found;
+    
+    $used_length += $region_size;
+    $remaining_length -= $region_size;
 }
+
+close $out_fh;
+
+my $duration = time - $start_time;
+$logger->info("Sampling completed in " . sprintf("%.2f", $duration) . " seconds");
+$logger->info("Generated $samples_generated samples");
+$logger->info("Results written to: $output_file");
+
+# Exit with error if no samples were generated
+exit($samples_generated > 0 ? 0 : 1);
