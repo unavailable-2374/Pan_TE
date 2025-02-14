@@ -11,6 +11,31 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
 
+VERSION = '1.0.0'
+
+# Usage and help message
+USAGE = f'''Usage:
+perl $0 [options]
+
+Example:
+    perl $0 --genome genome.fasta --threads 80 --model-dir Your_Path_To_ClassifyTE 
+
+Parameters:
+[General]
+    --genome <string>         Required. Genome file in FASTA format.
+    --model-dir <string>      Provide path to ClassifyTE for classification.
+
+[Other]
+    --vcf-dir <string>        Default: NA. Path for VCF, see gfa.list for format.
+    --out <string>           Default: current directory. The work directory.
+    -M <int>                 Memory limit (in MB), default: 0 (unlimited).
+    --threads <int>          Default: 4. Number of threads, preferably in multiples of 4.
+    --fragment_size <int>    Default: 40000. Length for fragment.
+    --help|-h                Display this help information.
+
+Version: {VERSION}
+'''
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +46,59 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+class CustomArgumentParser(argparse.ArgumentParser):
+    def format_help(self):
+        return USAGE
+
+    def error(self, message):
+        sys.stderr.write(f'error: {message}\n\n')
+        self.print_help()
+        sys.exit(2)
+
+def parse_arguments():
+    """Parse command line arguments with custom help format."""
+    parser = CustomArgumentParser(add_help=False)
+    
+    # General options
+    parser.add_argument('--genome', 
+                       type=str,
+                       help='Genome file in FASTA format')
+    parser.add_argument('--model-dir',
+                       type=str,
+                       help='Path to ClassifyTE for classification')
+    
+    # Other options
+    parser.add_argument('--vcf-dir',
+                       type=str,
+                       help='Path for VCF files')
+    parser.add_argument('--out',
+                       type=str,
+                       default=os.getcwd(),
+                       help='Work directory')
+    parser.add_argument('-M',
+                       type=int,
+                       default=0,
+                       help='Memory limit in MB')
+    parser.add_argument('--threads',
+                       type=int,
+                       default=4,
+                       help='Number of threads')
+    parser.add_argument('--fragment_size',
+                       type=int,
+                       default=40000,
+                       help='Length for fragment')
+    parser.add_argument('--help', '-h',
+                       action='help',
+                       help='Display help information')
+    
+    args = parser.parse_args()
+    
+    # Validate required arguments
+    if not args.genome:
+        parser.error('--genome is required')
+        
+    return args
 
 class PanTEPipeline:
     """Implementation of the Pan TE Pipeline with step tracking and checkpoints."""
@@ -369,20 +447,12 @@ class PanTEPipeline:
             raise
 
 def main():
-    parser = argparse.ArgumentParser(description='Pan TE Pipeline')
-    parser.add_argument('--genome', required=True, help='Input genome file')
-    parser.add_argument('--out', required=True, help='Output directory')
-    parser.add_argument('--threads', type=int, default=4, help='Number of threads')
-    parser.add_argument('--model-dir', help='ClassifyTE model directory')
-    parser.add_argument('--vcf-dir', help='Directory containing VCF files')
-    
-    args = parser.parse_args()
-    
+    """Main execution function."""
     try:
-        # Check if at least one input source is provided
-        if not (args.genome or args.vcf_dir):
-            parser.error("Either --genome or --vcf-dir must be provided")
-            
+        # Parse arguments
+        args = parse_arguments()
+        
+        # Create pipeline instance
         pipeline = PanTEPipeline(
             genome_file=args.genome,
             output_dir=args.out,
@@ -390,11 +460,29 @@ def main():
             model_dir=args.model_dir,
             vcf_dir=args.vcf_dir
         )
+
+        # Set memory limit if specified
+        if args.M > 0:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (args.M * 1024 * 1024, -1))
+            logger.info(f"Set memory limit to {args.M} MB")
+
+        # Set fragment size
+        if hasattr(pipeline, 'fragment_size'):
+            pipeline.fragment_size = args.fragment_size
+            logger.info(f"Set fragment size to {args.fragment_size}")
+
+        # Run pipeline
         pipeline.run()
         logger.info("Pipeline completed successfully")
         
+    except KeyboardInterrupt:
+        logger.error("Pipeline interrupted by user")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Pipeline failed: {str(e)}")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logger.exception("Detailed error traceback:")
         sys.exit(1)
 
 if __name__ == "__main__":

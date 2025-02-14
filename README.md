@@ -57,7 +57,7 @@ go to [this link](https://drive.google.com/file/d/1CuDciG0Ru5zRBhffjQmgJdqSMQB89
         --model-dir <string>      Provide path to ClassifyTE for classification.
     
     [Other]
-        --vcf-dir <string>        Default: NA. Path for VCF, see gfa.list for format.
+        --vcf-dir <string>        Default: NA. Path for VCFs.
         --out <string>            Default: current directory. The work directory.
         -M <int>                  Memory limit (in MB), default: 0 (unlimited).
         --threads <int>           Default: 4. Number of threads, preferably in multiples of 4.
