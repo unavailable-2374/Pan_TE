@@ -81,6 +81,7 @@ if (! -e "raw.fa") {
     while(<IN>) {
         chomp;
         my @arr = split(/\t/);
+        if($arr[15] eq NA){next;}
         if($arr[15] > 0.9) {
             if($arr[5] eq "NA") {
                 print OUT $arr[0]."\t".$arr[2]."\t".$arr[3]."\n";
