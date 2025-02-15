@@ -355,20 +355,14 @@ class TEConsensusBuilder:
             # Create temporary directory alongside output file
             input_path = os.path.abspath(input_file)
             output_path = os.path.abspath(output_file)
-            output_dir = os.path.dirname(os.path.dirname(os.path.dirname(output_path)))
-
-            logger.info(f"Derived output directory: {output_dir}")
+            output_dir = os.getcwd()
+            logger.info(f"Using base directory for consensus building: {output_dir}")
 
             timestamp = int(time.time())
-            self.temp_dir = os.path.join(output_dir, 'genome', 'tmp', f'tmp_{timestamp}')
+            self.temp_dir = os.path.join(output_dir, f'tmp_{timestamp}')
             os.makedirs(self.temp_dir, exist_ok=True)
-
             os.chdir(self.temp_dir)
-
             logger.info(f"Created temporary directory: {self.temp_dir}")
-
-            if not os.path.exists(self.temp_dir):
-                raise RuntimeError(f"Failed to create temporary directory: {self.temp_dir}")
             
             logger.info(f"Reading sequences from: {input_path}")
             sequences = list(SeqIO.parse(input_path, "fasta"))

@@ -33,6 +33,8 @@ init_environment();
 # Main execution
 process_data();
 
+cleanup_tmp_files($config{out_dir});
+
 exit(0);
 
 ###############################################################################
@@ -235,6 +237,23 @@ sub log_message {
     close $log_fh;
 }
 
+sub cleanup_tmp_files {
+    my $dir = shift;
+    opendir(my $dh, $dir) or die "Cannot open directory $dir: $!\n";
+    while (my $file = readdir($dh)) {
+        next if ($file eq '.' or $file eq '..');
+        if ($file =~ /^tmp_/) {
+            my $path = File::Spec->catfile($dir, $file);
+            if (-d $path) {
+                remove_tree($path) or warn "Could not remove directory $path: $!";
+            } else {
+                unlink($path) or warn "Could not remove file $path: $!";
+            }
+            print "Removed $path\n";
+        }
+    }
+    closedir($dh);
+}
 __END__
 
 =head1 NAME
