@@ -44,6 +44,9 @@ sub init_environment {
     validate_environment();
     setup_directories();
     setup_logging();
+    $config{out_dir} = abs_path($config{out_dir});
+    chdir($config{out_dir}) or die "Cannot change directory to $config{out_dir}: $!\n";
+    print "DEBUG: Changed working directory to $config{out_dir}\n";
 }
 
 sub process_data {
@@ -194,14 +197,12 @@ sub process_multiple_alleles {
 sub refine_alleles {
     my ($temp_file, $base_name) = @_;
 
-    my $desired_tmp = $config{out_dir};
-    $temp_file = abs_path($temp_file);
-    
-    my $new_temp_file = File::Spec->catfile($desired_tmp, "$base_name.tmp.fa");
-    my $output_fasta  = File::Spec->catfile($desired_tmp, "$base_name.tmp.fa.out");
+    $config{out_dir} = abs_path($config{out_dir});
 
-    system("cp $temp_file $new_temp_file") == 0
-        or die "Failed to copy temp file: $!\n";
+    chdir($config{out_dir}) or die "Cannot change directory to $config{out_dir}: $!\n";
+    
+    my $new_temp_file = File::Spec->catfile($config{out_dir}, "$base_name.tmp.fa");
+    my $output_fasta  = File::Spec->catfile($config{out_dir}, "$base_name.tmp.fa.out");
     
     my $cmd = join(" ",
         "Refiner_for_Graph",
@@ -213,8 +214,9 @@ sub refine_alleles {
     
     system($cmd) == 0
         or die "Feature Extraction Failure: $?\n";
-        
-    system("cat $output_fasta >> " . File::Spec->catfile($desired_tmp, "$base_name.fa"))
+
+    my $final_fa = File::Spec->catfile($config{out_dir}, "$base_name.fa");
+    system("cat $output_fasta >> $final_fa")
         == 0 or die "Failed to append Refine results: $!\n";
 }
 
