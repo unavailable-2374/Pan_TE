@@ -12,8 +12,6 @@ use POSIX qw(strftime);
 # Constants
 use constant {
     MIN_SEQ_LENGTH => 50,
-    CDHIT_IDENTITY => 0.8,
-    CDHIT_COVERAGE => 0.8,
     DEFAULT_THREADS => 4,
     MAX_RETRIES => 3,
     TMP_DIR => '.',
@@ -209,7 +207,7 @@ sub refine_alleles {
         "Refiner_for_Graph",
         $new_temp_file,
         $output_fasta,
-        "--distance-threshold", "0.7",
+        "--distance-threshold", "0.8",
         "-t", $config{threads}
     );
     
@@ -218,15 +216,6 @@ sub refine_alleles {
         
     system("cat $output_fasta >> " . File::Spec->catfile($desired_tmp, "$base_name.fa"))
         == 0 or die "Failed to append Refine results: $!\n";
-        
-    #unlink glob(TMP_DIR . "/tmp_*/*");  
-    #remove_tree(glob(TMP_DIR . "/tmp_*"));  
-    #unlink glob(TMP_DIR . "/*.n*");        
-    #unlink glob(TMP_DIR . "/ref_sequences_*");
-    #unlink glob(TMP_DIR . "/queries_*");
-    #unlink glob(TMP_DIR . "/reference_*");
-    #unlink $output_fasta if -e $output_fasta;
-    #unlink $temp_file if -e $temp_file;
 }
 
 sub print_sequence {
