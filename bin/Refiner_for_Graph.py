@@ -269,8 +269,7 @@ class TEConsensusBuilder:
 
     def build_multiple_alignment(self, sequences, reference):
         unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
-        if not os.path.exists('tmp'):
-            os.makedirs('tmp')
+        os.makedirs('tmp', exist_ok=True)
 
         ref_name = os.path.join('tmp', f'reference_{unique_id}.fa')
         query_name = os.path.join('tmp', f'queries_{unique_id}.fa')
