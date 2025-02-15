@@ -50,7 +50,8 @@ sub init_environment {
 
 sub process_data {
     my $vcf_entries = read_vcf_file($config{vcf_file});
-    process_vcf_entries($vcf_entries);
+    my $output_file = File::Spec->catfile($config{out_dir}, "processed.fa");
+    process_vcf_entries($vcf_entries, $output_file);
 }
 
 ###############################################################################
@@ -192,6 +193,7 @@ sub process_multiple_alleles {
 sub refine_alleles {
     my ($temp_file, $base_name) = @_;
     my $output_fasta = "$temp_file.out";
+    my $work_dir = $config{out_dir};
     
     my $cmd = join(" ",
         "Refiner_for_Graph",

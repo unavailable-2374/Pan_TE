@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
+from vcf_processor import VCFProcessor  
 
 VERSION = '1.0.0'
 
@@ -116,8 +117,9 @@ class PanTEPipeline:
         # Verify inputs
         if not self.genome_file:
             raise ValueError("genome_file must be provided")
-        if self.vcf_dir and not self.genome_file:
-            raise ValueError("genome_file must be provided when using vcf_dir")
+        # Verify inputs
+        if not self.genome_file and not self.vcf_dir:
+            raise ValueError("Either genome_file or vcf_dir must be provided")
         
         self.ltr_threads = max(1, threads - 1)
         self.rs_threads = max(1, threads)
@@ -208,19 +210,19 @@ class PanTEPipeline:
         processed_genome = os.path.join(genome_dir, 'genome.fa')
         
         if self.vcf_dir:
-            # Process both VCF and genome file
-            logger.info("Processing both VCF and genome files")
-            vcf_result = os.path.join(genome_dir, 'vcf_sequences.fa')
-            genome_result = os.path.join(genome_dir, 'genome_sequence.fa')
-            
-            # Process genome file
-            self.process_single_genome(genome_result)
-            
-            # Process VCF files
-            self.process_graph_genome(vcf_result)
-            
-            # Combine both results
-            self.combine_genome_results(genome_dir, [vcf_result, genome_result])
+            # Process VCF files using the new VCF processor
+            logger.info("Processing VCF files...")
+            vcf_processor = VCFProcessor(
+                vcf_dir=self.vcf_dir,
+                output_dir=genome_dir,
+                total_threads=self.threads
+            )
+            try:
+                vcf_sequences = vcf_processor.process_all_vcfs()
+                logger.info(f"VCF processing completed: {vcf_sequences}")
+            except Exception as e:
+                logger.error(f"VCF processing failed: {str(e)}")
+                raise
         else:
             # Process only genome file
             logger.info("Processing single genome file")
@@ -352,41 +354,6 @@ class PanTEPipeline:
 
         os.remove(tmp_fa)
         logger.info("Single genome processing completed")
-
-    def process_graph_genome(self, output_file: str):
-        """Process genome from VCF files."""
-        logger.info("Starting graph genome processing from VCFs")
-        
-        if not self.vcf_dir:
-            raise ValueError("VCF directory not specified")
-            
-        tmp_dir = os.path.join(os.path.dirname(output_file), 'tmp')
-        os.makedirs(tmp_dir, exist_ok=True)
-        
-        # Get list of VCF files
-        vcf_files = list(Path(self.vcf_dir).glob('*.vcf'))
-        if not vcf_files:
-            raise FileNotFoundError(f"No VCF files found in {self.vcf_dir}")
-            
-        logger.info(f"Found {len(vcf_files)} VCF files")
-        
-        # Process each VCF file
-        for vcf_file in vcf_files:
-            try:
-                cmd = f"decode_gfa.pl --vcf {vcf_file} --threads {self.threads} --out {tmp_dir}"
-                self.run_cmd(cmd)
-                logger.info(f"Successfully processed {vcf_file}")
-            except Exception as e:
-                logger.error(f"Failed to process {vcf_file}: {str(e)}")
-                raise
-        
-        # Combine results
-        self.run_cmd(f"cat {tmp_dir}/*.fa > {output_file}")
-        
-        # Cleanup
-        import shutil
-        shutil.rmtree(tmp_dir)
-        logger.info("Graph genome processing completed")
 
     def combine_genome_results(self, genome_dir: str, input_files: list):
         """Combine and process all genome sequences into final genome.fa."""

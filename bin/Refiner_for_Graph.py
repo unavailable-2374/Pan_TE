@@ -40,9 +40,10 @@ class SequenceClusterer:
         distances = np.zeros((n_seqs, n_seqs))
         unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
         
-        if not os.path.exists('tmp'):
-            os.makedirs('tmp')
-        temp_name = os.path.join('tmp', f'ref_sequences_{unique_id}.fa')
+        if not hasattr(self.te_builder, 'temp_dir'):
+            raise ValueError("TEConsensusBuilder temp_dir not initialized")
+        
+        temp_name = os.path.join(self.te_builder.temp_dir, f'ref_sequences_{unique_id}.fa')
         with open(temp_name, 'w') as temp_file:
             SeqIO.write(sequences, temp_file, "fasta")
             
@@ -145,11 +146,13 @@ class TEConsensusBuilder:
         self.gap_init = gap_init
         self.gap_ext = gap_ext
         self.threads = threads or 1
+        self.temp_dir = None 
 
     def prepare_blast_db(self, fasta_file):
+        fasta_path = os.path.abspath(fasta_file)
         cmd = [
             self.makeblastdb_path,
-            "-in", fasta_file,
+            "-in", fasta_path,
             "-dbtype", "nucl"
         ]
         try:
@@ -160,12 +163,14 @@ class TEConsensusBuilder:
             raise
 
     def run_rmblast(self, query_file, subject_file):
-        self.prepare_blast_db(subject_file)
+        query_path = os.path.abspath(query_file)
+        subject_path = os.path.abspath(subject_file)
+        self.prepare_blast_db(subject_path)
 
         cmd = [
             self.rmblast_path,
-            "-query", query_file,
-            "-db", subject_file,
+            "-query", query_path,
+            "-db", subject_path,
             "-outfmt", "6 qseqid sseqid score qstart qend sstart send qseq sseq sstrand",
             "-matrix", self.matrix_path,
             "-gapopen", str(self.gap_init),
@@ -335,6 +340,14 @@ class TEConsensusBuilder:
 
     def build_clustered_consensus(self, input_file, output_file):
         try:
+            # Create temporary directory alongside output file
+            output_path = os.path.abspath(output_file)
+            output_dir = os.path.dirname(output_path)
+            self.temp_dir = os.path.join(output_dir, f'tmp_{int(time.time())}')
+            os.makedirs(self.temp_dir, exist_ok=True)
+
+            logger.info(f"Created temporary directory: {self.temp_dir}")
+            
             logger.info("Reading sequences...")
             sequences = list(SeqIO.parse(input_file, "fasta"))
             if not sequences:
@@ -379,6 +392,15 @@ class TEConsensusBuilder:
         except Exception as e:
             logger.error(f"Error in consensus building: {str(e)}")
             raise
+        finally:
+            # Clean up temporary directory
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                try:
+                    import shutil
+                    shutil.rmtree(self.temp_dir)
+                    logger.info("Cleaned up temporary directory")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary directory: {str(e)}")
 
 class Config:    
     def __init__(self):
