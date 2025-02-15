@@ -16,7 +16,7 @@ use constant {
     CDHIT_COVERAGE => 0.8,
     DEFAULT_THREADS => 4,
     MAX_RETRIES => 3,
-    TMP_DIR => 'tmp',
+    TMP_DIR => '.',
 };
 
 our $VERSION = '1.0.0';
@@ -168,6 +168,9 @@ sub process_multiple_alleles {
     my ($alt_allele, $base_name, $temp_file) = @_;
     my @alleles = split(/,/, $alt_allele);
     my $long_alleles = 0;
+
+    my $tmp_dir = TMP_DIR;
+    make_path($tmp_dir) unless -d $tmp_dir;
     
     open my $tmp_fh, '>', $temp_file;
     
@@ -192,12 +195,19 @@ sub process_multiple_alleles {
 
 sub refine_alleles {
     my ($temp_file, $base_name) = @_;
-    my $output_fasta = "$temp_file.out";
-    my $work_dir = $config{out_dir};
+
+    my $desired_tmp = $config{out_dir};
+    $temp_file = abs_path($temp_file);
+    
+    my $new_temp_file = File::Spec->catfile($desired_tmp, "$base_name.tmp.fa");
+    my $output_fasta  = File::Spec->catfile($desired_tmp, "$base_name.tmp.fa.out");
+
+    system("cp $temp_file $new_temp_file") == 0
+        or die "Failed to copy temp file: $!\n";
     
     my $cmd = join(" ",
         "Refiner_for_Graph",
-        $temp_file,
+        $new_temp_file,
         $output_fasta,
         "--distance-threshold", "0.7",
         "-t", $config{threads}
@@ -206,17 +216,17 @@ sub refine_alleles {
     system($cmd) == 0
         or die "Feature Extraction Failure: $?\n";
         
-    system("cat $output_fasta >> " . TMP_DIR . "/$base_name.fa") == 0
-        or die "Failed to append Refine results: $?\n";
+    system("cat $output_fasta >> " . File::Spec->catfile($desired_tmp, "$base_name.fa"))
+        == 0 or die "Failed to append Refine results: $!\n";
         
-    unlink glob(TMP_DIR . "/tmp_*/*");  
-    remove_tree(glob(TMP_DIR . "/tmp_*"));  
-    unlink glob(TMP_DIR . "/*.n*");        
-    unlink glob(TMP_DIR . "/ref_sequences_*");
-    unlink glob(TMP_DIR . "/queries_*");
-    unlink glob(TMP_DIR . "/reference_*");
-    unlink $output_fasta if -e $output_fasta;
-    unlink $temp_file if -e $temp_file;
+    #unlink glob(TMP_DIR . "/tmp_*/*");  
+    #remove_tree(glob(TMP_DIR . "/tmp_*"));  
+    #unlink glob(TMP_DIR . "/*.n*");        
+    #unlink glob(TMP_DIR . "/ref_sequences_*");
+    #unlink glob(TMP_DIR . "/queries_*");
+    #unlink glob(TMP_DIR . "/reference_*");
+    #unlink $output_fasta if -e $output_fasta;
+    #unlink $temp_file if -e $temp_file;
 }
 
 sub print_sequence {

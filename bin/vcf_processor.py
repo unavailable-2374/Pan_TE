@@ -15,6 +15,7 @@ import subprocess
 from typing import List, Dict, Tuple
 from dataclasses import dataclass
 import tempfile
+import shutil
 
 # Configure logging
 logging.basicConfig(

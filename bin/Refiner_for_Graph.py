@@ -351,27 +351,30 @@ class TEConsensusBuilder:
         return ''.join(consensus).replace('-', '')
 
     def build_clustered_consensus(self, input_file, output_file):
+        original_dir = os.getcwd()
         try:
             # Create temporary directory alongside output file
+            input_path = os.path.abspath(input_file)
             output_path = os.path.abspath(output_file)
-            output_dir = os.path.dirname(output_path)
-            self.temp_dir = os.path.join(output_dir, f'tmp_{int(time.time())}')
+            output_dir = os.path.dirname(os.path.dirname(os.path.dirname(output_path)))
+
+            logger.info(f"Derived output directory: {output_dir}")
+
+            timestamp = int(time.time())
+            self.temp_dir = os.path.join(output_dir, 'genome', 'tmp', f'tmp_{timestamp}')
             os.makedirs(self.temp_dir, exist_ok=True)
+
+            os.chdir(self.temp_dir)
 
             logger.info(f"Created temporary directory: {self.temp_dir}")
 
             if not os.path.exists(self.temp_dir):
                 raise RuntimeError(f"Failed to create temporary directory: {self.temp_dir}")
-                
-            logger.info("Reading sequences...")
-            sequences = list(SeqIO.parse(input_file, "fasta"))
-            if not sequences:
-                raise ValueError(f"No sequences found in {input_file}")
             
-            logger.info("Reading sequences...")
-            sequences = list(SeqIO.parse(input_file, "fasta"))
+            logger.info(f"Reading sequences from: {input_path}")
+            sequences = list(SeqIO.parse(input_path, "fasta"))
             if not sequences:
-                raise ValueError(f"No sequences found in {input_file}")
+                raise ValueError(f"No sequences found in {input_path}")
             logger.info(f"Read {len(sequences)} sequences")
 
             clusterer = SequenceClusterer(self)
@@ -398,10 +401,10 @@ class TEConsensusBuilder:
                 )
                 consensus_records.append(consensus_record)
 
-            SeqIO.write(consensus_records, output_file, "fasta")
-            logger.info(f"Written {len(consensus_records)} consensus sequences to {output_file}")
+            SeqIO.write(consensus_records, output_path, "fasta")
+            logger.info(f"Written {len(consensus_records)} consensus sequences to {output_path}")
 
-            stats_file = f"{output_file}.stats"
+            stats_file = f"{output_path}.stats"
             with open(stats_file, "w") as f:
                 f.write(f"Original sequences: {len(sequences)}\n")
                 f.write(f"Number of clusters: {len(clusters)}\n")
@@ -413,6 +416,7 @@ class TEConsensusBuilder:
             logger.error(f"Error in consensus building: {str(e)}")
             raise
         finally:
+            os.chdir(original_dir)
             if self.temp_dir and os.path.exists(self.temp_dir):
                 logger.info("Temporary directory will be cleaned by calling script")
 
