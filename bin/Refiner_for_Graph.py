@@ -9,6 +9,7 @@ import subprocess
 import os
 import time
 import random
+import shutil
 import logging
 from itertools import combinations
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -16,6 +17,9 @@ from scipy.spatial.distance import squareform
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+print(shutil)  
+print(type(shutil)) 
 
 class RMBlastAlignment:
     def __init__(self, query_id, subject_id, score, query_start, query_end,
@@ -116,29 +120,11 @@ class SequenceClusterer:
             logger.error(f"Distance matrix stats - min: {distances.min()}, max: {distances.max()}, mean: {distances.mean()}")
             raise
 
-    def cluster_sequences(self, sequences):
-        if len(sequences) == 1:
-            return [[sequences[0]]]
-            
-        logger.info("Calculating distance matrix...")
-        distances = self.calculate_distance_matrix(sequences)
-        
-        logger.info("Performing hierarchical clustering...")
-        linkage_matrix = linkage(squareform(distances), method='average')
-        
-        clusters = fcluster(linkage_matrix, t=self.distance_threshold, 
-                          criterion='distance')
-        
-        cluster_dict = defaultdict(list)
-        for seq, cluster_id in zip(sequences, clusters):
-            cluster_dict[cluster_id].append(seq)
-            
-        return list(cluster_dict.values())
-
 class TEConsensusBuilder:
     def __init__(self, rmblast_dir, makeblastdb_path, matrix_path,
                  min_score=150, gap_init=20, gap_ext=5, 
                  threads=None):
+        self.temp_files = set()
         self.rmblast_path = os.path.join(rmblast_dir, "rmblastn")
         self.makeblastdb_path = makeblastdb_path
         self.matrix_path = matrix_path
@@ -149,88 +135,115 @@ class TEConsensusBuilder:
         self.temp_dir = None 
 
     def prepare_blast_db(self, fasta_file):
-        fasta_path = os.path.abspath(fasta_file)
         cmd = [
             self.makeblastdb_path,
-            "-in", fasta_path,
-            "-dbtype", "nucl"
+            "-in", fasta_file,
+            "-dbtype", "nucl",
+            "-parse_seqids" 
         ]
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            logger.info(f"Created BLAST database for {fasta_file}")
+            logger.info(f"Creating BLAST database: {' '.join(cmd)}")
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            logger.info("BLAST database creation successful")
+            if result.stderr:
+                logger.debug(f"makeblastdb stderr: {result.stderr}")
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to create BLAST database: {e.stderr.decode()}")
+            logger.error(f"Failed to create BLAST database: {e.stderr}")
             raise
 
     def run_rmblast(self, query_file, subject_file):
+
+        current_dir = os.getcwd()
         query_path = os.path.abspath(query_file)
         subject_path = os.path.abspath(subject_file)
-        self.prepare_blast_db(subject_path)
+        work_dir = os.path.dirname(subject_path)
 
-        cmd = [
-            self.rmblast_path,
-            "-query", query_path,
-            "-db", subject_path,
-            "-outfmt", "6 qseqid sseqid score qstart qend sstart send qseq sseq sstrand",
-            "-matrix", self.matrix_path,
-            "-gapopen", str(self.gap_init),
-            "-gapextend", str(self.gap_ext),
-            "-dust", "no",  
-            "-soft_masking", "false",
-            "-num_threads", str(self.threads),
-            "-complexity_adjust",
-            "-evalue", "1e-10",
-            "-word_size", "7",
-            "-window_size", "40",      
-            "-xdrop_gap", "50",        
-            "-xdrop_gap_final", "100"  
-        ]
-
-        logger.info(f"Running RMBlast command: {' '.join(cmd)}")
+        os.chdir(work_dir)
         
         try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            alignments = []
-            for line in result.stdout.split('\n'):
-                if line.strip():
-                    fields = line.split('\t')
-                    if len(fields) >= 9:
-                        alignment = RMBlastAlignment(
-                            query_id=fields[0],
-                            subject_id=fields[1],
-                            score=float(fields[2]),
-                            query_start=int(fields[3]),
-                            query_end=int(fields[4]),
-                            subject_start=int(fields[5]),
-                            subject_end=int(fields[6]),
-                            alignment=(fields[7], fields[8]),
-                            orientation=fields[9] if len(fields) > 9 else 'plus'
-                        )
-                        if alignment.score >= self.min_score:
-                            alignments.append(alignment)
-            
-            return alignments
+            self.prepare_blast_db(subject_path)
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"RMBlast failed with error: {e.stderr}")
-            raise
+            if not os.path.exists(os.path.basename(query_path)):
+                logger.error(f"Query file not found: {query_path}")
+                raise FileNotFoundError(f"Query file not found: {query_path}")
+            if not os.path.exists(os.path.basename(subject_path)):
+                logger.error(f"Subject file not found: {subject_path}")
+                raise FileNotFoundError(f"Subject file not found: {subject_path}")
+        
+            self.prepare_blast_db(os.path.basename(subject_path))
+
+            db_files = [os.path.basename(subject_path) + ext for ext in ['.nhr', '.nin', '.nsq']]
+            for db_file in db_files:
+                if not os.path.exists(db_file):
+                    raise FileNotFoundError(f"BLAST database file not found: {db_file}")
+            
+            cmd = [
+                self.rmblast_path,
+                "-query", query_path,
+                "-db", subject_path,
+                "-outfmt", "6 qseqid sseqid score qstart qend sstart send qseq sseq sstrand",
+                "-matrix", self.matrix_path,
+                "-gapopen", str(self.gap_init),
+                "-gapextend", str(self.gap_ext),
+                "-dust", "no",  
+                "-soft_masking", "false",
+                "-num_threads", str(self.threads),
+                "-complexity_adjust",
+                "-evalue", "1e-10",
+                "-word_size", "7",
+                "-window_size", "40",      
+                "-xdrop_gap", "50",        
+                "-xdrop_gap_final", "100"  
+            ]
+
+            logger.info(f"Running RMBlast command: {' '.join(cmd)}")
+            
+            try:
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                alignments = []
+                for line in result.stdout.split('\n'):
+                    if line.strip():
+                        fields = line.split('\t')
+                        if len(fields) >= 9:
+                            alignment = RMBlastAlignment(
+                                query_id=fields[0],
+                                subject_id=fields[1],
+                                score=float(fields[2]),
+                                query_start=int(fields[3]),
+                                query_end=int(fields[4]),
+                                subject_start=int(fields[5]),
+                                subject_end=int(fields[6]),
+                                alignment=(fields[7], fields[8]),
+                                orientation=fields[9] if len(fields) > 9 else 'plus'
+                            )
+                            if alignment.score >= self.min_score:
+                                alignments.append(alignment)
+                
+                return alignments
+
+            except subprocess.CalledProcessError as e:
+                logger.error(f"RMBlast failed with error: {e.stderr}")
+                raise
+                
         finally:
-            for ext in ['.nin', '.nsq', '.nhr']:
-                try:
-                    os.remove(subject_file + ext)
-                except OSError:
-                    pass
+            os.chdir(current_dir)
 
     def find_best_reference(self, sequences):
-        unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
-        if not os.path.exists('tmp'):
-            os.makedirs('tmp')
+        if not self.temp_dir:
+            raise ValueError("Temp directory not initialized")
         
-        temp_name = os.path.join('tmp', f'ref_sequences_{unique_id}.fa')
+        unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+        temp_name = os.path.join(self.temp_dir, f'ref_sequences_{unique_id}.fa')
+        
+        os.makedirs(os.path.dirname(temp_name), exist_ok=True)
+        
         with open(temp_name, 'w') as temp_file:
             SeqIO.write(sequences, temp_file, "fasta")
-
+        
         try:
+            if not os.path.exists(temp_name):
+                raise FileNotFoundError(f"Failed to create temporary file: {temp_name}")
+                
             alignments = self.run_rmblast(temp_name, temp_name)
             
             sequence_scores = defaultdict(float)
@@ -242,11 +255,11 @@ class TEConsensusBuilder:
                 best_seq_id = max(sequence_scores.items(), key=lambda x: x[1])[0]
                 return next(seq for seq in sequences if seq.id == best_seq_id)
             else:
-                return sequences[0]  
-
+                return sequences[0]
         finally:
             try:
-                os.remove(temp_name)
+                if os.path.exists(temp_name):
+                    os.remove(temp_name)
                 for ext in ['.nin', '.nsq', '.nhr']:
                     db_file = temp_name + ext
                     if os.path.exists(db_file):
@@ -261,10 +274,12 @@ class TEConsensusBuilder:
 
         ref_name = os.path.join('tmp', f'reference_{unique_id}.fa')
         query_name = os.path.join('tmp', f'queries_{unique_id}.fa')
+        temp_files = []
 
         with open(ref_name, 'w') as ref_file, open(query_name, 'w') as query_file:
             SeqIO.write([reference], ref_file, "fasta")
             SeqIO.write(sequences, query_file, "fasta")
+            temp_files.extend([ref_name, query_name])
         
         try:
             alignments = self.run_rmblast(query_name, ref_name)
@@ -272,15 +287,12 @@ class TEConsensusBuilder:
             return aligned_sequences
             
         finally:
-            for fname in [ref_name, query_name]:
+            for fname in temp_files:
                 try:
-                    os.remove(fname)
-                    for ext in ['.nin', '.nsq', '.nhr']:
-                        db_file = fname + ext
-                        if os.path.exists(db_file):
-                            os.remove(db_file)
+                    if os.path.exists(fname):
+                        os.remove(fname)
                 except OSError as e:
-                    logger.warning(f"Error cleaning up temporary files: {e}")
+                    logger.warning(f"Error removing file {fname}: {e}")
 
     def process_alignments(self, alignments, reference):
         ref_length = len(reference.seq)
@@ -347,6 +359,14 @@ class TEConsensusBuilder:
             os.makedirs(self.temp_dir, exist_ok=True)
 
             logger.info(f"Created temporary directory: {self.temp_dir}")
+
+            if not os.path.exists(self.temp_dir):
+                raise RuntimeError(f"Failed to create temporary directory: {self.temp_dir}")
+                
+            logger.info("Reading sequences...")
+            sequences = list(SeqIO.parse(input_file, "fasta"))
+            if not sequences:
+                raise ValueError(f"No sequences found in {input_file}")
             
             logger.info("Reading sequences...")
             sequences = list(SeqIO.parse(input_file, "fasta"))
@@ -393,18 +413,11 @@ class TEConsensusBuilder:
             logger.error(f"Error in consensus building: {str(e)}")
             raise
         finally:
-            # Clean up temporary directory
             if self.temp_dir and os.path.exists(self.temp_dir):
-                try:
-                    import shutil
-                    shutil.rmtree(self.temp_dir)
-                    logger.info("Cleaned up temporary directory")
-                except Exception as e:
-                    logger.warning(f"Failed to clean up temporary directory: {str(e)}")
+                logger.info("Temporary directory will be cleaned by calling script")
 
 class Config:    
     def __init__(self):
-        import shutil
         
         conda_env_path = self.get_current_conda_env()
         if conda_env_path:

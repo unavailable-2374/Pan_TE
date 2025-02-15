@@ -5,7 +5,7 @@ use File::Basename;
 use Getopt::Long;
 use Pod::Usage;
 use autodie;
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use Cwd qw(abs_path);
 use POSIX qw(strftime);
 
@@ -209,8 +209,14 @@ sub refine_alleles {
     system("cat $output_fasta >> " . TMP_DIR . "/$base_name.fa") == 0
         or die "Failed to append Refine results: $?\n";
         
-    unlink $output_fasta;
-    unlink glob(TMP_DIR . '/*.fa.n*');
+    unlink glob(TMP_DIR . "/tmp_*/*");  
+    remove_tree(glob(TMP_DIR . "/tmp_*"));  
+    unlink glob(TMP_DIR . "/*.n*");        
+    unlink glob(TMP_DIR . "/ref_sequences_*");
+    unlink glob(TMP_DIR . "/queries_*");
+    unlink glob(TMP_DIR . "/reference_*");
+    unlink $output_fasta if -e $output_fasta;
+    unlink $temp_file if -e $temp_file;
 }
 
 sub print_sequence {
