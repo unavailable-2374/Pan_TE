@@ -32,7 +32,6 @@ init_environment();
 
 # Main execution
 process_data();
-
 cleanup_tmp_files($config{out_dir});
 
 exit(0);
@@ -125,9 +124,25 @@ sub read_vcf_file {
     log_message("Reading VCF file: $file");
     open my $fh, '<', $file;
     
+    my $total_lines = 0;
+    while (<$fh>) {
+        $total_lines++ unless /^#/;
+    }
+    
+    seek($fh, 0, 0);
+    
+    select((select(STDERR), $| = 1)[0]);
+    
+    my $processed = 0;
     while (my $line = <$fh>) {
         next if $line =~ /^#/;  # Skip headers
         chomp $line;
+        
+        $processed++;
+        if ($processed % 100 == 0) {
+            my $percent = int(($processed / $total_lines) * 100);
+            print STDERR "PROGRESS:$percent\n";
+        }
         
         my @fields = split(/\t/, $line);
         next unless @fields >= 5;  # Ensure minimum fields
@@ -140,6 +155,8 @@ sub read_vcf_file {
         };
     }
     
+    print STDERR "PROGRESS:100\n";
+    
     close $fh;
     log_message("Read " . scalar(@entries) . " VCF entries");
     return \@entries;
@@ -151,10 +168,27 @@ sub process_vcf_entries {
     my $output_file = TMP_DIR . "/$base_name.fa";
     my $temp_file = TMP_DIR . "/$base_name.tmp.fa";
     
+    # Force immediate output flush
+    $| = 1;
+    select((select(STDERR), $| = 1)[0]);
+    
     open my $out_fh, '>>', $output_file;
+    
+    my $total_entries = scalar(@$entries);
+    my $processed = 0;
+    my $last_percent = -1;
     
     foreach my $entry (@$entries) {
         my $alt_allele = $entry->{alt};
+        $processed++;
+        
+        # Calculate and display progress
+        my $percent = int(($processed / $total_entries) * 100);
+        if ($percent != $last_percent) {
+            print STDERR "PROGRESS:$percent\n"; 
+            $last_percent = $percent;
+        }
+        
         next unless length($alt_allele) > MIN_SEQ_LENGTH;
         
         if ($alt_allele =~ /,/) {
@@ -205,14 +239,14 @@ sub refine_alleles {
     
     my $new_temp_file = File::Spec->catfile($config{out_dir}, "$base_name.tmp.fa");
     my $output_fasta  = File::Spec->catfile($config{out_dir}, "$base_name.tmp.fa.out");
-    
+
     my $cmd = join(" ",
         "Refiner_for_Graph",
         $new_temp_file,
         $output_fasta,
         "--distance-threshold", "0.8",
         "-t", $config{threads},
-        "-v"
+	"-v"
     );
     
     system($cmd) == 0
@@ -255,6 +289,7 @@ sub cleanup_tmp_files {
     }
     closedir($dh);
 }
+
 __END__
 
 =head1 NAME

@@ -125,7 +125,6 @@ class TEConsensusBuilder:
         self.threads = threads or 1
         self.temp_dir = None
 
-        # 检查 MAFFT 是否存在，并获得其路径
         self.mafft_path = shutil.which("mafft")
         if not self.mafft_path:
             raise FileNotFoundError("mafft not found in system PATH")
@@ -223,9 +222,6 @@ class TEConsensusBuilder:
             os.chdir(current_dir)
 
     def build_multiple_alignment(self, sequences, reference=None):
-        """
-        利用 MAFFT 对聚类内所有序列进行全局多序列比对，返回比对后的序列列表
-        """
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".fa", dir=self.temp_dir) as temp_in:
             SeqIO.write(sequences, temp_in, "fasta")
             temp_in_name = temp_in.name
@@ -267,7 +263,6 @@ class TEConsensusBuilder:
         temp_fa = None
         sketch_prefix = None
         try:
-            # 创建临时文件并写入序列
             with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".fa", dir=self.temp_dir) as temp:
                 SeqIO.write(sequences, temp, "fasta")
                 temp_fa = temp.name
@@ -275,18 +270,15 @@ class TEConsensusBuilder:
                 temp.flush()
                 os.fsync(temp.fileno())
 
-            # 保存序列 ID 到文件名的映射
             seq_id_map = {str(seq.id): seq for seq in sequences}
             
             sketch_prefix = temp_fa + ".mash"
             
-            # 检查 mash 命令
             mash_path = shutil.which("mash")
             if not mash_path:
                 raise FileNotFoundError("mash command not found in system PATH")
             logger.info(f"Found mash at: {mash_path}")
                 
-            # 运行 mash sketch
             sketch_cmd = [mash_path, "sketch", "-k", "16", "-m", "2", "-o", sketch_prefix, temp_fa]
             logger.info("Running mash sketch: " + " ".join(sketch_cmd))
             result = subprocess.run(sketch_cmd, 
@@ -296,13 +288,11 @@ class TEConsensusBuilder:
             if result.stderr:
                 logger.info(f"Mash sketch stderr: {result.stderr}")
 
-            # 检查 mash sketch 输出文件
             msh_file = sketch_prefix + ".msh"
             if not os.path.exists(msh_file):
                 raise FileNotFoundError(f"Mash sketch output file not found: {msh_file}")
             logger.info(f"Mash sketch file created: {msh_file}")
 
-            # 运行 mash dist
             dist_cmd = [mash_path, "dist", msh_file, temp_fa]
             logger.info("Running mash dist: " + " ".join(dist_cmd))
             result = subprocess.run(dist_cmd, 
@@ -317,19 +307,16 @@ class TEConsensusBuilder:
             if not mash_output.strip():
                 raise RuntimeError("Mash dist produced no output")
 
-            # 处理聚类
             try:
-                # 使用序列ID初始化UnionFind，而不是文件路径
                 uf = UnionFind([str(seq.id) for seq in sequences])
                 logger.info(f"Initialized UnionFind with {len(sequences)} sequences")
                 
                 cluster_count = 0
                 for line in mash_output.strip().split("\n"):
-                    parts = line.split("\t")  # 使用tab作为分隔符
+                    parts = line.split("\t") 
                     if len(parts) < 3:
                         continue
                     
-                    # 从文件名中提取序列ID
                     seq1_path = parts[0]
                     seq2_path = parts[1]
                     seq1_id = os.path.basename(seq1_path)
@@ -346,7 +333,6 @@ class TEConsensusBuilder:
                         
                 logger.info(f"Created {cluster_count} initial clusters")
 
-                # 构建聚类结果
                 clusters_dict = defaultdict(list)
                 for seq in sequences:
                     seq_id = str(seq.id)
@@ -356,7 +342,6 @@ class TEConsensusBuilder:
                 preclusters = list(clusters_dict.values())
                 logger.info(f"Formed {len(preclusters)} preclusters")
 
-                # 进行细粒度聚类
                 final_clusters = []
                 clusterer = SequenceClusterer(self)
                 for i, group in enumerate(preclusters):
@@ -381,7 +366,6 @@ class TEConsensusBuilder:
             raise
 
         finally:
-            # 清理临时文件
             try:
                 if temp_fa and os.path.exists(temp_fa):
                     os.remove(temp_fa)

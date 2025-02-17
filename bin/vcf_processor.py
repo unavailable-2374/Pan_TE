@@ -118,13 +118,33 @@ class VCFProcessor:
                 "--out", vcf_temp_dir
             ]
             
-            result = subprocess.run(cmd, 
-                                  check=True, 
-                                  capture_output=True, 
-                                  text=True)
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+
+            while True:
+                line = process.stderr.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line:
+                    if line.startswith('PROGRESS:'):
+                        try:
+                            percent = int(line.strip().split(':')[1])
+                            print(f"\rProcessing {vcf_file.path.name}: {percent}%", end='', flush=True)
+                        except (ValueError, IndexError):
+                            pass
+                    else:
+                        logger.debug(line.strip())
+
+            print() 
             
-            if result.stderr:
-                logger.warning(f"Warning messages from decode_gfa.pl: {result.stderr}")
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, cmd)
             
             final_output = os.path.join(self.output_dir, f"{vcf_file.path.stem}_sequences.fa")
             if os.path.exists(output_file):
@@ -134,7 +154,6 @@ class VCFProcessor:
                 raise FileNotFoundError(f"Expected output file not found: {output_file}")
                 
             # Clean up
-            import shutil
             shutil.rmtree(vcf_temp_dir)
             logger.info(f"Processed {vcf_file.path.name} successfully")
             
@@ -149,55 +168,109 @@ class VCFProcessor:
             logger.error(f"Error processing {vcf_file.path.name}: {str(e)}")
             if os.path.exists(vcf_temp_dir):
                 shutil.rmtree(vcf_temp_dir)
-            raise
-    
+            raise    
+
     def process_all_vcfs(self) -> str:
-        """Process all VCF files in parallel.
-        
-        Returns:
-            Path to combined output file
-        """
+        """Process all VCF files in parallel with progress display."""
         vcf_files = self.get_vcf_files()
         if not vcf_files:
             raise ValueError(f"No VCF files found in {self.vcf_dir}")
-            
+                
         logger.info(f"Found {len(vcf_files)} VCF files")
         
-        # Allocate threads
         vcf_files = self.allocate_threads(vcf_files)
         
-        # Process VCF files in parallel
+        progress_dict = {vcf.path.name: 0 for vcf in vcf_files}
+        
+        def display_progress():
+            print('\033[2J\033[H', end='')
+            print("\nProcessing VCF files:")
+            print("-" * 60)
+            for name, prog in sorted(progress_dict.items()):
+                bar_length = 40
+                filled = int(bar_length * prog / 100)
+                bar = '=' * filled + '>' + ' ' * (bar_length - filled - 1)
+                print(f"{name:<20} [{bar}] {prog}%")
+            print() 
+            sys.stdout.flush()
+
+        def process_single_vcf(vcf_file: VCFFile) -> str:
+            vcf_temp_dir = os.path.join(self.temp_dir, vcf_file.path.stem)
+            os.makedirs(vcf_temp_dir, exist_ok=True)
+            
+            cmd = [
+                "decode_gfa.pl",
+                "--vcf", str(vcf_file.path),
+                "--threads", str(vcf_file.allocated_threads),
+                "--out", vcf_temp_dir
+            ]
+            
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    universal_newlines=True
+                )
+                
+                while True:
+                    line = process.stderr.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    if line.startswith('PROGRESS:'):
+                        try:
+                            percent = int(line.strip().split(':')[1])
+                            progress_dict[vcf_file.path.name] = percent
+                            display_progress()
+                        except (ValueError, IndexError):
+                            continue
+                
+                if process.returncode != 0:
+                    raise subprocess.CalledProcessError(process.returncode, cmd)
+                
+                output_file = os.path.join(vcf_temp_dir, f"{vcf_file.path.stem}_processed.fa")
+                final_output = os.path.join(self.output_dir, f"{vcf_file.path.stem}_sequences.fa")
+                
+                if os.path.exists(output_file):
+                    shutil.move(output_file, final_output)
+                else:
+                    raise FileNotFoundError(f"Output file not found: {output_file}")
+                
+                shutil.rmtree(vcf_temp_dir)
+                return final_output
+                
+            except Exception as e:
+                logger.error(f"Error processing {vcf_file.path.name}: {str(e)}")
+                if os.path.exists(vcf_temp_dir):
+                    shutil.rmtree(vcf_temp_dir)
+                raise
+
         output_files = []
         with ThreadPoolExecutor(max_workers=len(vcf_files)) as executor:
-            future_to_vcf = {
-                executor.submit(self.process_vcf, vcf): vcf 
-                for vcf in vcf_files
-            }
+            future_to_vcf = {executor.submit(process_single_vcf, vcf): vcf
+                            for vcf in vcf_files}
             
             for future in as_completed(future_to_vcf):
                 vcf = future_to_vcf[future]
                 try:
                     output_file = future.result()
                     output_files.append(output_file)
-                    logger.info(f"Completed processing {vcf.path.name}")
                 except Exception as e:
                     logger.error(f"Failed to process {vcf.path.name}: {str(e)}")
                     raise
-        
-        # Combine results
-        combined_output = self.output_dir / "combined_vcf_sequences.fa"
+
+        combined_output = os.path.join(self.output_dir, "combined_vcf_sequences.fa")
         with open(combined_output, 'w') as outfile:
             for file_path in output_files:
                 with open(file_path) as infile:
                     outfile.write(infile.read())
                 os.remove(file_path)
-        # Cleanup
-        if self.temp_dir.exists():
-            import shutil
+
+        if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
-            logger.info("Cleaned up all temporary directories")
-        
-        return str(combined_output)
+
+        return combined_output
 
 def main():
     """Main execution function."""
