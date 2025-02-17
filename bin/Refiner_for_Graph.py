@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
+import os
+import sys
+import time
+import random
+import subprocess
+import shutil
+import tempfile
+import argparse
+import json
+import logging
+from collections import defaultdict, Counter
+from io import StringIO
 
+import numpy as np
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
-import numpy as np
-from collections import defaultdict, Counter
-import subprocess
-import os
-import time
-import random
-import shutil
-import logging
-from itertools import combinations
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-print(shutil)  
-print(type(shutil)) 
 
 class RMBlastAlignment:
     def __init__(self, query_id, subject_id, score, query_start, query_end,
@@ -34,53 +36,47 @@ class RMBlastAlignment:
         self.alignment = alignment
         self.orientation = orientation
 
+
 class SequenceClusterer:
     def __init__(self, te_builder, distance_threshold=0.7):
         self.te_builder = te_builder
         self.distance_threshold = distance_threshold
-    
+
     def calculate_distance_matrix(self, sequences):
         n_seqs = len(sequences)
-        distances = np.zeros((n_seqs, n_seqs))
         unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
-        
+
         if not hasattr(self.te_builder, 'temp_dir'):
             raise ValueError("TEConsensusBuilder temp_dir not initialized")
-        
+
         temp_name = os.path.join(self.te_builder.temp_dir, f'ref_sequences_{unique_id}.fa')
         with open(temp_name, 'w') as temp_file:
             SeqIO.write(sequences, temp_file, "fasta")
-            
+
         try:
             alignments = self.te_builder.run_rmblast(temp_name, temp_name)
-            
             seq_lengths = {seq.id: len(seq.seq) for seq in sequences}
             seq_id_to_idx = {seq.id: idx for idx, seq in enumerate(sequences)}
-            
+
             similarities = np.zeros((n_seqs, n_seqs))
-            
             for aln in alignments:
                 if aln.query_id != aln.subject_id:
                     i = seq_id_to_idx[aln.query_id]
                     j = seq_id_to_idx[aln.subject_id]
-                    
                     min_len = min(seq_lengths[aln.query_id], seq_lengths[aln.subject_id])
-                    norm_score = aln.score / (min_len * 2)  
-                    
-                    similarities[i,j] = max(similarities[i,j], norm_score)
-                    similarities[j,i] = similarities[i,j]  
-            
+                    norm_score = aln.score / (min_len * 2)
+                    similarities[i, j] = max(similarities[i, j], norm_score)
+                    similarities[j, i] = similarities[i, j]
+
             np.fill_diagonal(similarities, 1.0)
-            
             distances = 1.0 - similarities
-            
             distances = np.maximum(distances, 0.0)
-            
+
             logger.info(f"Distance matrix shape: {distances.shape}")
             logger.info(f"Distance range: [{distances.min()}, {distances.max()}]")
-            
+
             return distances
-            
+
         finally:
             try:
                 os.remove(temp_name)
@@ -90,41 +86,36 @@ class SequenceClusterer:
                         os.remove(db_file)
             except OSError as e:
                 logger.warning(f"Error cleaning up temporary files: {e}")
-    
+
     def cluster_sequences(self, sequences):
         if len(sequences) == 1:
             return [[sequences[0]]]
-            
+
         logger.info("Calculating distance matrix...")
         distances = self.calculate_distance_matrix(sequences)
-        
+
         logger.info("Performing hierarchical clustering...")
         try:
             distances = np.maximum(distances, distances.T)
-            
             condensed_distances = squareform(distances)
-            
             linkage_matrix = linkage(condensed_distances, method='average')
-            
-            clusters = fcluster(linkage_matrix, t=self.distance_threshold, 
-                              criterion='distance')
-            
+            clusters = fcluster(linkage_matrix, t=self.distance_threshold, criterion='distance')
+
             cluster_dict = defaultdict(list)
             for seq, cluster_id in zip(sequences, clusters):
                 cluster_dict[cluster_id].append(seq)
-                
+
             return list(cluster_dict.values())
-            
+
         except Exception as e:
             logger.error(f"Clustering error: {str(e)}")
             logger.error(f"Distance matrix stats - min: {distances.min()}, max: {distances.max()}, mean: {distances.mean()}")
             raise
 
+
 class TEConsensusBuilder:
     def __init__(self, rmblast_dir, makeblastdb_path, matrix_path,
-                 min_score=150, gap_init=20, gap_ext=5, 
-                 threads=None):
-        self.temp_files = set()
+                 min_score=150, gap_init=20, gap_ext=5, threads=None):
         self.rmblast_path = os.path.join(rmblast_dir, "rmblastn")
         self.makeblastdb_path = makeblastdb_path
         self.matrix_path = matrix_path
@@ -132,14 +123,19 @@ class TEConsensusBuilder:
         self.gap_init = gap_init
         self.gap_ext = gap_ext
         self.threads = threads or 1
-        self.temp_dir = None 
+        self.temp_dir = None
+
+        # 检查 MAFFT 是否存在，并获得其路径
+        self.mafft_path = shutil.which("mafft")
+        if not self.mafft_path:
+            raise FileNotFoundError("mafft not found in system PATH")
 
     def prepare_blast_db(self, fasta_file):
         cmd = [
             self.makeblastdb_path,
             "-in", fasta_file,
             "-dbtype", "nucl",
-            "-parse_seqids" 
+            "-parse_seqids"
         ]
         try:
             logger.info(f"Creating BLAST database: {' '.join(cmd)}")
@@ -152,31 +148,29 @@ class TEConsensusBuilder:
             raise
 
     def run_rmblast(self, query_file, subject_file):
-
         current_dir = os.getcwd()
         query_path = os.path.abspath(query_file)
         subject_path = os.path.abspath(subject_file)
         work_dir = os.path.dirname(subject_path)
 
         os.chdir(work_dir)
-        
         try:
             self.prepare_blast_db(subject_path)
 
-            if not os.path.exists(os.path.basename(query_path)):
+            if not os.path.exists(query_path):
                 logger.error(f"Query file not found: {query_path}")
                 raise FileNotFoundError(f"Query file not found: {query_path}")
-            if not os.path.exists(os.path.basename(subject_path)):
+            if not os.path.exists(subject_path):
                 logger.error(f"Subject file not found: {subject_path}")
                 raise FileNotFoundError(f"Subject file not found: {subject_path}")
-        
+
             self.prepare_blast_db(os.path.basename(subject_path))
 
             db_files = [os.path.basename(subject_path) + ext for ext in ['.nhr', '.nin', '.nsq']]
             for db_file in db_files:
                 if not os.path.exists(db_file):
                     raise FileNotFoundError(f"BLAST database file not found: {db_file}")
-            
+
             cmd = [
                 self.rmblast_path,
                 "-query", query_path,
@@ -185,19 +179,19 @@ class TEConsensusBuilder:
                 "-matrix", self.matrix_path,
                 "-gapopen", str(self.gap_init),
                 "-gapextend", str(self.gap_ext),
-                "-dust", "no",  
+                "-dust", "no",
                 "-soft_masking", "false",
                 "-num_threads", str(self.threads),
                 "-complexity_adjust",
                 "-evalue", "1e-10",
                 "-word_size", "7",
-                "-window_size", "40",      
-                "-xdrop_gap", "50",        
-                "-xdrop_gap_final", "100"  
+                "-window_size", "40",
+                "-xdrop_gap", "50",
+                "-xdrop_gap_final", "100"
             ]
 
             logger.info(f"Running RMBlast command: {' '.join(cmd)}")
-            
+
             try:
                 result = subprocess.run(cmd, check=True, capture_output=True, text=True)
                 alignments = []
@@ -218,144 +212,229 @@ class TEConsensusBuilder:
                             )
                             if alignment.score >= self.min_score:
                                 alignments.append(alignment)
-                
+
                 return alignments
 
             except subprocess.CalledProcessError as e:
                 logger.error(f"RMBlast failed with error: {e.stderr}")
                 raise
-                
+
         finally:
             os.chdir(current_dir)
 
-    def find_best_reference(self, sequences):
-        if not self.temp_dir:
-            raise ValueError("Temp directory not initialized")
-        
-        unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
-        temp_name = os.path.join(self.temp_dir, f'ref_sequences_{unique_id}.fa')
-        
-        os.makedirs(os.path.dirname(temp_name), exist_ok=True)
-        
-        with open(temp_name, 'w') as temp_file:
-            SeqIO.write(sequences, temp_file, "fasta")
-        
+    def build_multiple_alignment(self, sequences, reference=None):
+        """
+        利用 MAFFT 对聚类内所有序列进行全局多序列比对，返回比对后的序列列表
+        """
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".fa", dir=self.temp_dir) as temp_in:
+            SeqIO.write(sequences, temp_in, "fasta")
+            temp_in_name = temp_in.name
+
         try:
-            if not os.path.exists(temp_name):
-                raise FileNotFoundError(f"Failed to create temporary file: {temp_name}")
-                
-            alignments = self.run_rmblast(temp_name, temp_name)
-            
-            sequence_scores = defaultdict(float)
-            for aln in alignments:
-                if aln.query_id != aln.subject_id: 
-                    sequence_scores[aln.query_id] += aln.score
-            
-            if sequence_scores:
-                best_seq_id = max(sequence_scores.items(), key=lambda x: x[1])[0]
-                return next(seq for seq in sequences if seq.id == best_seq_id)
-            else:
-                return sequences[0]
+            cmd = [self.mafft_path, "--auto", "--thread", str(self.threads), temp_in_name]
+            logger.info("Running MAFFT for multiple sequence alignment: " + " ".join(cmd))
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            aligned_output = result.stdout
+
+            aligned_seqs = list(SeqIO.parse(StringIO(aligned_output), "fasta"))
+            return [str(record.seq) for record in aligned_seqs]
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"MAFFT failed: {e.stderr}")
+            raise
+
         finally:
-            try:
-                if os.path.exists(temp_name):
-                    os.remove(temp_name)
-                for ext in ['.nin', '.nsq', '.nhr']:
-                    db_file = temp_name + ext
-                    if os.path.exists(db_file):
-                        os.remove(db_file)
-            except OSError as e:
-                logger.warning(f"Error cleaning up temporary files: {e}")
-
-    def build_multiple_alignment(self, sequences, reference):
-        unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
-        os.makedirs('tmp', exist_ok=True)
-
-        ref_name = os.path.join('tmp', f'reference_{unique_id}.fa')
-        query_name = os.path.join('tmp', f'queries_{unique_id}.fa')
-        temp_files = []
-
-        with open(ref_name, 'w') as ref_file, open(query_name, 'w') as query_file:
-            SeqIO.write([reference], ref_file, "fasta")
-            SeqIO.write(sequences, query_file, "fasta")
-            temp_files.extend([ref_name, query_name])
-        
-        try:
-            alignments = self.run_rmblast(query_name, ref_name)
-            aligned_sequences = self.process_alignments(alignments, reference)
-            return aligned_sequences
-            
-        finally:
-            for fname in temp_files:
-                try:
-                    if os.path.exists(fname):
-                        os.remove(fname)
-                except OSError as e:
-                    logger.warning(f"Error removing file {fname}: {e}")
-
-    def process_alignments(self, alignments, reference):
-        ref_length = len(reference.seq)
-        query_aln_dict = {}
-        query_score_dict = {}
-
-        all_query_ids = set([aln.query_id for aln in alignments])
-        for qid in all_query_ids:
-            query_aln_dict[qid] = ['-' for _ in range(ref_length)]
-            query_score_dict[qid] = [0.0 for _ in range(ref_length)]
-
-        for aln in alignments:
-            qid = aln.query_id
-            if aln.orientation == 'plus':
-                qseq = aln.alignment[0]
-            else:
-                qseq = str(Seq(aln.alignment[0]).reverse_complement())
-
-            subj_start = aln.subject_start - 1
-            subj_end = aln.subject_end - 1
-
-            aligned_len = len(qseq)
-            expected_len = (subj_end - subj_start + 1)
-            if aligned_len != expected_len:
-                continue
-            for i in range(aligned_len):
-                ref_pos = subj_start + i
-                base = qseq[i]
-                if aln.score > query_score_dict[qid][ref_pos]:
-                    query_aln_dict[qid][ref_pos] = base
-                    query_score_dict[qid][ref_pos] = aln.score
-
-        final_seqs = []
-        for qid in all_query_ids:
-            merged_seq = ''.join(query_aln_dict[qid])
-            final_seqs.append(merged_seq)
-
-        return final_seqs
+            os.remove(temp_in_name)
 
     def build_consensus(self, aligned_sequences):
         if not aligned_sequences:
             return ""
-        
+
         seq_length = len(aligned_sequences[0])
         consensus = []
-        
+
         for i in range(seq_length):
-            bases = [seq[i] for seq in aligned_sequences if i < len(seq)]
-            base_counts = Counter(base for base in bases if base != '-')
-            
+            column = [seq[i] for seq in aligned_sequences if i < len(seq)]
+            base_counts = Counter(b for b in column if b != '-')
             if base_counts:
-                consensus.append(max(base_counts.items(), key=lambda x: x[1])[0])
+                consensus.append(base_counts.most_common(1)[0][0])
             else:
                 consensus.append('-')
-                
+
         return ''.join(consensus).replace('-', '')
+
+    def mash_precluster(self, sequences, mash_threshold=0.1):
+        temp_fa = None
+        sketch_prefix = None
+        try:
+            # 创建临时文件并写入序列
+            with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".fa", dir=self.temp_dir) as temp:
+                SeqIO.write(sequences, temp, "fasta")
+                temp_fa = temp.name
+                logger.info(f"Created temporary FASTA file: {temp_fa}")
+                temp.flush()
+                os.fsync(temp.fileno())
+
+            # 保存序列 ID 到文件名的映射
+            seq_id_map = {str(seq.id): seq for seq in sequences}
+            
+            sketch_prefix = temp_fa + ".mash"
+            
+            # 检查 mash 命令
+            mash_path = shutil.which("mash")
+            if not mash_path:
+                raise FileNotFoundError("mash command not found in system PATH")
+            logger.info(f"Found mash at: {mash_path}")
+                
+            # 运行 mash sketch
+            sketch_cmd = [mash_path, "sketch", "-k", "16", "-m", "2", "-o", sketch_prefix, temp_fa]
+            logger.info("Running mash sketch: " + " ".join(sketch_cmd))
+            result = subprocess.run(sketch_cmd, 
+                                check=True, 
+                                capture_output=True, 
+                                text=True)
+            if result.stderr:
+                logger.info(f"Mash sketch stderr: {result.stderr}")
+
+            # 检查 mash sketch 输出文件
+            msh_file = sketch_prefix + ".msh"
+            if not os.path.exists(msh_file):
+                raise FileNotFoundError(f"Mash sketch output file not found: {msh_file}")
+            logger.info(f"Mash sketch file created: {msh_file}")
+
+            # 运行 mash dist
+            dist_cmd = [mash_path, "dist", msh_file, temp_fa]
+            logger.info("Running mash dist: " + " ".join(dist_cmd))
+            result = subprocess.run(dist_cmd, 
+                                check=True, 
+                                capture_output=True, 
+                                text=True)
+            
+            if result.stderr:
+                logger.info(f"Mash dist stderr: {result.stderr}")
+            
+            mash_output = result.stdout
+            if not mash_output.strip():
+                raise RuntimeError("Mash dist produced no output")
+
+            # 处理聚类
+            try:
+                # 使用序列ID初始化UnionFind，而不是文件路径
+                uf = UnionFind([str(seq.id) for seq in sequences])
+                logger.info(f"Initialized UnionFind with {len(sequences)} sequences")
+                
+                cluster_count = 0
+                for line in mash_output.strip().split("\n"):
+                    parts = line.split("\t")  # 使用tab作为分隔符
+                    if len(parts) < 3:
+                        continue
+                    
+                    # 从文件名中提取序列ID
+                    seq1_path = parts[0]
+                    seq2_path = parts[1]
+                    seq1_id = os.path.basename(seq1_path)
+                    seq2_id = os.path.basename(seq2_path)
+                    
+                    try:
+                        dist = float(parts[2])
+                        if dist < mash_threshold and seq1_id in seq_id_map and seq2_id in seq_id_map:
+                            uf.union(seq1_id, seq2_id)
+                            cluster_count += 1
+                    except (ValueError, KeyError) as e:
+                        logger.warning(f"Error processing distance for {seq1_id}-{seq2_id}: {e}")
+                        continue
+                        
+                logger.info(f"Created {cluster_count} initial clusters")
+
+                # 构建聚类结果
+                clusters_dict = defaultdict(list)
+                for seq in sequences:
+                    seq_id = str(seq.id)
+                    root_id = uf.find(seq_id)
+                    clusters_dict[root_id].append(seq)
+                    
+                preclusters = list(clusters_dict.values())
+                logger.info(f"Formed {len(preclusters)} preclusters")
+
+                # 进行细粒度聚类
+                final_clusters = []
+                clusterer = SequenceClusterer(self)
+                for i, group in enumerate(preclusters):
+                    logger.info(f"Processing precluster {i+1}/{len(preclusters)} with {len(group)} sequences")
+                    if len(group) == 1:
+                        final_clusters.append(group)
+                    else:
+                        refined = clusterer.cluster_sequences(group)
+                        final_clusters.extend(refined)
+                        
+                logger.info(f"Created {len(final_clusters)} final clusters")
+                return final_clusters
+
+            except Exception as e:
+                logger.error(f"Error during clustering: {str(e)}")
+                raise
+
+        except Exception as e:
+            logger.error(f"Error in mash_precluster: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            raise
+
+        finally:
+            # 清理临时文件
+            try:
+                if temp_fa and os.path.exists(temp_fa):
+                    os.remove(temp_fa)
+                    logger.info(f"Removed temporary file: {temp_fa}")
+                if sketch_prefix:
+                    msh_file = sketch_prefix + ".msh"
+                    if os.path.exists(msh_file):
+                        os.remove(msh_file)
+                        logger.info(f"Removed mash sketch file: {msh_file}")
+            except OSError as e:
+                logger.warning(f"Error cleaning up temporary files: {e}")
+
+    def hybrid_cluster(self, sequences):
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".fa", dir=self.temp_dir) as temp_in:
+            SeqIO.write(sequences, temp_in, "fasta")
+            temp_in_name = temp_in.name
+
+        temp_out_name = temp_in_name + ".cdhit"
+        cmd = [
+            "cd-hit-est",
+            "-i", temp_in_name,
+            "-o", temp_out_name,
+            "-aS", "0.8",
+            "-c", "0.8",
+            "-g", "0",
+            "-G", "0",
+            "-A", "80",
+            "-M", "10000",
+            "-t", str(self.threads)
+        ]
+        logger.info("Running cd-hit-est: " + " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            logger.info("cd-hit-est finished successfully.")
+        except subprocess.CalledProcessError as e:
+            logger.error("cd-hit-est failed: " + e.stderr)
+            raise
+
+        preclustered_sequences = list(SeqIO.parse(temp_out_name, "fasta"))
+
+        os.remove(temp_in_name)
+        os.remove(temp_out_name)
+
+        clusterer = SequenceClusterer(self)
+        refined_clusters = clusterer.cluster_sequences(preclustered_sequences)
+        return refined_clusters
 
     def build_clustered_consensus(self, input_file, output_file):
         original_dir = os.getcwd()
         try:
-            # Create temporary directory alongside output file
             input_path = os.path.abspath(input_file)
             output_path = os.path.abspath(output_file)
-            output_dir = os.getcwd()
+            output_dir = os.path.dirname(output_path)
             logger.info(f"Using base directory for consensus building: {output_dir}")
 
             timestamp = int(time.time())
@@ -363,30 +442,36 @@ class TEConsensusBuilder:
             os.makedirs(self.temp_dir, exist_ok=True)
             os.chdir(self.temp_dir)
             logger.info(f"Created temporary directory: {self.temp_dir}")
-            
+
             logger.info(f"Reading sequences from: {input_path}")
             sequences = list(SeqIO.parse(input_path, "fasta"))
             if not sequences:
                 raise ValueError(f"No sequences found in {input_path}")
             logger.info(f"Read {len(sequences)} sequences")
 
-            clusterer = SequenceClusterer(self)
-            clusters = clusterer.cluster_sequences(sequences)
+            if any(len(seq.seq) > 50000 for seq in sequences):
+                logger.info("Long sequences (>50k) detected; using k-mer (Mash) pre-clustering.")
+                clusters = self.mash_precluster(sequences)
+            elif os.path.getsize(input_path) > 2 * 1024 * 1024:
+                logger.info("Large input file detected; using hybrid clustering strategy with cd-hit-est pre-clustering.")
+                clusters = self.hybrid_cluster(sequences)
+            else:
+                logger.info("Using standard RMBlast-based clustering.")
+                clusterer = SequenceClusterer(self)
+                clusters = clusterer.cluster_sequences(sequences)
+
             logger.info(f"Found {len(clusters)} clusters")
 
             consensus_records = []
             for i, cluster in enumerate(clusters, 1):
                 logger.info(f"Processing cluster {i} with {len(cluster)} sequences")
-                
                 if len(cluster) == 1:
                     consensus_seq = str(cluster[0].seq)
                     consensus_desc = f"single sequence from cluster {i}"
                 else:
-                    reference = self.find_best_reference(cluster)
-                    aligned_seqs = self.build_multiple_alignment(cluster, reference)
+                    aligned_seqs = self.build_multiple_alignment(cluster)
                     consensus_seq = self.build_consensus(aligned_seqs)
                     consensus_desc = f"consensus from {len(cluster)} sequences in cluster {i}"
-
                 consensus_record = SeqRecord(
                     Seq(consensus_seq),
                     id=f"{os.path.splitext(os.path.basename(input_file))[0]}_cluster_{i}",
@@ -413,9 +498,25 @@ class TEConsensusBuilder:
             if self.temp_dir and os.path.exists(self.temp_dir):
                 logger.info("Temporary directory will be cleaned by calling script")
 
-class Config:    
+
+class UnionFind:
+    def __init__(self, elements):
+        self.parent = {e: e for e in elements}
+
+    def find(self, a):
+        if self.parent[a] != a:
+            self.parent[a] = self.find(self.parent[a])
+        return self.parent[a]
+
+    def union(self, a, b):
+        rootA = self.find(a)
+        rootB = self.find(b)
+        if rootA != rootB:
+            self.parent[rootB] = rootA
+
+
+class Config:
     def __init__(self):
-        
         conda_env_path = self.get_current_conda_env()
         if conda_env_path:
             self.rmblastn = os.path.join(conda_env_path, 'bin', 'rmblastn')
@@ -425,10 +526,10 @@ class Config:
             self.rmblastn = shutil.which('rmblastn')
             self.makeblastdb = shutil.which('makeblastdb')
             logger.info("No Conda environment detected, using system PATH")
-        
-        if not os.path.exists(self.rmblastn):
+
+        if not self.rmblastn or not os.path.exists(self.rmblastn):
             raise FileNotFoundError(f"rmblastn not found at {self.rmblastn}")
-        if not os.path.exists(self.makeblastdb):
+        if not self.makeblastdb or not os.path.exists(self.makeblastdb):
             raise FileNotFoundError(f"makeblastdb not found at {self.makeblastdb}")
 
         conda_env_dir = conda_env_path if conda_env_path else os.path.dirname(os.path.dirname(self.rmblastn))
@@ -439,16 +540,16 @@ class Config:
             os.path.join(conda_env_dir, 'share/RepeatMasker/Matrices/nt'),
             os.path.join(conda_env_dir, 'share/RepeatMasker/Matrices/BLOSUM62')
         ]
-        
+
         self.matrix_path = None
         for path in possible_matrix_paths:
             if os.path.exists(path):
                 self.matrix_path = path
                 break
-                
+
         if self.matrix_path is None:
             self.matrix_path = 'BLOSUM62'
-            
+
         logger.info(f"Using rmblastn from: {self.rmblastn}")
         logger.info(f"Using scoring matrix: {self.matrix_path}")
 
@@ -465,7 +566,6 @@ class Config:
             conda_path = subprocess.check_output(['which', 'conda']).decode().strip()
             if conda_path:
                 result = subprocess.check_output(['conda', 'info', '--json']).decode()
-                import json
                 conda_info = json.loads(result)
                 active_prefix = conda_info.get('active_prefix')
                 if active_prefix:
@@ -475,30 +575,35 @@ class Config:
 
         return None
 
-if __name__ == "__main__":
-    import argparse
-    import sys
 
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Build consensus sequences for clustered transposable element families using RMBlast')
+        description='Build consensus sequences for clustered transposable element families using RMBlast for clustering and MAFFT for multiple sequence alignment. '
+                    'When sequences longer than 50k exist, a k-mer (Mash) pre-clustering is applied first, followed by RMBlast-based fine clustering; '
+                    'otherwise, a hybrid clustering (using cd-hit-est pre-clustering) or standard RMBlast-based clustering is used based on input file size.')
     parser.add_argument('input', help='Input FASTA file')
     parser.add_argument('output', help='Output FASTA file')
     parser.add_argument('-t', '--threads', type=int,
-                       help='Number of threads')
+                        help='Number of threads', default=1)
     parser.add_argument('--min-score', type=float, default=150,
-                       help='Minimum alignment score (default: 150)')
+                        help='Minimum alignment score (default: 150)')
     parser.add_argument('--gap-init', type=int, default=20,
-                       help='Gap initiation penalty (default: 20)')
+                        help='Gap initiation penalty (default: 20)')
     parser.add_argument('--gap-ext', type=int, default=5,
-                       help='Gap extension penalty (default: 5)')
+                        help='Gap extension penalty (default: 5)')
     parser.add_argument('--distance-threshold', type=float, default=0.7,
-                       help='Distance threshold for clustering (default: 0.7)')
-    
+                        help='Distance threshold for clustering (default: 0.7)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Enable verbose logging')
+
     args = parser.parse_args()
-    
+
+    if args.verbose:
+        logging.getLogger(__name__).setLevel(logging.DEBUG)
+
     try:
         config = Config()
-        
+
         builder = TEConsensusBuilder(
             rmblast_dir=os.path.dirname(config.rmblastn),
             makeblastdb_path=config.makeblastdb,
@@ -509,7 +614,8 @@ if __name__ == "__main__":
             threads=args.threads
         )
         builder.build_clustered_consensus(args.input, args.output)
-        
+
     except Exception as e:
-        logger.error(str(e))
+        logger.error(f"Error details: {str(e)}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         sys.exit(1)

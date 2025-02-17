@@ -211,7 +211,8 @@ sub refine_alleles {
         $new_temp_file,
         $output_fasta,
         "--distance-threshold", "0.8",
-        "-t", $config{threads}
+        "-t", $config{threads},
+        "-v"
     );
     
     system($cmd) == 0
