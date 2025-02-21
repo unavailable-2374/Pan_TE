@@ -262,7 +262,8 @@ sub filter_repeats {
     $ENV{TRF_COMMAND} = which('trf');
     $ENV{RMBLAST_DIR} = $config{rmblast_dir};
 
-    run_cmd("filter-stage-1.prl $input > $output 2> $config{tmp_dir}/filter.log");
+    system("filter-stage-1.prl $input > $output 2> $config{tmp_dir}/filter.log") == 0
+    	or die "Failed to run filter-stage-1.prl: $?\n";
     $logger->info("Repeat filtering completed");
 }
 
