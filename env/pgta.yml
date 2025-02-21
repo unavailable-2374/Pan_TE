@@ -23,3 +23,4 @@ dependencies:
  - perl-Parallel-ForkManager
  - java-jdk
  - perl-log-log4perl
+ - seqkil
