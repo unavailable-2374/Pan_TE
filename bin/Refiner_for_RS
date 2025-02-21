@@ -97,7 +97,7 @@ $config{max_parallel} = 1 if $config{max_parallel} < 1;
 
 # Main execution
 my $sample_contigs = process_sample_database();
-if (-s "raw_lib.fa") {
+if (-s "repeats.filtered.fa") {
     process_raw_library();
     build_consensus_parallel();
 }
@@ -130,7 +130,7 @@ sub process_sample_database {
 sub process_raw_library {
     print "Processing raw library...\n";
     
-    run_cmd("cp raw_lib.fa $config{consensi_file}");
+    run_cmd("cp repeats.filtered.fa $config{consensi_file}");
     create_blast_db($config{sample_file});
     create_blast_db($config{consensi_file});
 }
@@ -154,7 +154,7 @@ sub build_consensus_parallel {
 
 sub setup_blast_engine {
     my $engine = NCBIBlastSearchEngine->new(
-        pathToEngine => "$config{rmblast_path}/rmblastn"  # 修改这一行，添加 /rmblastn
+        pathToEngine => "$config{rmblast_path}/rmblastn"
     ) or die "Cannot initialize BLAST engine\n";
     
     $engine->setMatrix("$FindBin::RealBin/Matrices/ncbi/nt/comparison.matrix");

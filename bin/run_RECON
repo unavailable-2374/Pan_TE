@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use File::Path qw(make_path remove_tree);
 use File::Spec;
+use File::Basename qw(dirname basename);
 use Cwd qw(getcwd);
 use constant {
     MIN_THREADS => 1,
@@ -130,8 +131,13 @@ sub process_edge_redefinition {
 sub load_translation_table {
     my ($genome_file) = @_;
     my %id_mapping;
-    open(my $fh_trans, '<', "$genome_file.translation") 
-        or die "Cannot open translation file: $!\n";
+    
+    # Update the path to look in the genome directory for the translation file
+    my $translation_file = dirname($genome_file) . "/genome.fa.translation";
+    
+    open(my $fh_trans, '<', $translation_file) 
+        or die "Cannot open translation file: $translation_file: $!\n";
+        
     while(<$fh_trans>) {
         chomp;
         my ($key, $value) = split(/\t/);

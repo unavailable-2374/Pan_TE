@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Set
 from pathlib import Path
 from Bio import SeqIO
+from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
 # Configure logging
@@ -18,18 +19,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class SequenceCleaner:
-    """Clean degenerate symbols from sequence files."""
+    """Clean degenerate symbols from sequence files and rename chromosomes."""
     
     def __init__(self):
+        """Initialize the cleaner."""
         self.degenerate_symbols: Set[str] = set('WRMKYSHBVDXNwrmkyshbvd')
+        self.current_chr_num = 1  # Simple counter for chromosome numbering
         
     def clean_sequence(self, sequence: str) -> str:
         """Replace degenerate symbols with N."""
         return ''.join('N' if base in self.degenerate_symbols else base 
                       for base in sequence)
     
+    def get_next_chr_name(self) -> str:
+        """Get next chromosome name using simple increment."""
+        chr_name = f"chr{self.current_chr_num}"
+        self.current_chr_num += 1
+        return chr_name
+    
     def process_file(self, input_file: Path, output_file: Path) -> None:
-        """Process input file and write cleaned sequences."""
+        """Process input file and write cleaned sequences with renamed chromosomes."""
         try:
             logger.info(f"Processing file: {input_file}")
             stats = {
@@ -39,27 +48,44 @@ class SequenceCleaner:
                 'cleaned_bases': 0
             }
             
+            # Track original to new ID mapping for logging
+            id_mapping = {}
+            
+            # Process sequences
             with open(output_file, 'w') as out:
                 for record in SeqIO.parse(input_file, 'fasta'):
                     stats['total_sequences'] += 1
                     original_seq = str(record.seq)
                     stats['total_bases'] += len(original_seq)
                     
+                    # Clean sequence
                     cleaned_seq = self.clean_sequence(original_seq)
                     if cleaned_seq != original_seq:
                         stats['cleaned_sequences'] += 1
                         stats['cleaned_bases'] += sum(1 for a, b in zip(original_seq, cleaned_seq) 
                                                     if a != b)
                     
-                    # Write cleaned sequence
-                    out.write(f">{record.id}\n{cleaned_seq}\n")
+                    # Get next chromosome name
+                    new_id = self.get_next_chr_name()
+                    id_mapping[record.id] = new_id
+                    
+                    # Create new record with cleaned sequence and new name
+                    new_record = SeqRecord(
+                        Seq(cleaned_seq),
+                        id=new_id,
+                        description=""
+                    )
+                    SeqIO.write(new_record, out, "fasta")
             
-            # Log statistics
+            # Log statistics and mapping
             logger.info("Cleaning completed:")
             logger.info(f"Total sequences processed: {stats['total_sequences']}")
             logger.info(f"Sequences containing degenerate bases: {stats['cleaned_sequences']}")
             logger.info(f"Total bases: {stats['total_bases']}")
             logger.info(f"Bases replaced: {stats['cleaned_bases']}")
+            logger.info("Chromosome mapping:")
+            for old_id, new_id in id_mapping.items():
+                logger.info(f"{old_id} -> {new_id}")
             
         except Exception as e:
             logger.error(f"Error processing file: {e}")

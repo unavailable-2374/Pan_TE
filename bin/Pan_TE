@@ -10,6 +10,32 @@ from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
+from vcf_processor import VCFProcessor  
+
+VERSION = '1.0.0'
+
+# Usage and help message
+USAGE = f'''Usage:
+perl $0 [options]
+
+Example:
+    perl $0 --genome genome.fasta --threads 80 --model-dir Your_Path_To_ClassifyTE 
+
+Parameters:
+[General]
+    --genome <string>         Required. Genome file in FASTA format.
+    --model-dir <string>      Provide path to ClassifyTE for classification.
+
+[Other]
+    --vcf-dir <string>        Default: NA. Path for VCF, see gfa.list for format.
+    --out <string>           Default: current directory. The work directory.
+    -M <int>                 Memory limit (in MB), default: 0 (unlimited).
+    --threads <int>          Default: 4. Number of threads, preferably in multiples of 4.
+    --fragment_size <int>    Default: 40000. Length for fragment.
+    --help|-h                Display this help information.
+
+Version: {VERSION}
+'''
 
 # Configure logging
 logging.basicConfig(
@@ -21,6 +47,59 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+class CustomArgumentParser(argparse.ArgumentParser):
+    def format_help(self):
+        return USAGE
+
+    def error(self, message):
+        sys.stderr.write(f'error: {message}\n\n')
+        self.print_help()
+        sys.exit(2)
+
+def parse_arguments():
+    """Parse command line arguments with custom help format."""
+    parser = CustomArgumentParser(add_help=False)
+    
+    # General options
+    parser.add_argument('--genome', 
+                       type=str,
+                       help='Genome file in FASTA format')
+    parser.add_argument('--model-dir',
+                       type=str,
+                       help='Path to ClassifyTE for classification')
+    
+    # Other options
+    parser.add_argument('--vcf-dir',
+                       type=str,
+                       help='Path for VCF files')
+    parser.add_argument('--out',
+                       type=str,
+                       default=os.getcwd(),
+                       help='Work directory')
+    parser.add_argument('-M',
+                       type=int,
+                       default=0,
+                       help='Memory limit in MB')
+    parser.add_argument('--threads',
+                       type=int,
+                       default=4,
+                       help='Number of threads')
+    parser.add_argument('--fragment_size',
+                       type=int,
+                       default=40000,
+                       help='Length for fragment')
+    parser.add_argument('--help', '-h',
+                       action='help',
+                       help='Display help information')
+    
+    args = parser.parse_args()
+    
+    # Validate required arguments
+    if not args.genome:
+        parser.error('--genome is required')
+        
+    return args
 
 class PanTEPipeline:
     """Implementation of the Pan TE Pipeline with step tracking and checkpoints."""
@@ -38,8 +117,9 @@ class PanTEPipeline:
         # Verify inputs
         if not self.genome_file:
             raise ValueError("genome_file must be provided")
-        if self.vcf_dir and not self.genome_file:
-            raise ValueError("genome_file must be provided when using vcf_dir")
+        # Verify inputs
+        if not self.genome_file and not self.vcf_dir:
+            raise ValueError("Either genome_file or vcf_dir must be provided")
         
         self.ltr_threads = max(1, threads - 1)
         self.rs_threads = max(1, threads)
@@ -121,37 +201,77 @@ class PanTEPipeline:
                 os.chdir(current_dir)
 
     def process_genome(self):
-        """Step 1: Process genome."""
+        """Step 1: Process genome and VCF files if provided."""
         if self.check_checkpoint('genome'):
             logger.info("Genome processing already completed, skipping...")
             return
-            
+                
         genome_dir = os.path.join(self.output_dir, 'genome')
         processed_genome = os.path.join(genome_dir, 'genome.fa')
-        
+        os.makedirs(genome_dir, exist_ok=True)
+            
+        # Step 1: Process VCF files if provided
+        combined_input = None
         if self.vcf_dir:
-            # Process both VCF and genome file
-            logger.info("Processing both VCF and genome files")
-            vcf_result = os.path.join(genome_dir, 'vcf_sequences.fa')
-            genome_result = os.path.join(genome_dir, 'genome_sequence.fa')
-            
-            # Process genome file
-            self.process_single_genome(genome_result)
-            
-            # Process VCF files
-            self.process_graph_genome(vcf_result)
-            
-            # Combine both results
-            self.combine_genome_results(genome_dir, [vcf_result, genome_result])
-        else:
-            # Process only genome file
-            logger.info("Processing single genome file")
-            self.process_single_genome(processed_genome)
-        
+            logger.info("Processing VCF files...")
+            vcf_processor = VCFProcessor(
+                vcf_dir=self.vcf_dir,
+                output_dir=genome_dir,
+                total_threads=self.threads
+            )
+            try:
+                vcf_sequences = vcf_processor.process_all_vcfs()
+                logger.info(f"VCF processing completed: {vcf_sequences}")
+                
+                # Step 2: Combine VCF results with input genome
+                logger.info("Combining VCF results with input genome...")
+                combined_input = os.path.join(genome_dir, 'combined_input.fa')
+                with open(combined_input, 'w') as outfile:
+                    # First write VCF sequences
+                    with open(vcf_sequences) as infile:
+                        outfile.write(infile.read())
+                    # Then write genome sequences
+                    with open(self.genome_file) as infile:
+                        outfile.write(infile.read())
+                
+                # Clean up VCF results file
+                os.remove(vcf_sequences)
+                
+                # Update genome file path to combined file for processing
+                self.genome_file = combined_input
+                
+            except Exception as e:
+                logger.error(f"VCF processing failed: {str(e)}")
+                raise
+
+        # Step 3: Process the genome file (either combined or original)
+        logger.info("Processing genome file...")
+        self.process_single_genome(processed_genome)
+
+        # Clean up temporary files
+        if combined_input and os.path.exists(combined_input):
+            os.remove(combined_input)
+
         # Update genome file path to processed version
         self.genome_file = processed_genome
         self.create_checkpoint('genome')
         logger.info("Genome processing completed")
+
+    def process_single_genome(self, output_file: str):
+        """Process a single genome file."""
+        logger.info("Starting single genome processing")
+        
+        # Process genome file
+        tmp_fa = output_file + '.tmp'
+        self.run_cmd(f"tr 'a-z' 'A-Z' < {self.genome_file} > {tmp_fa}")
+        self.run_cmd(f"clean_seq {tmp_fa} {output_file}")
+        
+        # Index genome
+        self.run_cmd(f"samtools faidx {output_file}")
+        self.run_cmd(f"index {output_file}") 
+
+        os.remove(tmp_fa)
+        logger.info("Single genome processing completed")
 
     def process_ltr(self):
         """Process LTRs using allocated threads."""
@@ -275,41 +395,6 @@ class PanTEPipeline:
         os.remove(tmp_fa)
         logger.info("Single genome processing completed")
 
-    def process_graph_genome(self, output_file: str):
-        """Process genome from VCF files."""
-        logger.info("Starting graph genome processing from VCFs")
-        
-        if not self.vcf_dir:
-            raise ValueError("VCF directory not specified")
-            
-        tmp_dir = os.path.join(os.path.dirname(output_file), 'tmp')
-        os.makedirs(tmp_dir, exist_ok=True)
-        
-        # Get list of VCF files
-        vcf_files = list(Path(self.vcf_dir).glob('*.vcf'))
-        if not vcf_files:
-            raise FileNotFoundError(f"No VCF files found in {self.vcf_dir}")
-            
-        logger.info(f"Found {len(vcf_files)} VCF files")
-        
-        # Process each VCF file
-        for vcf_file in vcf_files:
-            try:
-                cmd = f"decode_gfa.pl --vcf {vcf_file} --threads {self.threads} --out {tmp_dir}"
-                self.run_cmd(cmd)
-                logger.info(f"Successfully processed {vcf_file}")
-            except Exception as e:
-                logger.error(f"Failed to process {vcf_file}: {str(e)}")
-                raise
-        
-        # Combine results
-        self.run_cmd(f"cat {tmp_dir}/*.fa > {output_file}")
-        
-        # Cleanup
-        import shutil
-        shutil.rmtree(tmp_dir)
-        logger.info("Graph genome processing completed")
-
     def combine_genome_results(self, genome_dir: str, input_files: list):
         """Combine and process all genome sequences into final genome.fa."""
         logger.info("Combining genome results")
@@ -369,20 +454,12 @@ class PanTEPipeline:
             raise
 
 def main():
-    parser = argparse.ArgumentParser(description='Pan TE Pipeline')
-    parser.add_argument('--genome', required=True, help='Input genome file')
-    parser.add_argument('--out', required=True, help='Output directory')
-    parser.add_argument('--threads', type=int, default=4, help='Number of threads')
-    parser.add_argument('--model-dir', help='ClassifyTE model directory')
-    parser.add_argument('--vcf-dir', help='Directory containing VCF files')
-    
-    args = parser.parse_args()
-    
+    """Main execution function."""
     try:
-        # Check if at least one input source is provided
-        if not (args.genome or args.vcf_dir):
-            parser.error("Either --genome or --vcf-dir must be provided")
-            
+        # Parse arguments
+        args = parse_arguments()
+        
+        # Create pipeline instance
         pipeline = PanTEPipeline(
             genome_file=args.genome,
             output_dir=args.out,
@@ -390,11 +467,29 @@ def main():
             model_dir=args.model_dir,
             vcf_dir=args.vcf_dir
         )
+
+        # Set memory limit if specified
+        if args.M > 0:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (args.M * 1024 * 1024, -1))
+            logger.info(f"Set memory limit to {args.M} MB")
+
+        # Set fragment size
+        if hasattr(pipeline, 'fragment_size'):
+            pipeline.fragment_size = args.fragment_size
+            logger.info(f"Set fragment size to {args.fragment_size}")
+
+        # Run pipeline
         pipeline.run()
         logger.info("Pipeline completed successfully")
         
+    except KeyboardInterrupt:
+        logger.error("Pipeline interrupted by user")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Pipeline failed: {str(e)}")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logger.exception("Detailed error traceback:")
         sys.exit(1)
 
 if __name__ == "__main__":

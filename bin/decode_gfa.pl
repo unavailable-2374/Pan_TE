@@ -5,18 +5,16 @@ use File::Basename;
 use Getopt::Long;
 use Pod::Usage;
 use autodie;
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use Cwd qw(abs_path);
 use POSIX qw(strftime);
 
 # Constants
 use constant {
     MIN_SEQ_LENGTH => 50,
-    CDHIT_IDENTITY => 0.8,
-    CDHIT_COVERAGE => 0.8,
     DEFAULT_THREADS => 4,
     MAX_RETRIES => 3,
-    TMP_DIR => 'tmp',
+    TMP_DIR => '.',
 };
 
 our $VERSION = '1.0.0';
@@ -34,6 +32,7 @@ init_environment();
 
 # Main execution
 process_data();
+cleanup_tmp_files($config{out_dir});
 
 exit(0);
 
@@ -46,11 +45,15 @@ sub init_environment {
     validate_environment();
     setup_directories();
     setup_logging();
+    $config{out_dir} = abs_path($config{out_dir});
+    chdir($config{out_dir}) or die "Cannot change directory to $config{out_dir}: $!\n";
+    print "DEBUG: Changed working directory to $config{out_dir}\n";
 }
 
 sub process_data {
     my $vcf_entries = read_vcf_file($config{vcf_file});
-    process_vcf_entries($vcf_entries);
+    my $output_file = File::Spec->catfile($config{out_dir}, "processed.fa");
+    process_vcf_entries($vcf_entries, $output_file);
 }
 
 ###############################################################################
@@ -121,9 +124,25 @@ sub read_vcf_file {
     log_message("Reading VCF file: $file");
     open my $fh, '<', $file;
     
+    my $total_lines = 0;
+    while (<$fh>) {
+        $total_lines++ unless /^#/;
+    }
+    
+    seek($fh, 0, 0);
+    
+    select((select(STDERR), $| = 1)[0]);
+    
+    my $processed = 0;
     while (my $line = <$fh>) {
         next if $line =~ /^#/;  # Skip headers
         chomp $line;
+        
+        $processed++;
+        if ($processed % 100 == 0) {
+            my $percent = int(($processed / $total_lines) * 100);
+            print STDERR "PROGRESS:$percent\n";
+        }
         
         my @fields = split(/\t/, $line);
         next unless @fields >= 5;  # Ensure minimum fields
@@ -136,6 +155,8 @@ sub read_vcf_file {
         };
     }
     
+    print STDERR "PROGRESS:100\n";
+    
     close $fh;
     log_message("Read " . scalar(@entries) . " VCF entries");
     return \@entries;
@@ -147,10 +168,27 @@ sub process_vcf_entries {
     my $output_file = TMP_DIR . "/$base_name.fa";
     my $temp_file = TMP_DIR . "/$base_name.tmp.fa";
     
+    # Force immediate output flush
+    $| = 1;
+    select((select(STDERR), $| = 1)[0]);
+    
     open my $out_fh, '>>', $output_file;
+    
+    my $total_entries = scalar(@$entries);
+    my $processed = 0;
+    my $last_percent = -1;
     
     foreach my $entry (@$entries) {
         my $alt_allele = $entry->{alt};
+        $processed++;
+        
+        # Calculate and display progress
+        my $percent = int(($processed / $total_entries) * 100);
+        if ($percent != $last_percent) {
+            print STDERR "PROGRESS:$percent\n";  # 特殊格式的进度信息
+            $last_percent = $percent;
+        }
+        
         next unless length($alt_allele) > MIN_SEQ_LENGTH;
         
         if ($alt_allele =~ /,/) {
@@ -167,6 +205,9 @@ sub process_multiple_alleles {
     my ($alt_allele, $base_name, $temp_file) = @_;
     my @alleles = split(/,/, $alt_allele);
     my $long_alleles = 0;
+
+    my $tmp_dir = TMP_DIR;
+    make_path($tmp_dir) unless -d $tmp_dir;
     
     open my $tmp_fh, '>', $temp_file;
     
@@ -191,24 +232,29 @@ sub process_multiple_alleles {
 
 sub refine_alleles {
     my ($temp_file, $base_name) = @_;
-    my $output_fasta = "$temp_file.out";
+
+    $config{out_dir} = abs_path($config{out_dir});
+
+    chdir($config{out_dir}) or die "Cannot change directory to $config{out_dir}: $!\n";
     
+    my $new_temp_file = File::Spec->catfile($config{out_dir}, "$base_name.tmp.fa");
+    my $output_fasta  = File::Spec->catfile($config{out_dir}, "$base_name.tmp.fa.out");
+
     my $cmd = join(" ",
         "Refiner_for_Graph",
-        $temp_file,
+        $new_temp_file,
         $output_fasta,
-        "--distance-threshold", "0.7",
-        "-t", $config{threads}
+        "--distance-threshold", "0.8",
+        "-t", $config{threads},
+	"-v"
     );
     
     system($cmd) == 0
         or die "Feature Extraction Failure: $?\n";
-        
-    system("cat $output_fasta >> " . TMP_DIR . "/$base_name.fa") == 0
-        or die "Failed to append Refine results: $?\n";
-        
-    unlink $output_fasta;
-    unlink glob(TMP_DIR . '/*.fa.n*');
+
+    my $final_fa = File::Spec->catfile($config{out_dir}, "$base_name.fa");
+    system("cat $output_fasta >> $final_fa")
+        == 0 or die "Failed to append Refine results: $!\n";
 }
 
 sub print_sequence {
@@ -224,6 +270,24 @@ sub log_message {
     open my $log_fh, '>>', "$config{out_dir}/decode_gfa.log";
     print $log_fh "[$timestamp] $message\n";
     close $log_fh;
+}
+
+sub cleanup_tmp_files {
+    my $dir = shift;
+    opendir(my $dh, $dir) or die "Cannot open directory $dir: $!\n";
+    while (my $file = readdir($dh)) {
+        next if ($file eq '.' or $file eq '..');
+        if ($file =~ /^tmp_/) {
+            my $path = File::Spec->catfile($dir, $file);
+            if (-d $path) {
+                remove_tree($path) or warn "Could not remove directory $path: $!";
+            } else {
+                unlink($path) or warn "Could not remove file $path: $!";
+            }
+            print "Removed $path\n";
+        }
+    }
+    closedir($dh);
 }
 
 __END__

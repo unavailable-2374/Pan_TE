@@ -2,7 +2,7 @@
 use strict;
 
 open(IN,"$ARGV[0]");
-open(OUT,">$ARGV[0].fa.translation");
+open(OUT,">$ARGV[0].translation");
 
 my $i=1;
 
