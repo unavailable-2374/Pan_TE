@@ -22,8 +22,8 @@ make_path("look4ltrs") unless -d "look4ltrs";
 chdir "look4ltrs" or die "Cannot change to look4ltrs directory: $!\n";
 
 # Data structures to store sequences
-my @large_seqs;     # Sequences > 20MB
-my @small_seqs;     # Sequences < 20MB
+my @large_seqs;     # Sequences > 50MB
+my @small_seqs;     # Sequences < 50MB
 my $current_group = {
     seqs => [],
     size => 0
