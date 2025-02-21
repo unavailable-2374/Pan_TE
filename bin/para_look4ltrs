@@ -136,7 +136,7 @@ if (! -e "raw.fa") {
         or die "Failed to clean genome.bed\n";
     system("seqtk subseq $fasta_file $current_dir/genome.cleaned.bed > $current_dir/LTR.fa") == 0
         or die "Failed to extract LTR sequences\n";
-    system("seqkit grep -v -i -p "N" $current_dir/tmp.fa > $current_dir/LTR.fa") == 0
+    system("seqkit grep -v -i -p 'N' $current_dir/tmp.fa > $current_dir/LTR.fa") == 0
         or die "Failed to extract LTR sequences\n";
 }
 
