@@ -101,7 +101,7 @@ if($group_count > $ARGV[1]) {
     $cmdString = "ParaFly -c command.list -CPU $group_count > look4ltr.err 2> look4ltr.log";
 }
 
-if (! -e "raw.fa") {
+if (! -e "$current_dir/LTR.fa") {
     system($cmdString) == 0 or die "Failed to execute: $cmdString\n";
     
     for(my $j = 1; $j < $group_index; $j++) {
