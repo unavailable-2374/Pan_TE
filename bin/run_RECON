@@ -57,7 +57,7 @@ sub process_repeat_masker {
     `mv consensi.fa lib.fa`;
     
     run_cmd("RepeatMasker -lib lib.fa -e rmblast -lcambig -dir repeat " . 
-            "-pa $cpu_threads -q tmp.fa -div 10 2> rm.log");
+            "-pa $cpu_threads -q tmp.fa -div 10 > rm.log 2>&1");
 }
 
 sub process_blast_db {

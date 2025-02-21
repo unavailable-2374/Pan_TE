@@ -188,7 +188,7 @@ sub run_pipeline {
             # Generate genome samples if needed
             if ($genome_size > 500_000_000) {
                 $logger->info("Generating genome samples...");
-                run_cmd("sample_for_genome $config{genome_file} $config{tmp_dir}/out.bed $sample_times $batch_size");
+                run_cmd("sample_for_genome $config{genome_file}.fai $config{tmp_dir}/out.bed $sample_times $batch_size");
                 run_cmd("seqtk subseq $config{genome_file} $config{tmp_dir}/out.bed > $config{tmp_dir}/tmp.fa");
             } else {
                 run_cmd("cp $config{genome_file} $config{tmp_dir}/tmp.fa");
