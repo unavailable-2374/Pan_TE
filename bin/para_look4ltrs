@@ -134,7 +134,7 @@ if (! -e "$current_dir/LTR.fa") {
         or die "Failed to sort genome.bed\n";
     system("clean_list $current_dir/genome.sorted.bed $current_dir/genome.cleaned.bed") == 0
         or die "Failed to clean genome.bed\n";
-    system("seqtk subseq $fasta_file $current_dir/genome.cleaned.bed > $current_dir/LTR.fa") == 0
+    system("seqtk subseq $fasta_file $current_dir/genome.cleaned.bed > $current_dir/tmp.fa") == 0
         or die "Failed to extract LTR sequences\n";
     system("seqkit grep -v -i -p 'N' $current_dir/tmp.fa > $current_dir/LTR.fa") == 0
         or die "Failed to extract LTR sequences\n";
