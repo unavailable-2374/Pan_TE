@@ -68,7 +68,7 @@ CT_DONE="/tmp/ct_done.$$"
 # Run RepeatClassifier in background
 log "Starting RepeatClassifier with $RC_THREADS threads"
 (
-    RepeatClassifier -consensi data/re.fa -pa $RC_THREADS
+    RepeatClassifier -consensi data/re.fa --threads $RC_THREADS
     touch "$RC_DONE"
 ) &
 RC_PID=$!
