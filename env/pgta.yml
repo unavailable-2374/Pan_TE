@@ -7,7 +7,7 @@ channels:
 dependencies:
  - python>=3.7
  - RepeatModeler==2.0.6
- - networkx=2.4
+ - networkx=3.1
  - numpy=1.19.1
  - pandas=1.0.5
  - scikit-learn=0.23.1
@@ -24,3 +24,6 @@ dependencies:
  - java-jdk
  - perl-log-log4perl
  - seqkit
+ - last
+ - tqdm
+ - mash

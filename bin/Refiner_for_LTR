@@ -1,405 +1,677 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 import logging
 import subprocess
+import tempfile
+import argparse
 from collections import defaultdict
-import networkx as nx
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
-import argparse
+import networkx as nx
 from concurrent.futures import ThreadPoolExecutor
-import numpy as np
-from statistics import mean
+import shutil
+from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class LTRClusteringPipeline:
+class FastClusteringPipeline:
     def __init__(self, input_fasta, output_dir, 
+                 cluster_method="minimap2", threads=1,
                  identity_threshold=0.8, coverage_threshold=0.8,
-                 seq_count_threshold=1000, seq_length_threshold=10000,
-                 threads=1):
-        """Initialize the LTR clustering pipeline"""
+                 cleanup_temp=True):
+        """
+        使用高性能聚类方法处理大型序列数据集
+        
+        参数:
+            input_fasta (str): 输入FASTA文件路径
+            output_dir (str): 输出目录路径
+            cluster_method (str): 聚类方法 (minimap2/mmseqs/vsearch)
+            threads (int): 线程数
+            identity_threshold (float): 相似度阈值 (0-1)
+            coverage_threshold (float): 覆盖率阈值 (0-1)
+            cleanup_temp (bool): 是否清理临时文件
+        """
         self.input_fasta = input_fasta
         self.output_dir = output_dir
+        self.cluster_method = cluster_method
+        self.threads = threads
         self.identity_threshold = identity_threshold
         self.coverage_threshold = coverage_threshold
-        self.seq_count_threshold = seq_count_threshold
-        self.seq_length_threshold = seq_length_threshold
-        self.threads = threads
+        self.cleanup_temp = cleanup_temp
         
-        # Create output directory
+        # 创建输出目录
         os.makedirs(output_dir, exist_ok=True)
-
-    def run_initial_clustering(self, input_fasta, output_paf):
-        """Run initial fast clustering using minimap2"""
+        
+        # 创建临时目录
+        self.temp_dir = os.path.join(output_dir, "temp")
+        os.makedirs(self.temp_dir, exist_ok=True)
+        
+    def check_tools(self):
+        """检查必要工具是否可用"""
+        tools = ["Refiner_for_Graph"]
+        
+        if self.cluster_method == "minimap2":
+            tools.append("minimap2")
+        elif self.cluster_method == "mmseqs":
+            tools.append("mmseqs")
+        elif self.cluster_method == "vsearch":
+            tools.append("vsearch")
+        else:
+            tools.append("cd-hit-est")
+            
+        missing_tools = []
+        for tool in tools:
+            if not shutil.which(tool):
+                missing_tools.append(tool)
+                
+        if missing_tools:
+            logger.error(f"缺少以下必要工具: {', '.join(missing_tools)}")
+            return False
+            
+        return True
+        
+    def preprocess_sequences(self):
+        """预处理序列：长度过滤、低复杂度区域过滤等"""
+        logger.info("预处理序列...")
+        
+        min_length = 100  # 最小长度阈值
+        max_n_ratio = 0.1  # 最大N比例
+        
+        # 读取所有序列
+        sequences = list(SeqIO.parse(self.input_fasta, "fasta"))
+        input_seq_count = len(sequences)
+        
+        # 筛选序列
+        filtered_sequences = []
+        for seq in sequences:
+            seq_len = len(seq.seq)
+            n_count = seq.seq.upper().count('N')
+            n_ratio = n_count / seq_len if seq_len > 0 else 1.0
+            
+            if seq_len >= min_length and n_ratio <= max_n_ratio:
+                filtered_sequences.append(seq)
+                
+        output_seq_count = len(filtered_sequences)
+        
+        # 写入处理后的序列
+        preprocessed_file = os.path.join(self.temp_dir, "preprocessed.fa")
+        SeqIO.write(filtered_sequences, preprocessed_file, "fasta")
+        
+        logger.info(f"预处理完成: {input_seq_count} 序列输入, {output_seq_count} 序列通过筛选")
+        return preprocessed_file
+        
+    def run_clustering(self, input_file):
+        """使用选定的聚类方法进行序列聚类"""
+        logger.info(f"使用 {self.cluster_method} 进行序列聚类...")
+        
+        if self.cluster_method == "minimap2":
+            return self.run_minimap2_clustering(input_file)
+        elif self.cluster_method == "mmseqs":
+            return self.run_mmseqs_clustering(input_file)
+        elif self.cluster_method == "vsearch":
+            return self.run_vsearch_clustering(input_file)
+        else:
+            # 回退到CD-HIT-EST
+            return self.run_cdhit_clustering(input_file)
+            
+    def run_minimap2_clustering(self, input_file):
+        """使用minimap2进行快速聚类"""
+        paf_file = os.path.join(self.temp_dir, "minimap2.paf")
+        
+        # minimap2参数，针对LTR元素优化
+        # -k 15: 使用较小的k-mer提高敏感度
+        # -X: 跳过自我比对
+        # -p 0.8: 次要比对阈值，0.8为适中值
+        # -c: 输出CIGAR字符串，用于精确计算相似度
         cmd = [
             "minimap2",
-            "-k", "15",          # smaller k-mer for higher sensitivity
-            "-w", "10",          # window size
-            "-A", "4",           # matching score
-            "-B", "8",           # mismatch penalty
-            "-O", "4,24",        # gap open penalties
-            "-E", "2,1",         # gap extension penalties
-            "-z", "400",         # Z-drop score
-            "-N", "150",         # minimum chain score
-            "--no-long-join",    # disable joining long gaps
-            "-F", "1000",        # max fragment length
-            "-p", "0.6",         # min secondary-to-primary score ratio
-            "--secondary=no",    # disable secondary alignments
+            "-x", "asm20",     # 更适合重复序列的预设
+            "-k", "15",        # 更小的k-mer提高敏感度
+            "-w", "10",        # 窗口大小
+            "-c",              # 输出CIGAR字符串
+            "-p", "0.8",       # 次要比对阈值
+            "-N", "100",       # 更多候选链
+            "--cs",            # 输出详细的比对信息
+            "-D",              # 启用密集比对模式
             "-t", str(self.threads),
-            "-o", output_paf,
-            input_fasta,
-            input_fasta
+            "-o", paf_file,
+            input_file, input_file
         ]
         
         try:
             subprocess.run(cmd, check=True, capture_output=True)
-            logger.info(f"Completed minimap2 alignment: {output_paf}")
+            logger.info("minimap2比对完成")
+            
+            # 解析PAF文件并构建图
+            G = self.parse_minimap2_results(paf_file)
+            
+            # 使用图算法识别聚类
+            clusters = self.identify_clusters_from_graph(G)
+            
+            return clusters, input_file
+            
         except subprocess.CalledProcessError as e:
-            logger.error(f"Minimap2 alignment failed: {e.stderr.decode()}")
+            logger.error(f"minimap2运行失败: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
             raise
-
-    def build_multiple_alignment_large_cluster(self, input_fasta, output_file):
-        """Build multiple alignment for large clusters using MAFFT"""
-        # First run LAST to generate pairwise alignments
-        db_prefix = f"{output_file}.lastdb"
-        last_cmd = [
-            "lastdb",
-            "-v",
-            "-R01",
-            db_prefix,
-            input_fasta
-        ]
+            
+    def parse_minimap2_results(self, paf_file):
+        """解析minimap2 PAF输出，构建序列相似性图"""
+        G = nx.Graph()
         
-        try:
-            result = subprocess.run(last_cmd, check=True, capture_output=True, text=True)
-            logger.info(f"Created LAST database: {db_prefix}")
-            logger.debug(f"lastdb output: {result.stdout}")
-            
-            # Run LAST alignment with correct parameters
-            last_out = f"{output_file}.maf"
-            align_cmd = [
-                "lastal",
-                "-v",
-                "-m", "50",
-                "-e", "30",
-                "-a", "7",
-                "-j", "3",
-                "-q", "3",
-                "-r", "2",
-                "-b", "1", 
-                "-f", "1",
-                db_prefix,
-                input_fasta
-            ]
-            
-            with open(last_out, 'w') as f:
-                result = subprocess.run(align_cmd, check=True, stdout=f, stderr=subprocess.PIPE, text=True)
-                logger.debug(f"lastal stderr: {result.stderr}")
-                
-            convert_cmd = ["maf-convert", "sam", last_out]
-            with open(f"{output_file}.sam", 'w') as f:
-                subprocess.run(convert_cmd, check=True, stdout=f)
-            
-            mafft_cmd = [
-                "mafft",
-                "--localpair",
-                "--maxiterate", "1000",
-                "--quiet",
-                "--ep", "0.123",
-                "--retree", "2",
-                "--thread", str(self.threads),
-                "--adjustdirection",
-                input_fasta
-            ]
-            
-            with open(output_file, 'w') as f:
-                subprocess.run(mafft_cmd, check=True, stdout=f)
-                
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Alignment failed: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-            raise
-        finally:
-            # Clean up temporary files
-            for ext in [".lastdb", ".maf", ".sam"]:
-                try:
-                    os.remove(f"{output_file}{ext}")
-                except OSError:
-                    pass
-
-    def parse_paf(self, paf_file):
-        graph = nx.Graph()
-        edge_weights = defaultdict(list)
+        # 设置聚类阈值
+        min_identity = self.identity_threshold
+        min_coverage = self.coverage_threshold
         
+        # 读取PAF文件
         with open(paf_file) as f:
             for line in f:
-                fields = line.strip().split('\t')
+                fields = line.strip().split("\t")
+                if len(fields) < 12:
+                    continue
+                    
                 query_name = fields[0]
                 target_name = fields[5]
                 
+                # 跳过自身比对
                 if query_name == target_name:
                     continue
                     
-                matches = int(fields[9])        # 匹配数
-                aln_length = int(fields[10])    # 比对长度
-                query_length = int(fields[1])   # 查询序列长度
-                target_length = int(fields[6])  # 目标序列长度
+                query_len = int(fields[1])
+                target_len = int(fields[6])
+                alignment_len = int(fields[10])
+                matches = int(fields[9])
                 
-                identity = matches / aln_length
-                coverage = aln_length / min(query_length, target_length)
+                # 计算相似度和覆盖率
+                identity = matches / alignment_len if alignment_len > 0 else 0
+                q_coverage = alignment_len / query_len if query_len > 0 else 0
+                t_coverage = alignment_len / target_len if target_len > 0 else 0
+                coverage = max(q_coverage, t_coverage)
                 
-                length_ratio = min(query_length, target_length) / max(query_length, target_length)
-                terminal_score = self._calculate_terminal_score(fields)
-                
-                if (identity >= self.identity_threshold and 
-                    coverage >= self.coverage_threshold):
-                    weight = self._calculate_combined_weight(
-                        identity, coverage, length_ratio, terminal_score
-                    )
-                    edge_weights[(query_name, target_name)].append(weight)
+                # 如果满足阈值，添加边
+                if identity >= min_identity and coverage >= min_coverage:
+                    weight = identity * coverage  # 组合权重
+                    
+                    if G.has_edge(query_name, target_name):
+                        # 使用最高权重
+                        G[query_name][target_name]['weight'] = max(
+                            G[query_name][target_name]['weight'], 
+                            weight
+                        )
+                    else:
+                        G.add_edge(query_name, target_name, weight=weight)
+                        
+        # 确保所有序列ID都在图中，包括没有高相似性的序列
+        for line in open(paf_file):
+            fields = line.strip().split("\t")
+            if len(fields) < 2:
+                continue
+            G.add_node(fields[0])
+            G.add_node(fields[5])
+            
+        logger.info(f"从minimap2结果构建了图，包含 {len(G.nodes())} 个节点，{len(G.edges())} 条边")
+        return G
         
-        for (node1, node2), weights in edge_weights.items():
-            avg_weight = sum(weights) / len(weights)
-            graph.add_edge(node1, node2, weight=avg_weight)
+    def identify_clusters_from_graph(self, G):
+        """从图中识别聚类"""
+        # 使用连通分量算法
+        clusters = list(nx.connected_components(G))
+        logger.info(f"图聚类识别出 {len(clusters)} 个聚类")
+        return clusters
         
-        return graph
-
-    def _calculate_terminal_score(self, paf_fields):
+    def run_mmseqs_clustering(self, input_file):
+        """使用MMseqs2进行超快速聚类，特别适合大型数据集"""
+        # 创建临时目录
+        mmseqs_tmp = os.path.join(self.temp_dir, "mmseqs_tmp")
+        os.makedirs(mmseqs_tmp, exist_ok=True)
+        
+        # 设置输出文件
+        prefix = os.path.join(self.temp_dir, "mmseqs")
+        db_file = f"{prefix}_DB"
+        cluster_file = f"{prefix}_cluster"
+        cluster_tsv = f"{prefix}_cluster.tsv"
+        
         try:
-            cigar_str = [f for f in paf_fields if f.startswith('cg:Z:')]
-            if cigar_str:
-                cigar = cigar_str[0].split(':')[2]
-                return self._analyze_terminal_matches(cigar)
-        except (IndexError, ValueError):
-            pass
-        return 0.5  
-
-    def _analyze_terminal_matches(self, cigar):
-        TERMINAL_LENGTH = 100  # 考虑的末端长度
-        operations = []
-        current_num = ""
+            # 步骤1: 创建数据库
+            cmd = [
+                "mmseqs", "createdb", 
+                input_file, 
+                db_file
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            # 步骤2: 运行聚类
+            # 设置--min-seq-id为相似度阈值
+            # 设置-c为覆盖率阈值
+            cmd = [
+                "mmseqs", "cluster",
+                db_file, 
+                cluster_file,
+                mmseqs_tmp,
+                "--min-seq-id", str(self.identity_threshold),
+                "-c", str(self.coverage_threshold),
+                "--cov-mode", "2",  # 2代表目标序列覆盖率
+                "--threads", str(self.threads)
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            # 步骤3: 转换结果为人类可读格式
+            cmd = [
+                "mmseqs", "createtsv",
+                db_file,
+                db_file,
+                cluster_file,
+                cluster_tsv
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            # 解析聚类结果
+            clusters = self.parse_mmseqs_results(cluster_tsv)
+            
+            return clusters, input_file
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"MMseqs2运行失败: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            # 尝试回退到minimap2
+            logger.info("尝试使用minimap2作为备选方法")
+            return self.run_minimap2_clustering(input_file)
+        finally:
+            # 清理临时文件
+            if self.cleanup_temp:
+                try:
+                    shutil.rmtree(mmseqs_tmp)
+                except:
+                    pass
+                    
+    def parse_mmseqs_results(self, cluster_tsv):
+        """解析MMseqs2聚类结果"""
+        cluster_dict = defaultdict(set)
         
-        for char in cigar:
-            if char.isdigit():
-                current_num += char
+        with open(cluster_tsv) as f:
+            for line in f:
+                fields = line.strip().split("\t")
+                if len(fields) >= 2:
+                    rep_id = fields[0]  # 代表序列ID
+                    member_id = fields[1]  # 成员序列ID
+                    cluster_dict[rep_id].add(member_id)
+                    # 确保代表序列也在集合中
+                    cluster_dict[rep_id].add(rep_id)
+        
+        # 转换为列表
+        clusters = list(cluster_dict.values())
+        logger.info(f"MMseqs2聚类生成了 {len(clusters)} 个聚类")
+        return clusters
+        
+    def run_vsearch_clustering(self, input_file):
+        """使用vsearch进行快速聚类"""
+        # 设置输出文件
+        cluster_file = os.path.join(self.temp_dir, "vsearch_clusters.uc")
+        
+        try:
+            # 运行vsearch聚类
+            # --id: 相似度阈值
+            # --strand both: 检查两条链
+            cmd = [
+                "vsearch",
+                "--cluster_fast", input_file,
+                "--id", str(self.identity_threshold),
+                "--strand", "both",
+                "--uc", cluster_file,
+                "--threads", str(self.threads)
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            # 解析聚类结果
+            clusters = self.parse_vsearch_results(cluster_file)
+            
+            return clusters, input_file
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"vsearch运行失败: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            # 尝试回退到minimap2
+            logger.info("尝试使用minimap2作为备选方法")
+            return self.run_minimap2_clustering(input_file)
+            
+    def parse_vsearch_results(self, cluster_file):
+        """解析vsearch聚类结果"""
+        cluster_dict = defaultdict(set)
+        
+        with open(cluster_file) as f:
+            for line in f:
+                if line.startswith('C') or line.startswith('H'):
+                    fields = line.strip().split("\t")
+                    if len(fields) >= 9:
+                        cluster_id = fields[1]
+                        seq_id = fields[8]
+                        if seq_id == '*':
+                            seq_id = fields[9]  # 有时代表序列在第10个字段
+                        cluster_dict[cluster_id].add(seq_id)
+        
+        # 转换为列表
+        clusters = list(cluster_dict.values())
+        logger.info(f"vsearch聚类生成了 {len(clusters)} 个聚类")
+        return clusters
+        
+    def run_cdhit_clustering(self, input_file):
+        """使用CD-HIT-EST进行初始聚类"""
+        output_file = os.path.join(self.temp_dir, "cdhit_clustered.fa")
+        clusters_file = output_file + ".clstr"
+        
+        # CD-HIT参数
+        cmd = [
+            "cd-hit-est",
+            "-i", input_file,
+            "-o", output_file,
+            "-aS", str(self.coverage_threshold),  # 序列覆盖率
+            "-c", str(self.identity_threshold),   # 序列相似度
+            "-g", "1",             # 使用局部最佳匹配
+            "-G", "0",             # 允许在两个方向上聚类
+            "-A", "80",            # 最小对齐长度
+            "-M", "10000",         # 内存限制(MB)
+            "-T", str(self.threads)
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info("CD-HIT聚类完成")
+            
+            # 解析聚类结果
+            if os.path.exists(clusters_file):
+                clusters = self.parse_cdhit_clusters(clusters_file)
+                logger.info(f"CD-HIT生成了 {len(clusters)} 个聚类")
+                return clusters, output_file
             else:
-                if current_num:
-                    operations.append((char, int(current_num)))
-                    current_num = ""
-                    
-        left_matches = 0
-        right_matches = 0
-        current_pos = 0
-        
-        for op, length in operations:
-            if current_pos >= TERMINAL_LENGTH:
-                break
-            if op == 'M':  
-                left_matches += min(length, TERMINAL_LENGTH - current_pos)
-            current_pos += length
-            
-        current_pos = 0
-        for op, length in reversed(operations):
-            if current_pos >= TERMINAL_LENGTH:
-                break
-            if op == 'M':  # 匹配
-                right_matches += min(length, TERMINAL_LENGTH - current_pos)
-            current_pos += length
-            
-        terminal_score = (left_matches + right_matches) / (2 * TERMINAL_LENGTH)
-        return min(1.0, terminal_score)
-
-    def _calculate_combined_weight(self, identity, coverage, length_ratio, terminal_score):
-        w1, w2, w3, w4 = 0.4, 0.3, 0.1, 0.2
-        return (w1 * identity + 
-                w2 * coverage + 
-                w3 * length_ratio + 
-                w4 * terminal_score)
-
-    def cluster_sequences(self, graph):
-        """Perform clustering using connected components"""
-        return list(nx.connected_components(graph))
-
-    def is_large_cluster(self, cluster, sequences):
-        """Determine if a cluster is 'large' based on sequence count and length"""
-        if len(cluster) >= self.seq_count_threshold:
-            return True
-            
-        avg_length = mean(len(sequences[seq_id].seq) for seq_id in cluster)
-        if avg_length >= self.seq_length_threshold:
-            return True
-            
-        return False
-
-    def build_consensus_for_cluster(self, cluster, sequences, cluster_idx):
-        """Build consensus sequence for a cluster"""
-        if len(cluster) == 1:
-            seq_id = list(cluster)[0]
-            consensus_file = os.path.join(self.output_dir, f"consensus_{cluster_idx}.fa")
-            
-            with open(consensus_file, "w") as f:
-                SeqIO.write(sequences[seq_id], f, "fasta")
-            
-            logger.info(f"Single sequence cluster {cluster_idx}, direct output")
-            return consensus_file
-            
-        cluster_fasta = os.path.join(self.output_dir, f"cluster_{cluster_idx}.fa")
-        cluster_seqs = []
-        for seq_id in cluster:
-            cluster_seqs.append(sequences[seq_id])
-            
-        with open(cluster_fasta, "w") as f:
-            SeqIO.write(cluster_seqs, f, "fasta")
-            
-        consensus_file = os.path.join(self.output_dir, f"consensus_{cluster_idx}.fa")
-        
-        # 检查是否是大簇
-        is_large = self.is_large_cluster(cluster, sequences)
-        
-        if is_large:
-            logger.info(f"Processing large cluster {cluster_idx} "
-                    f"(size={len(cluster)}) using MAFFT")
-            self.build_multiple_alignment_large_cluster(cluster_fasta, consensus_file)
-            
-            alignment = list(SeqIO.parse(consensus_file, "fasta"))
-            consensus_seq = self.build_consensus_from_mafft(alignment)
-            
-            with open(consensus_file, "w") as f:
-                SeqIO.write(consensus_seq, f, "fasta")
-        else:
-            logger.info(f"Processing cluster {cluster_idx} using Refiner_for_Graph")
-            from Refiner_for_Graph import TEConsensusBuilder, Config
-            config = Config()
-            builder = TEConsensusBuilder(
-                rmblast_dir=os.path.dirname(config.rmblastn),
-                makeblastdb_path=config.makeblastdb,
-                matrix_path=config.matrix_path,
-                threads=self.threads
-            )
-            builder.build_clustered_consensus(cluster_fasta, consensus_file)
-            
-        return consensus_file
-
-    def build_consensus_from_mafft(self, alignment):
-        """Build consensus sequence from MAFFT multiple alignment"""
-        if not alignment:
-            return None
-            
-        aln_length = len(alignment[0].seq)
-        consensus = []
-        
-        for i in range(aln_length):
-            bases = [record.seq[i] for record in alignment if i < len(record.seq)]
-            base_counts = defaultdict(int)
-            for base in bases:
-                if base != '-':
-                    base_counts[base] += 1
-                    
-            if base_counts:
-                max_base = max(base_counts.items(), key=lambda x: x[1])[0]
-                consensus.append(max_base)
+                logger.warning(f"聚类文件 {clusters_file} 不存在")
+                return [], input_file
                 
-        consensus_seq = SeqRecord(
-            Seq(''.join(consensus)),
-            id=f"consensus",
-            description=f"consensus from {len(alignment)} sequences"
-        )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"CD-HIT运行失败: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            # 如果CD-HIT失败，返回空聚类列表
+            return [], input_file
+            
+    def parse_cdhit_clusters(self, clusters_file):
+        """解析CD-HIT聚类文件"""
+        cluster_dict = defaultdict(set)
+        current_cluster = None
         
-        return consensus_seq
+        with open(clusters_file) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(">Cluster"):
+                    current_cluster = line.split()[1]
+                elif line and current_cluster is not None:
+                    # 提取序列ID
+                    parts = line.split(">")
+                    if len(parts) > 1:
+                        seq_id = parts[1].split("...")[0]
+                        cluster_dict[current_cluster].add(seq_id)
+        
+        # 转换为列表
+        return list(cluster_dict.values())
+
+    def refine_cluster(self, cluster_seqs, cluster_id):
+        """
+        对含有多条序列的聚类进行refine，生成代表序列
+        
+        参数:
+            cluster_seqs (list): 聚类中的序列对象列表
+            cluster_id (str/int): 聚类ID
+            
+        返回:
+            共识序列对象
+        """
+        if len(cluster_seqs) == 1:
+            # 单序列聚类，直接返回
+            return cluster_seqs[0]
+            
+        logger.info(f"对聚类 {cluster_id} (包含 {len(cluster_seqs)} 条序列) 进行refine")
+        
+        # 验证序列
+        valid_seqs = []
+        for seq in cluster_seqs:
+            if len(seq.seq) >= 50:  # 确保序列长度足够
+                valid_seqs.append(seq)
+                
+        if not valid_seqs:
+            logger.warning(f"聚类 {cluster_id} 没有有效序列，跳过refine")
+            return cluster_seqs[0] if cluster_seqs else None
+            
+        if len(valid_seqs) == 1:
+            # 如果只有一个有效序列，直接返回
+            return valid_seqs[0]
+        
+        # 创建临时文件用于Refiner_for_Graph
+        cluster_fasta = os.path.join(self.temp_dir, f"cluster_{cluster_id}.fa")
+        output_fasta = os.path.join(self.temp_dir, f"refined_{cluster_id}.fa")
+        
+        # 写入聚类序列
+        SeqIO.write(valid_seqs, cluster_fasta, "fasta")
+        
+        # 检查文件大小确保写入成功
+        if os.path.getsize(cluster_fasta) == 0:
+            logger.warning(f"聚类 {cluster_id} 写入文件为空，使用最长序列作为代表")
+            return max(valid_seqs, key=lambda x: len(x.seq))
+        
+        try:
+            # 避免浮点精度问题
+            distance_threshold = round(1 - self.identity_threshold, 2)
+            
+            # 调用Refiner_for_Graph进行refine
+            cmd = [
+                "Refiner_for_Graph",
+                cluster_fasta,
+                output_fasta,
+                "--distance-threshold", str(distance_threshold),
+                "-t", str(min(self.threads, 4))  # 限制每个refine使用的线程数
+            ]
+            
+            # 尝试捕获详细错误信息
+            process = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True
+            )
+            
+            if process.returncode != 0:
+                logger.warning(f"Refiner_for_Graph返回错误 (代码 {process.returncode}):")
+                logger.warning(f"STDERR: {process.stderr}")
+                logger.warning(f"STDOUT: {process.stdout}")
+                # 如果Refiner_for_Graph失败，尝试使用其他方法
+                return self._fallback_refine(valid_seqs, cluster_id)
+            
+            # 读取refine结果
+            if os.path.exists(output_fasta) and os.path.getsize(output_fasta) > 0:
+                refined_seqs = list(SeqIO.parse(output_fasta, "fasta"))
+                if refined_seqs:
+                    # 使用第一条序列作为代表
+                    consensus = refined_seqs[0]
+                    # 更新序列描述，添加聚类信息
+                    consensus.description = f"refined from cluster {cluster_id} ({len(valid_seqs)} sequences)"
+                    return consensus
+            
+            logger.warning(f"Refiner_for_Graph未能生成结果，使用备选方法")
+            return self._fallback_refine(valid_seqs, cluster_id)
+            
+        except Exception as e:
+            logger.error(f"Refiner_for_Graph处理聚类 {cluster_id} 失败: {e}")
+            import traceback
+            logger.error(f"异常详情: {traceback.format_exc()}")
+            # 失败时使用备选方法
+            return self._fallback_refine(valid_seqs, cluster_id)
+        finally:
+            # 可选地清理临时文件
+            if self.cleanup_temp:
+                for f in [cluster_fasta, output_fasta]:
+                    if os.path.exists(f):
+                        try:
+                            os.remove(f)
+                        except:
+                            pass
+                            
+    def _fallback_refine(self, sequences, cluster_id):
+        """在Refiner_for_Graph失败时的备选方法"""
+        logger.info(f"使用备选方法处理聚类 {cluster_id}")
+        
+        # 策略1: 尝试使用cd-hit-est
+        try:
+            # 创建临时文件
+            input_file = os.path.join(self.temp_dir, f"fallback_{cluster_id}_input.fa")
+            output_file = os.path.join(self.temp_dir, f"fallback_{cluster_id}_output.fa")
+            
+            # 写入序列
+            SeqIO.write(sequences, input_file, "fasta")
+            
+            # 运行cd-hit-est
+            cmd = [
+                "cd-hit-est",
+                "-i", input_file,
+                "-o", output_file,
+                "-c", "0.9",       # 更高的相似度阈值
+                "-aS", "0.8",
+                "-g", "1",
+                "-d", "0",         # 使用完整序列描述
+                "-T", "1"          # 单线程，避免并发问题
+            ]
+            
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if process.returncode == 0 and os.path.exists(output_file):
+                # 读取结果，使用第一条序列
+                cdhit_seqs = list(SeqIO.parse(output_file, "fasta"))
+                if cdhit_seqs:
+                    consensus = cdhit_seqs[0]
+                    consensus.description = f"cd-hit consensus for cluster {cluster_id} ({len(sequences)} sequences)"
+                    return consensus
+        except Exception as e:
+            logger.warning(f"cd-hit-est 备选方法失败: {e}")
+        
+        # 策略2: 如果cd-hit-est也失败，使用最长序列
+        logger.info(f"使用最长序列作为聚类 {cluster_id} 的代表")
+        return max(sequences, key=lambda x: len(x.seq))
+
+    def process_clusters(self, clusters, sequences_file):
+        """
+        处理聚类结果：
+        - 对多序列聚类进行refine
+        - 单序列聚类直接使用
+        
+        参数:
+            clusters (list): 聚类列表，每个元素是一个序列ID集合
+            sequences_file (str): 序列文件路径
+            
+        返回:
+            处理后的序列列表
+        """
+        logger.info(f"处理 {len(clusters)} 个聚类...")
+        
+        # 读取所有序列
+        sequences = SeqIO.to_dict(SeqIO.parse(sequences_file, "fasta"))
+        
+        # 准备结果
+        results = []
+        
+        # 并行处理聚类
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            future_to_cluster = {}
+            
+            for i, cluster in enumerate(clusters):
+                # 获取该聚类的序列
+                cluster_seqs = [sequences[seq_id] for seq_id in cluster if seq_id in sequences]
+                
+                if not cluster_seqs:
+                    continue
+                    
+                # 提交处理任务
+                future = executor.submit(self.refine_cluster, cluster_seqs, i)
+                future_to_cluster[future] = i
+            
+            # 收集结果
+            for future in tqdm(future_to_cluster, desc="处理聚类"):
+                cluster_id = future_to_cluster[future]
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    logger.error(f"处理聚类 {cluster_id} 失败: {e}")
+        
+        logger.info(f"共生成 {len(results)} 条序列")
+        return results
 
     def run(self):
-        """Run the complete pipeline"""
-        logger.info("Starting LTR clustering pipeline")
+        """运行完整的LTR去冗余流程"""
+        logger.info("启动快速LTR聚类和去冗余流程...")
         
-        sequences = SeqIO.to_dict(SeqIO.parse(self.input_fasta, "fasta"))
-        initial_count = len(sequences)
-        logger.info(f"Read {initial_count} input sequences")
-        
-        paf_file = os.path.join(self.output_dir, "initial_alignment.paf")
-        self.run_initial_clustering(self.input_fasta, paf_file)
-        
-        graph = self.parse_paf(paf_file)
-        clusters = self.cluster_sequences(graph)
-        
-        clustered_seqs = set()
-        for cluster in clusters:
-            clustered_seqs.update(cluster)
-            
-        missing_seqs = set(sequences.keys()) - clustered_seqs
-        if missing_seqs:
-            logger.warning(f"Found {len(missing_seqs)} unclustered sequences")
-            for seq_id in missing_seqs:
-                clusters.append({seq_id})
-        
-        logger.info(f"Found {len(clusters)} clusters")
-        logger.info(f"Total sequences in clusters: {sum(len(c) for c in clusters)}")
-        
-        assert sum(len(c) for c in clusters) == initial_count, \
-            "Some sequences were lost during clustering"
-        
-        logger.info("Building consensus sequences for clusters...")
-        consensus_files = []
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = []
-            for idx, cluster in enumerate(clusters):
-                future = executor.submit(self.build_consensus_for_cluster, 
-                                    cluster, sequences, idx)
-                futures.append(future)
+        try:
+            # 检查工具
+            if not self.check_tools():
+                return None
                 
-            for future in futures:
+            # 预处理序列
+            preprocessed_file = self.preprocess_sequences()
+            
+            # 运行聚类
+            clusters, input_file = self.run_clustering(preprocessed_file)
+            
+            # 处理聚类结果
+            final_sequences = self.process_clusters(clusters, input_file)
+            
+            # 写入最终输出
+            output_file = os.path.join(self.output_dir, "consensi.fa")
+            SeqIO.write(final_sequences, output_file, "fasta")
+            
+            logger.info(f"处理完成，结果保存至: {output_file}")
+            return output_file
+            
+        except Exception as e:
+            logger.error(f"处理过程中发生错误: {e}")
+            import traceback
+            logger.error(f"异常详情: {traceback.format_exc()}")
+            return None
+            
+        finally:
+            # 清理临时文件
+            if self.cleanup_temp:
                 try:
-                    consensus_file = future.result()
-                    if consensus_file:
-                        consensus_files.append(consensus_file)
+                    logger.info("清理临时文件...")
+                    shutil.rmtree(self.temp_dir)
                 except Exception as e:
-                    logger.error(f"Error building consensus: {e}")
-                    
-        final_consensus = os.path.join(self.output_dir, "consensi.fa")
-        with open(final_consensus, "w") as outf:
-            for cons_file in consensus_files:
-                try:
-                    for record in SeqIO.parse(cons_file, "fasta"):
-                        SeqIO.write(record, outf, "fasta")
-                except Exception as e:
-                    logger.error(f"Error writing consensus {cons_file}: {e}")
-                        
-        logger.info(f"Pipeline complete. Final consensus: {final_consensus}")
-        return final_consensus
+                    logger.warning(f"清理临时文件失败: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="LTR Clustering Pipeline")
-    parser.add_argument("input_fasta", help="Input FASTA file")
-    parser.add_argument("output_dir", help="Output directory")
+    """命令行入口函数"""
+    parser = argparse.ArgumentParser(description="快速LTR序列聚类和去冗余工具")
+    
+    parser.add_argument("input_fasta", help="输入FASTA文件")
+    parser.add_argument("output_dir", help="输出目录")
+    
+    parser.add_argument("--method", choices=["minimap2", "mmseqs", "vsearch", "cdhit"], 
+                       default="minimap2", help="聚类方法 (默认: minimap2)")
     parser.add_argument("--identity", type=float, default=0.6,
-                      help="Minimum sequence identity (default: 0.6)")
-    parser.add_argument("--coverage", type=float, default=0.6,
-                      help="Minimum alignment coverage (default: 0.6)")
-    parser.add_argument("--seq-count", type=int, default=1000,
-                      help="Sequence count threshold for large clusters (default: 1000)")
-    parser.add_argument("--seq-length", type=int, default=10000,
-                      help="Sequence length threshold for large clusters (default: 10000)")
+                       help="序列相似度阈值 (0-1, 默认: 0.6)")
+    parser.add_argument("--coverage", type=float, default=0.8,
+                       help="序列覆盖率阈值 (0-1, 默认: 0.8)")
     parser.add_argument("--threads", type=int, default=1,
-                      help="Number of threads (default: 1)")
+                       help="线程数 (默认: 1)")
+    parser.add_argument("--keep-temp", action="store_false", dest="cleanup_temp",
+                       help="保留临时文件")
     
     args = parser.parse_args()
     
-    pipeline = LTRClusteringPipeline(
+    pipeline = FastClusteringPipeline(
         args.input_fasta,
         args.output_dir,
+        cluster_method=args.method,
+        threads=args.threads,
         identity_threshold=args.identity,
         coverage_threshold=args.coverage,
-        seq_count_threshold=args.seq_count,
-        seq_length_threshold=args.seq_length,
-        threads=args.threads
+        cleanup_temp=args.cleanup_temp
     )
     
     pipeline.run()
-
+    
 if __name__ == "__main__":
     main()

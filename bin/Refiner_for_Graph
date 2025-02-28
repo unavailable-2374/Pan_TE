@@ -404,7 +404,7 @@ class TEConsensusBuilder:
             "cd-hit-est",
             "-i", temp_in_name,
             "-o", temp_out_name,
-            "-aS", "0.8",
+            "-aS", "0.6",
             "-c", "0.8",
             "-g", "0",
             "-G", "0",
