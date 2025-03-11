@@ -8,7 +8,11 @@ use Cwd qw(getcwd);
 use constant {
     MIN_THREADS => 1,
     DEFAULT_EVALUE => '1e-5',
-    BLAST_DB_TYPE => 'nucl'
+    BLAST_DB_TYPE => 'nucl',
+    MIN_PREDETECT_SIZE => 10000000,  # 10Mb
+    MAX_PREDETECT_SIZE => 40000000,  # 40Mb
+    TE_THRESHOLD => 30,              # 30% TE content threshold
+    MAX_REDUCED_SAMPLE => 256000000  # 256Mb cap for reduced sampling
 };
 
 die "Usage: $0 round_num threads genome_file genome_size batch_size\n"
@@ -22,6 +26,7 @@ die "Genome file $genome_file not found\n" unless -f $genome_file;
 die "Invalid genome size\n" unless $genome_size =~ /^\d+$/;
 die "Invalid batch size\n" unless $batch_size =~ /^\d+$/;
 
+# Create directory structure
 my $tmp_dir = "round-$round_num";
 make_path($tmp_dir) unless -d $tmp_dir;
 chdir $tmp_dir or die "Cannot change to directory $tmp_dir: $!\n";
@@ -30,8 +35,29 @@ my $times = int($genome_size / $batch_size);
 my $cpu_threads = int($threads/4);
 $cpu_threads = MIN_THREADS if $cpu_threads < MIN_THREADS;
 
-process_repeat_masker($genome_file, $cpu_threads, $times, $batch_size);
-process_blast_db($threads,$genome_file);
+# Run the pre-detection step and get TE percentage
+my $te_percentage = run_predetection($genome_file, $cpu_threads);
+print "Pre-detection TE percentage: $te_percentage%\n";
+
+# Adjust sampling based on pre-detection results
+my $adjusted_times = $times;
+if ($te_percentage < TE_THRESHOLD) {
+    # Calculate new times based on reduced sample size (max 256Mb)
+    my $reduced_sample_size = MAX_REDUCED_SAMPLE;
+    # If original sample is smaller than the cap, keep it
+    if ($genome_size < MAX_REDUCED_SAMPLE) {
+        $reduced_sample_size = $genome_size;
+    }
+    $adjusted_times = int($reduced_sample_size / $batch_size);
+    print "Low TE content detected ($te_percentage%). Reducing sample size to " . 
+          ($adjusted_times * $batch_size) . " bytes\n";
+} else {
+    print "Sufficient TE content detected ($te_percentage%). Using original sample size\n";
+}
+
+# Continue with regular processing using adjusted sample size
+process_repeat_masker($genome_file, $cpu_threads, $adjusted_times, $batch_size, $te_percentage);
+process_blast_db($threads, $genome_file);
 run_recon_pipeline();
 build_final_output($threads);
 
@@ -43,8 +69,65 @@ chdir "../";
 
 exit 0;
 
+# New function for pre-detection step
+sub run_predetection {
+    my ($genome_file, $cpu_threads) = @_;
+    
+    print "Starting pre-detection for TE content...\n";
+    
+    # Create predetect directory
+    make_path("predetect") unless -d "predetect";
+    
+    # Calculate 1% of genome size
+    my $total_size = `wc -c < $genome_file`;
+    chomp($total_size);
+    my $sample_size = int($total_size * 0.01);
+    
+    # Apply min/max constraints
+    if ($sample_size < MIN_PREDETECT_SIZE) {
+        $sample_size = MIN_PREDETECT_SIZE;
+    } elsif ($sample_size > MAX_PREDETECT_SIZE) {
+        $sample_size = MAX_PREDETECT_SIZE;
+    }
+    
+    print "Pre-detection sample size: $sample_size bytes\n";
+    
+    # Calculate number of regions to sample evenly
+    my $region_size = 10000; # 10kb regions
+    my $num_regions = int($sample_size / $region_size);
+    
+    # Create evenly distributed bed file for sampling
+    run_cmd("sample_for_genome $genome_file.fai predetect/sample.bed $num_regions $region_size");
+    
+    # Extract sequences
+    run_cmd("seqtk subseq $genome_file predetect/sample.bed > predetect/sample.fa");
+    
+    # Run RepeatMasker with -div 20
+    run_cmd("RepeatMasker -lib ../raw.fa -e rmblast -lcambig -dir predetect " . 
+            "-pa $cpu_threads -q predetect/sample.fa -div 20 > predetect/rm.log 2>&1");
+    
+    # Parse RepeatMasker output to get TE percentage
+    my $te_percentage = 0;
+    if (-e "predetect/sample.fa.tbl") {
+        # Extract total masked bases from tbl file
+        my $tbl_output = `grep "bases masked" predetect/sample.fa.tbl`;
+        print "RepeatMasker output: $tbl_output\n";
+        # Match the actual format: "bases masked: XXXX bp ( XX.XX %)"
+        if ($tbl_output =~ /\(\s*([0-9.]+)\s*%\s*\)/) {
+            $te_percentage = $1;
+            print "Successfully extracted TE percentage: $te_percentage%\n";
+        } else {
+            print "Warning: Could not parse TE percentage from: $tbl_output\n";
+        }
+    } else {
+        print "Warning: RepeatMasker tbl file not found. Using default TE percentage.\n";
+    }
+    
+    return $te_percentage;
+}
+
 sub process_repeat_masker {
-    my ($genome_file, $cpu_threads, $times, $batch_size) = @_;
+    my ($genome_file, $cpu_threads, $times, $batch_size, $te_percentage) = @_;
     
     return if -e "repeat/tmp.fa.tbl";
     
@@ -56,8 +139,9 @@ sub process_repeat_masker {
     
     `mv consensi.fa lib.fa`;
     
+    # Use -div 10 for the main RepeatMasker run (keeping original parameter)
     run_cmd("RepeatMasker -lib lib.fa -e rmblast -lcambig -dir repeat " . 
-            "-pa $cpu_threads -q tmp.fa -div 10 > rm.log 2>&1");
+            "-pa $cpu_threads -q tmp.fa -div 15 > rm.log 2>&1");
 }
 
 sub process_blast_db {
@@ -176,18 +260,18 @@ sub process_masked_file {
 sub create_seq_name_list {
     run_cmd("grep '>' DB.fa | wc -l > seq_name.list");
     open(my $in, '<', 'DB.fa') or die "Can't open DB.fa: $!";
-open(my $out, '>>', 'seq_name.list') or die "Can't open seq_name.list: $!";
+    open(my $out, '>>', 'seq_name.list') or die "Can't open seq_name.list: $!";
 
-my @headers;
-while (<$in>) {
-    if (/^>(.*)/) {
-        push @headers, (split /\s+/, $1)[0];
+    my @headers;
+    while (<$in>) {
+        if (/^>(.*)/) {
+            push @headers, (split /\s+/, $1)[0];
+        }
     }
-}
-print $out "$_\n" for sort @headers;
+    print $out "$_\n" for sort @headers;
 
-close $in;
-close $out;
+    close $in;
+    close $out;
 }
 
 sub create_symlinks {

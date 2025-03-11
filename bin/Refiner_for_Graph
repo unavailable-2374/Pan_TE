@@ -11,16 +11,112 @@ import json
 import logging
 from collections import defaultdict, Counter
 from io import StringIO
+import re
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Set, Optional
 
 import numpy as np
-from Bio import SeqIO
+from Bio import SeqIO, AlignIO, Phylo
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
+from Bio.Align import MultipleSeqAlignment
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# IUPAC ambiguity codes for DNA
+IUPAC_CODES = {
+    frozenset(['A']): 'A',
+    frozenset(['C']): 'C',
+    frozenset(['G']): 'G',
+    frozenset(['T']): 'T',
+    frozenset(['A', 'G']): 'R',
+    frozenset(['C', 'T']): 'Y',
+    frozenset(['G', 'C']): 'S',
+    frozenset(['A', 'T']): 'W',
+    frozenset(['G', 'T']): 'K',
+    frozenset(['A', 'C']): 'M',
+    frozenset(['C', 'G', 'T']): 'B',
+    frozenset(['A', 'G', 'T']): 'D',
+    frozenset(['A', 'C', 'T']): 'H',
+    frozenset(['A', 'C', 'G']): 'V',
+    frozenset(['A', 'C', 'G', 'T']): 'N',
+}
+
+# Reverse lookup of IUPAC codes
+IUPAC_REVERSE = {
+    'A': ['A'],
+    'C': ['C'],
+    'G': ['G'],
+    'T': ['T'],
+    'R': ['A', 'G'],
+    'Y': ['C', 'T'],
+    'S': ['G', 'C'],
+    'W': ['A', 'T'],
+    'K': ['G', 'T'],
+    'M': ['A', 'C'],
+    'B': ['C', 'G', 'T'],
+    'D': ['A', 'G', 'T'],
+    'H': ['A', 'C', 'T'],
+    'V': ['A', 'C', 'G'],
+    'N': ['A', 'C', 'G', 'T'],
+}
+
+@dataclass
+class PositionStats:
+    """存储单个位点的统计信息"""
+    base_counts: Dict[str, int]  # 每个碱基的计数
+    entropy: float               # 多样性度量  
+    gap_freq: float              # 间隙频率
+    consensus: str               # 共识碱基
+    
+    @classmethod
+    def from_column(cls, column):
+        """从比对的单列创建位点统计"""
+        bases = [b.upper() for b in column if b != '-']
+        total = len(column)
+        base_counts = Counter(bases)
+        
+        # 计算间隙频率
+        gap_count = column.count('-')
+        gap_freq = gap_count / total if total > 0 else 0
+        
+        # 如果全是间隙，返回间隙
+        if gap_freq == 1.0:
+            return cls(base_counts, 0.0, gap_freq, '-')
+            
+        # 计算熵(多样性)
+        entropy = 0.0
+        if bases:
+            probs = [count / len(bases) for count in base_counts.values()]
+            for p in probs:
+                if p > 0:
+                    entropy -= p * np.log2(p)
+                    
+        # 确定共识碱基 - 使用 IUPAC 表示
+        if base_counts:
+            # 如果一个碱基出现频率超过 70%，使用该碱基
+            most_common = base_counts.most_common(1)[0]
+            if most_common[1] / len(bases) >= 0.7:
+                consensus = most_common[0]
+            else:
+                # 否则，找出所有频率 >= 20% 的碱基
+                significant_bases = frozenset(
+                    base for base, count in base_counts.items() 
+                    if count / len(bases) >= 0.2
+                )
+                if significant_bases:
+                    consensus = IUPAC_CODES.get(significant_bases, 'N')
+                else:
+                    consensus = 'N'
+        else:
+            consensus = '-'
+            
+        return cls(base_counts, entropy, gap_freq, consensus)
 
 
 class RMBlastAlignment:
@@ -37,10 +133,115 @@ class RMBlastAlignment:
         self.orientation = orientation
 
 
+class EnhancedConsensus:
+    """增强型共识序列，包含位点频率和变异信息"""
+    
+    def __init__(self, seq_id, consensus_seq, position_stats=None, 
+                 entropy=None, conservation_blocks=None, alignment=None):
+        self.seq_id = seq_id
+        self.consensus_seq = consensus_seq
+        self.position_stats = position_stats or []
+        self.entropy = entropy or []
+        self.conservation_blocks = conservation_blocks or []
+        self.alignment = alignment
+        
+    def to_seqrecord(self):
+        """转换为 Bio.SeqRecord 对象"""
+        desc_parts = []
+        
+        # 添加保守区块信息
+        if self.conservation_blocks:
+            block_info = []
+            for start, end, cons in self.conservation_blocks:
+                block_info.append(f"{start}-{end}:{cons:.2f}")
+            desc_parts.append(f"conserved_blocks={','.join(block_info)}")
+            
+        # 添加平均熵
+        if self.entropy:
+            mean_entropy = sum(self.entropy) / len(self.entropy) if self.entropy else 0
+            desc_parts.append(f"mean_entropy={mean_entropy:.4f}")
+            
+        description = " ".join(desc_parts) if desc_parts else ""
+        
+        return SeqRecord(
+            Seq(self.consensus_seq),
+            id=self.seq_id,
+            description=description
+        )
+    
+    def to_detailed_seqrecord(self):
+        """转换为详细的 SeqRecord，包含位点注释"""
+        record = self.to_seqrecord()
+        
+        # 每20个位点添加一个位点注释行
+        annotations = []
+        for i in range(0, len(self.position_stats), 20):
+            block = self.position_stats[i:i+20]
+            annotation_line = []
+            for pos in block:
+                if pos.entropy > 0.5:  # 高变异位点
+                    annotation_line.append('*')
+                else:
+                    annotation_line.append(' ')
+            annotations.append(''.join(annotation_line))
+            
+        # 添加到 record 的注释中
+        record.annotations['site_annotations'] = annotations
+        
+        return record
+        
+    def generate_logo_plot(self, output_file):
+        """生成序列 logo 可视化"""
+        try:
+            import logomaker
+            import pandas as pd
+            
+            # 准备数据
+            data = []
+            for i, stats in enumerate(self.position_stats):
+                if stats.consensus == '-':
+                    continue
+                    
+                row = {'A': 0, 'C': 0, 'G': 0, 'T': 0, 'position': i+1}
+                total = sum(stats.base_counts.values())
+                
+                if total > 0:
+                    for base, count in stats.base_counts.items():
+                        if base in 'ACGT':
+                            row[base] = count / total
+                
+                data.append(row)
+                
+            if not data:
+                logger.warning("No valid data for sequence logo generation")
+                return
+                
+            # 创建 DataFrame
+            matrix = pd.DataFrame(data)
+            matrix = matrix.set_index('position')
+            
+            # 生成 logo
+            plt.figure(figsize=(10, 3))
+            logo = logomaker.Logo(matrix, color_scheme='classic')
+            logo.style_spines(visible=False)
+            logo.ax.set_ylabel('Frequency')
+            logo.ax.set_xlabel('Position')
+            
+            plt.tight_layout()
+            plt.savefig(output_file, dpi=300)
+            plt.close()
+            
+        except ImportError:
+            logger.warning("Logomaker or pandas not available. Skipping logo generation.")
+
+
 class SequenceClusterer:
-    def __init__(self, te_builder, distance_threshold=0.7):
+    def __init__(self, te_builder, distance_threshold=0.7, 
+                 max_cluster_size=50, subclustering_threshold=0.4):
         self.te_builder = te_builder
         self.distance_threshold = distance_threshold
+        self.max_cluster_size = max_cluster_size
+        self.subclustering_threshold = subclustering_threshold
 
     def calculate_distance_matrix(self, sequences):
         n_seqs = len(sequences)
@@ -79,7 +280,6 @@ class SequenceClusterer:
 
         finally:
             try:
-                os.remove(temp_name)
                 for ext in ['.nin', '.nsq', '.nhr']:
                     db_file = temp_name + ext
                     if os.path.exists(db_file):
@@ -87,12 +287,49 @@ class SequenceClusterer:
             except OSError as e:
                 logger.warning(f"Error cleaning up temporary files: {e}")
 
+    def visualize_distance_matrix(self, distances, sequences, output_file):
+        """可视化距离矩阵"""
+        try:
+            n_seqs = len(sequences)
+            fig, ax = plt.subplots(figsize=(10, 8))
+            
+            # 创建自定义颜色映射 - 从蓝色(相似)到红色(不同)
+            cmap = LinearSegmentedColormap.from_list('custom_cmap', ['blue', 'white', 'red'])
+            
+            im = ax.imshow(distances, cmap=cmap, vmin=0, vmax=1)
+            plt.colorbar(im, ax=ax, label='Distance')
+            
+            # 标注轴
+            if n_seqs <= 30:  # 只有较少序列时才添加标签
+                ax.set_xticks(np.arange(n_seqs))
+                ax.set_yticks(np.arange(n_seqs))
+                
+                # 截断长ID以适应图表
+                labels = [seq.id[:15] + '...' if len(seq.id) > 15 else seq.id 
+                         for seq in sequences]
+                
+                ax.set_xticklabels(labels, rotation=90, fontsize=8)
+                ax.set_yticklabels(labels, fontsize=8)
+            
+            plt.title('Sequence Distance Matrix')
+            plt.tight_layout()
+            plt.savefig(output_file, dpi=300)
+            plt.close()
+            
+        except Exception as e:
+            logger.warning(f"Error visualizing distance matrix: {e}")
+
     def cluster_sequences(self, sequences):
         if len(sequences) == 1:
             return [[sequences[0]]]
 
         logger.info("Calculating distance matrix...")
         distances = self.calculate_distance_matrix(sequences)
+        
+        # 可视化距离矩阵
+        matrix_viz = os.path.join(self.te_builder.temp_dir, "distance_matrix.png")
+        self.visualize_distance_matrix(distances, sequences, matrix_viz)
+        logger.info(f"Distance matrix visualization saved to {matrix_viz}")
 
         logger.info("Performing hierarchical clustering...")
         try:
@@ -101,21 +338,76 @@ class SequenceClusterer:
             linkage_matrix = linkage(condensed_distances, method='average')
             clusters = fcluster(linkage_matrix, t=self.distance_threshold, criterion='distance')
 
+            # 分配序列到聚类
             cluster_dict = defaultdict(list)
             for seq, cluster_id in zip(sequences, clusters):
                 cluster_dict[cluster_id].append(seq)
+                
+            # 检查大聚类并拆分
+            final_clusters = []
+            for cluster_id, cluster_seqs in cluster_dict.items():
+                if len(cluster_seqs) > self.max_cluster_size:
+                    logger.info(f"Large cluster detected with {len(cluster_seqs)} sequences. Attempting to split.")
+                    # 尝试用更严格的阈值拆分
+                    subclusters = self.split_large_cluster(cluster_seqs)
+                    final_clusters.extend(subclusters)
+                else:
+                    final_clusters.append(cluster_seqs)
 
-            return list(cluster_dict.values())
+            return final_clusters
 
         except Exception as e:
             logger.error(f"Clustering error: {str(e)}")
             logger.error(f"Distance matrix stats - min: {distances.min()}, max: {distances.max()}, mean: {distances.mean()}")
             raise
+            
+    def split_large_cluster(self, sequences):
+        """尝试拆分大聚类，使用进化树方法"""
+        logger.info(f"Splitting large cluster with {len(sequences)} sequences")
+        
+        # 方法1: 使用更严格的层次聚类阈值
+        try:
+            distances = self.calculate_distance_matrix(sequences)
+            condensed_distances = squareform(distances)
+            linkage_matrix = linkage(condensed_distances, method='average')
+            
+            # 尝试递减阈值，直到获得合理大小的聚类
+            thresholds = [self.subclustering_threshold, 0.3, 0.2, 0.1]
+            for threshold in thresholds:
+                subclusters = fcluster(linkage_matrix, t=threshold, criterion='distance')
+                subcluster_dict = defaultdict(list)
+                
+                for seq, cluster_id in zip(sequences, subclusters):
+                    subcluster_dict[cluster_id].append(seq)
+                    
+                # 检查最大聚类大小
+                max_size = max(len(seqs) for seqs in subcluster_dict.values())
+                n_clusters = len(subcluster_dict)
+                
+                logger.info(f"Threshold {threshold}: {n_clusters} clusters, max size {max_size}")
+                
+                if max_size <= self.max_cluster_size or n_clusters >= 2:
+                    logger.info(f"Successfully split into {n_clusters} subclusters")
+                    return list(subcluster_dict.values())
+        
+        except Exception as e:
+            logger.warning(f"Failed to split using hierarchical clustering: {e}")
+            
+        # 方法2: 如果层次聚类失败，尝试随机抽样
+        if len(sequences) > self.max_cluster_size:
+            logger.warning(f"Could not split cluster effectively. Using random sampling to create manageable clusters.")
+            random.shuffle(sequences)
+            return [sequences[i:i+self.max_cluster_size] 
+                    for i in range(0, len(sequences), self.max_cluster_size)]
+        
+        return [sequences]
 
 
 class TEConsensusBuilder:
     def __init__(self, rmblast_dir, makeblastdb_path, matrix_path,
-                 min_score=150, gap_init=20, gap_ext=5, threads=None):
+                 min_score=150, gap_init=20, gap_ext=5, threads=None,
+                 entropy_threshold=0.4, min_conserved_block=15,
+                 use_iupac=True, keep_variants=True):
         self.rmblast_path = os.path.join(rmblast_dir, "rmblastn")
         self.makeblastdb_path = makeblastdb_path
         self.matrix_path = matrix_path
@@ -124,11 +416,20 @@ class TEConsensusBuilder:
         self.gap_ext = gap_ext
         self.threads = threads or 1
         self.temp_dir = None
+        self.entropy_threshold = entropy_threshold
+        self.min_conserved_block = min_conserved_block
+        self.use_iupac = use_iupac
+        self.keep_variants = keep_variants
 
         # 检查 MAFFT 是否存在，并获得其路径
         self.mafft_path = shutil.which("mafft")
         if not self.mafft_path:
             raise FileNotFoundError("mafft not found in system PATH")
+            
+        # 检查是否可以使用 FastTree
+        self.fasttree_path = shutil.which("fasttree")
+        if not self.fasttree_path:
+            logger.warning("FastTree not found. Phylogenetic methods will be limited.")
 
     def prepare_blast_db(self, fasta_file):
         cmd = [
@@ -222,22 +523,80 @@ class TEConsensusBuilder:
         finally:
             os.chdir(current_dir)
 
-    def build_multiple_alignment(self, sequences, reference=None):
+    def build_multiple_alignment(self, sequences, reference=None, generate_tree=True):
         """
         利用 MAFFT 对聚类内所有序列进行全局多序列比对，返回比对后的序列列表
+        增强版可以选择代表序列作为参考，并可选择生成进化树
         """
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".fa", dir=self.temp_dir) as temp_in:
-            SeqIO.write(sequences, temp_in, "fasta")
+            # 如果指定了参考序列，将其放在第一位
+            if reference is not None:
+                SeqIO.write([reference] + [s for s in sequences if s.id != reference.id], temp_in, "fasta")
+            else:
+                SeqIO.write(sequences, temp_in, "fasta")
             temp_in_name = temp_in.name
 
+        alignment_file = temp_in_name + ".aln"
+        tree_file = temp_in_name + ".tree"
+
         try:
-            cmd = [self.mafft_path, "--auto", "--thread", str(self.threads), temp_in_name]
+            # 运行 MAFFT 进行多序列比对
+            if reference is not None:
+                # 使用 --add 选项，以保持参考序列不变
+                cmd = [
+                    self.mafft_path, 
+                    "--retree", "2",
+                    "--maxiterate", "1000",
+                    "--localpair",
+                    "--thread", str(self.threads),
+                    temp_in_name
+                ]
+            else:
+                cmd = [self.mafft_path, "--auto", "--thread", str(self.threads), temp_in_name]
+                
             logger.info("Running MAFFT for multiple sequence alignment: " + " ".join(cmd))
             result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            
+            # 保存比对结果
+            with open(alignment_file, "w") as f:
+                f.write(result.stdout)
+                
+            # 从结果中解析对齐序列
             aligned_output = result.stdout
-
-            aligned_seqs = list(SeqIO.parse(StringIO(aligned_output), "fasta"))
-            return [str(record.seq) for record in aligned_seqs]
+            alignment = AlignIO.read(StringIO(aligned_output), "fasta")
+            
+            # 如果请求，生成进化树
+            if generate_tree and self.fasttree_path and len(sequences) >= 3:
+                try:
+                    # 运行 FastTree 生成进化树
+                    tree_cmd = [
+                        self.fasttree_path,
+                        "-nt", # 核酸序列
+                        "-gtr", # 通用时间可逆模型
+                        "-gamma", # Gamma分布模型
+                    ]
+                    
+                    logger.info("Generating phylogenetic tree with FastTree")
+                    tree_process = subprocess.Popen(
+                        tree_cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True
+                    )
+                    
+                    tree_stdout, tree_stderr = tree_process.communicate(input=aligned_output)
+                    
+                    if tree_process.returncode == 0:
+                        with open(tree_file, "w") as f:
+                            f.write(tree_stdout)
+                        logger.info(f"Phylogenetic tree saved to {tree_file}")
+                    else:
+                        logger.warning(f"FastTree error: {tree_stderr}")
+                except Exception as e:
+                    logger.warning(f"Error generating phylogenetic tree: {e}")
+            
+            return alignment, alignment_file, tree_file if os.path.exists(tree_file) else None
 
         except subprocess.CalledProcessError as e:
             logger.error(f"MAFFT failed: {e.stderr}")
@@ -246,22 +605,163 @@ class TEConsensusBuilder:
         finally:
             os.remove(temp_in_name)
 
-    def build_consensus(self, aligned_sequences):
-        if not aligned_sequences:
-            return ""
-
-        seq_length = len(aligned_sequences[0])
-        consensus = []
-
-        for i in range(seq_length):
-            column = [seq[i] for seq in aligned_sequences if i < len(seq)]
-            base_counts = Counter(b for b in column if b != '-')
-            if base_counts:
-                consensus.append(base_counts.most_common(1)[0][0])
+    def analyze_alignment(self, alignment):
+        """分析多序列比对结果，计算位点统计和保守区块"""
+        if not alignment:
+            return [], [], []
+            
+        # 计算每个位点的统计信息
+        position_stats = []
+        for i in range(alignment.get_alignment_length()):
+            column = alignment[:, i]
+            stats = PositionStats.from_column(column)
+            position_stats.append(stats)
+            
+        # 计算位点熵
+        entropy = [stats.entropy for stats in position_stats]
+        
+        # 识别保守区块
+        conservation_blocks = []
+        current_block = None
+        
+        for i, stats in enumerate(position_stats):
+            if stats.entropy < self.entropy_threshold and stats.gap_freq < 0.2:
+                # 保守位点
+                if current_block is None:
+                    # 开始新块
+                    current_block = [i, i, 1.0 - stats.entropy]
+                else:
+                    # 继续现有块
+                    current_block[1] = i
+                    current_block[2] = (current_block[2] * (i - current_block[0]) + (1.0 - stats.entropy)) / ((i - current_block[0]) + 1)
             else:
-                consensus.append('-')
+                # 非保守位点
+                if current_block is not None:
+                    # 如果块足够长，保存它
+                    if current_block[1] - current_block[0] + 1 >= self.min_conserved_block:
+                        conservation_blocks.append(tuple(current_block))
+                    current_block = None
+                    
+        # 检查最后一个块
+        if current_block is not None and current_block[1] - current_block[0] + 1 >= self.min_conserved_block:
+            conservation_blocks.append(tuple(current_block))
+            
+        return position_stats, entropy, conservation_blocks
 
-        return ''.join(consensus).replace('-', '')
+    def build_enhanced_consensus(self, alignment, seq_id, reference_idx=None):
+        """构建增强型共识序列，包含位点频率和变异信息"""
+        if not alignment:
+            return EnhancedConsensus(seq_id, "")
+            
+        # 分析比对
+        position_stats, entropy, conservation_blocks = self.analyze_alignment(alignment)
+        
+        # 构建共识序列
+        consensus_seq = []
+        
+        for i, stats in enumerate(position_stats):
+            if stats.gap_freq > 0.5:  # 大多数为间隙
+                consensus_seq.append("")  # 不添加任何字符
+            else:
+                if self.use_iupac:
+                    consensus_seq.append(stats.consensus)
+                else:
+                    if stats.base_counts:
+                        most_common = stats.base_counts.most_common(1)[0][0]
+                        consensus_seq.append(most_common)
+                    else:
+                        consensus_seq.append("N")
+        
+        consensus_seq = "".join(consensus_seq)
+        
+        # 创建增强型共识对象
+        enhanced_consensus = EnhancedConsensus(
+            seq_id=seq_id,
+            consensus_seq=consensus_seq,
+            position_stats=position_stats,
+            entropy=entropy,
+            conservation_blocks=conservation_blocks,
+            alignment=alignment
+        )
+        
+        return enhanced_consensus
+
+    def select_representative_variants(self, sequences, alignment, tree_file=None, max_variants=3):
+        """从聚类中选择代表性变体"""
+        if len(sequences) <= 1:
+            return sequences
+            
+        if len(sequences) <= max_variants:
+            return sequences
+            
+        # 尝试基于系统发育树选择变体
+        if tree_file and os.path.exists(tree_file):
+            try:
+                # 使用 Phylo 读取树
+                tree = Phylo.read(tree_file, "newick")
+                
+                # 获取最深的分支
+                depths = {}
+                for clade in tree.find_clades():
+                    if clade.name:
+                        depths[clade.name] = tree.distance(tree.root, clade)
+                
+                # 选择不同分支的代表
+                variants = []
+                seq_by_id = {seq.id: seq for seq in sequences}
+                
+                # 按深度排序并选择前几个
+                sorted_seqs = sorted(depths.items(), key=lambda x: x[1], reverse=True)
+                for name, _ in sorted_seqs[:max_variants]:
+                    if name in seq_by_id:
+                        variants.append(seq_by_id[name])
+                
+                if variants:
+                    logger.info(f"Selected {len(variants)} phylogenetic variants")
+                    return variants
+                    
+            except Exception as e:
+                logger.warning(f"Error selecting variants from phylogenetic tree: {e}")
+        
+        # 备选方法: 基于序列长度和变异
+        try:
+            # 计算每个序列的特征
+            seq_features = []
+            avg_len = sum(len(seq.seq) for seq in sequences) / len(sequences)
+            
+            for i, seq in enumerate(sequences):
+                # 长度偏差
+                len_dev = abs(len(seq.seq) - avg_len) / avg_len if avg_len > 0 else 0
+                
+                # 序列变异性
+                n_count = str(seq.seq).upper().count('N')
+                n_ratio = n_count / len(seq.seq) if len(seq.seq) > 0 else 0
+                
+                seq_features.append((seq, len_dev, n_ratio, i))
+            
+            # 选择一个接近平均长度的序列
+            seq_features.sort(key=lambda x: x[1])  # 按长度偏差排序
+            variants = [seq_features[0][0]]
+            
+            # 再选择几个最不同的序列
+            if len(seq_features) > 1:
+                # 先移除已选序列
+                remaining = seq_features[1:]
+                
+                # 基于N含量和长度偏差选择不同的序列
+                remaining.sort(key=lambda x: (-x[2], x[1]))  # N率低且长度不同
+                
+                for i in range(min(max_variants-1, len(remaining))):
+                    variants.append(remaining[i][0])
+            
+            logger.info(f"Selected {len(variants)} feature-based variants")
+            return variants
+            
+        except Exception as e:
+            logger.warning(f"Error selecting variants based on features: {e}")
+            
+        # 最保守的方法：随机选择
+        return random.sample(sequences, min(max_variants, len(sequences)))
 
     def mash_precluster(self, sequences, mash_threshold=0.1):
         temp_fa = None
@@ -429,7 +929,7 @@ class TEConsensusBuilder:
         refined_clusters = clusterer.cluster_sequences(preclustered_sequences)
         return refined_clusters
 
-    def build_clustered_consensus(self, input_file, output_file):
+    def build_clustered_consensus(self, input_file, output_file, stats_file=None, details_dir=None):
         original_dir = os.getcwd()
         try:
             input_path = os.path.abspath(input_file)
@@ -442,6 +942,14 @@ class TEConsensusBuilder:
             os.makedirs(self.temp_dir, exist_ok=True)
             os.chdir(self.temp_dir)
             logger.info(f"Created temporary directory: {self.temp_dir}")
+            
+            # 创建详细信息目录
+            if details_dir:
+                details_path = os.path.abspath(details_dir)
+                os.makedirs(details_path, exist_ok=True)
+            else:
+                details_path = os.path.join(output_dir, "cluster_details")
+                os.makedirs(details_path, exist_ok=True)
 
             logger.info(f"Reading sequences from: {input_path}")
             sequences = list(SeqIO.parse(input_path, "fasta"))
@@ -450,7 +958,7 @@ class TEConsensusBuilder:
             logger.info(f"Read {len(sequences)} sequences")
 
             if any(len(seq.seq) > 40000 for seq in sequences):
-                logger.info("Long sequences (>50k) detected; using k-mer (Mash) pre-clustering.")
+                logger.info("Long sequences (>40k) detected; using k-mer (Mash) pre-clustering.")
                 clusters = self.mash_precluster(sequences)
             elif os.path.getsize(input_path) > 2 * 1024 * 1024:
                 logger.info("Large input file detected; using hybrid clustering strategy with cd-hit-est pre-clustering.")
@@ -463,36 +971,115 @@ class TEConsensusBuilder:
             logger.info(f"Found {len(clusters)} clusters")
 
             consensus_records = []
+            variant_records = []
+            cluster_stats = []
+            
             for i, cluster in enumerate(clusters, 1):
+                cluster_id = f"{os.path.splitext(os.path.basename(input_file))[0]}_cluster_{i}"
                 logger.info(f"Processing cluster {i} with {len(cluster)} sequences")
+                
                 if len(cluster) == 1:
+                    # 单序列聚类
                     consensus_seq = str(cluster[0].seq)
                     consensus_desc = f"single sequence from cluster {i}"
+                    consensus_record = SeqRecord(
+                        Seq(consensus_seq),
+                        id=cluster_id,
+                        description=consensus_desc
+                    )
+                    consensus_records.append(consensus_record)
+                    
+                    # 单序列不需要变体
+                    cluster_stats.append({
+                        "cluster_id": cluster_id,
+                        "size": 1,
+                        "mean_length": len(consensus_seq),
+                        "is_single": True,
+                        "conserved_blocks": 0
+                    })
+                    
                 else:
-                    aligned_seqs = self.build_multiple_alignment(cluster)
-                    consensus_seq = self.build_consensus(aligned_seqs)
-                    consensus_desc = f"consensus from {len(cluster)} sequences in cluster {i}"
-                consensus_record = SeqRecord(
-                    Seq(consensus_seq),
-                    id=f"{os.path.splitext(os.path.basename(input_file))[0]}_cluster_{i}",
-                    description=consensus_desc
-                )
-                consensus_records.append(consensus_record)
-
-            SeqIO.write(consensus_records, output_path, "fasta")
-            logger.info(f"Written {len(consensus_records)} consensus sequences to {output_path}")
-
-            stats_file = f"{output_path}.stats"
-            with open(stats_file, "w") as f:
+                    # 多序列聚类
+                    # 1. 多序列比对
+                    alignment, aln_file, tree_file = self.build_multiple_alignment(cluster)
+                    
+                    # 保存比对文件以供参考
+                    cluster_aln_file = os.path.join(details_path, f"{cluster_id}_alignment.fa")
+                    shutil.copy(aln_file, cluster_aln_file)
+                    
+                    # 2. 构建增强型共识序列
+                    enhanced_consensus = self.build_enhanced_consensus(alignment, cluster_id)
+                    
+                    # 3. 生成序列logo
+                    logo_file = os.path.join(details_path, f"{cluster_id}_logo.png")
+                    enhanced_consensus.generate_logo_plot(logo_file)
+                    
+                    # 4. 添加到结果
+                    consensus_records.append(enhanced_consensus.to_seqrecord())
+                    
+                    # 5. 如果需要，选择代表性变体
+                    if self.keep_variants:
+                        variants = self.select_representative_variants(
+                            cluster, alignment, tree_file, max_variants=min(3, len(cluster))
+                        )
+                        
+                        for j, var in enumerate(variants, 1):
+                            var_id = f"{cluster_id}_variant_{j}"
+                            var_record = SeqRecord(
+                                var.seq,
+                                id=var_id,
+                                description=f"representative variant {j} from cluster {i}"
+                            )
+                            variant_records.append(var_record)
+                    
+                    # 6. 收集统计信息
+                    cluster_stats.append({
+                        "cluster_id": cluster_id,
+                        "size": len(cluster),
+                        "mean_length": len(enhanced_consensus.consensus_seq),
+                        "is_single": False,
+                        "conserved_blocks": len(enhanced_consensus.conservation_blocks),
+                        "mean_entropy": sum(enhanced_consensus.entropy) / len(enhanced_consensus.entropy) if enhanced_consensus.entropy else 0
+                    })
+            
+            # 写入结果
+            all_records = consensus_records + variant_records
+            SeqIO.write(all_records, output_path, "fasta")
+            logger.info(f"Written {len(all_records)} sequences to {output_path}")
+            
+            # 写入统计信息
+            stats_output = stats_file or f"{output_path}.stats"
+            with open(stats_output, "w") as f:
                 f.write(f"Original sequences: {len(sequences)}\n")
-                f.write(f"Number of clusters: {len(clusters)}\n")
-                for i, cluster in enumerate(clusters, 1):
-                    f.write(f"Cluster {i} size: {len(cluster)}\n")
-            logger.info(f"Written statistics to {stats_file}")
+                f.write(f"Number of clusters: {len(clusters)}\n\n")
+                
+                f.write("Cluster statistics:\n")
+                for stat in cluster_stats:
+                    f.write(f"Cluster {stat['cluster_id']}:\n")
+                    f.write(f"  Size: {stat['size']}\n")
+                    f.write(f"  Mean length: {stat['mean_length']}\n")
+                    
+                    if not stat['is_single']:
+                        f.write(f"  Conserved blocks: {stat['conserved_blocks']}\n")
+                        f.write(f"  Mean entropy: {stat['mean_entropy']:.4f}\n")
+                    f.write("\n")
+                    
+            logger.info(f"Written statistics to {stats_output}")
+
+            return {
+                "consensus_file": output_path,
+                "stats_file": stats_output,
+                "details_dir": details_path,
+                "num_clusters": len(clusters),
+                "num_sequences": len(all_records)
+            }
 
         except Exception as e:
             logger.error(f"Error in consensus building: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             raise
+            
         finally:
             os.chdir(original_dir)
             if self.temp_dir and os.path.exists(self.temp_dir):
@@ -578,9 +1165,7 @@ class Config:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Build consensus sequences for clustered transposable element families using RMBlast for clustering and MAFFT for multiple sequence alignment. '
-                    'When sequences longer than 50k exist, a k-mer (Mash) pre-clustering is applied first, followed by RMBlast-based fine clustering; '
-                    'otherwise, a hybrid clustering (using cd-hit-est pre-clustering) or standard RMBlast-based clustering is used based on input file size.')
+        description='Enhanced Refiner_for_Graph: Build consensus sequences for TE families with improved information retention and evolutionary awareness.')
     parser.add_argument('input', help='Input FASTA file')
     parser.add_argument('output', help='Output FASTA file')
     parser.add_argument('-t', '--threads', type=int,
@@ -593,6 +1178,18 @@ if __name__ == "__main__":
                         help='Gap extension penalty (default: 5)')
     parser.add_argument('--distance-threshold', type=float, default=0.7,
                         help='Distance threshold for clustering (default: 0.7)')
+    parser.add_argument('--entropy-threshold', type=float, default=0.4,
+                        help='Entropy threshold for conserved positions (default: 0.4)')
+    parser.add_argument('--min-conserved-block', type=int, default=15,
+                        help='Minimum length for conserved blocks (default: 15)')
+    parser.add_argument('--max-cluster-size', type=int, default=50,
+                        help='Maximum cluster size before splitting (default: 50)')
+    parser.add_argument('--use-iupac', action='store_true', default=True,
+                        help='Use IUPAC ambiguity codes for variable positions')
+    parser.add_argument('--keep-variants', action='store_true', default=True,
+                        help='Keep representative variants from each cluster')
+    parser.add_argument('--details-dir', type=str,
+                        help='Directory to store detailed information for each cluster')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Enable verbose logging')
 
@@ -611,11 +1208,35 @@ if __name__ == "__main__":
             min_score=args.min_score,
             gap_init=args.gap_init,
             gap_ext=args.gap_ext,
-            threads=args.threads
+            threads=args.threads,
+            entropy_threshold=args.entropy_threshold,
+            min_conserved_block=args.min_conserved_block,
+            use_iupac=args.use_iupac,
+            keep_variants=args.keep_variants
         )
-        builder.build_clustered_consensus(args.input, args.output)
+        
+        # 创建SequenceClusterer并设置最大聚类大小
+        clusterer = SequenceClusterer(
+            builder,
+            distance_threshold=args.distance_threshold,
+            max_cluster_size=args.max_cluster_size,
+            subclustering_threshold=args.distance_threshold * 0.6  # 更严格的二级聚类阈值
+        )
+        
+        result = builder.build_clustered_consensus(
+            args.input, 
+            args.output,
+            details_dir=args.details_dir
+        )
+        
+        logger.info(f"Process completed successfully.")
+        logger.info(f"Generated {result['num_clusters']} clusters and {result['num_sequences']} sequences.")
+        logger.info(f"Results saved to {result['consensus_file']}")
+        logger.info(f"Statistics saved to {result['stats_file']}")
+        logger.info(f"Detailed information saved to {result['details_dir']}")
 
     except Exception as e:
-        logger.error(f"Error details: {str(e)}")
+        logger.error(f"Error: {str(e)}")
+        import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
         sys.exit(1)
