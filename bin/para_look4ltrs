@@ -149,7 +149,7 @@ system($cmdString) == 0 or die "Failed to execute: $cmdString\n";
 $cmdString = "LTR_Boundary_Optimizer.py consensi.fa ../genome/genome.fa output_dir --threads 32 --min-identity 85 --chimera-threshold 0.4";
 system($cmdString) == 0 or die "Failed to execute: $cmdString\n";
 
-`cp output_dir
+`cp output_dir/optimized_consensus.fa consensi.fa`;
 
 sub process_sequence {
     my ($header, $seq) = @_;
