@@ -136,7 +136,7 @@ if (! -e "$current_dir/LTR.fa") {
         or die "Failed to clean genome.bed\n";
     system("seqtk subseq $fasta_file $current_dir/genome.cleaned.bed > $current_dir/tmp.fa") == 0
         or die "Failed to extract LTR sequences\n";
-    system("seqkit grep -v -i -p 'N' $current_dir/tmp.fa > $current_dir/LTR.fa") == 0
+    system("sed 's:N::g' $current_dir/tmp.fa > $current_dir/LTR.fa") == 0
         or die "Failed to extract LTR sequences\n";
 }
 
@@ -145,6 +145,11 @@ system("filter-stage-1.prl LTR.fa > LTR.fa.filter 2>> look4ltr.log") == 0
 
 $cmdString = "Refiner_for_LTR LTR.fa.filter ./ --threads $ARGV[1] > refine.log 2> refine.err";
 system($cmdString) == 0 or die "Failed to execute: $cmdString\n";
+
+$cmdString = "LTR_Boundary_Optimizer.py consensi.fa ../genome/genome.fa output_dir --threads 32 --min-identity 85 --chimera-threshold 0.4";
+system($cmdString) == 0 or die "Failed to execute: $cmdString\n";
+
+`cp output_dir
 
 sub process_sequence {
     my ($header, $seq) = @_;

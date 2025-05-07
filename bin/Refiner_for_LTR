@@ -17,9 +17,16 @@ from concurrent.futures import ThreadPoolExecutor
 import shutil
 from tqdm import tqdm
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
+# Removed matplotlib imports
 import pandas as pd
+
+# Add compatibility layer for np.bool deprecation
+if hasattr(np, 'bool'):
+    # For backwards compatibility with code that might use np.bool
+    pass
+else:
+    # Create alias for backward compatibility
+    np.bool = np.bool_
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,22 +40,22 @@ class FastClusteringPipeline:
                  keep_variants=True, store_iterations=True,
                  use_iupac=True):
         """
-        使用高性能聚类方法处理大型序列数据集，优化信息保留和进化感知
+        Process large sequence datasets using high-performance clustering methods, optimizing information retention and evolutionary awareness
         
-        参数:
-            input_fasta (str): 输入FASTA文件路径
-            output_dir (str): 输出目录路径
-            cluster_method (str): 聚类方法 (minimap2/mmseqs/vsearch)
-            threads (int): 线程数
-            identity_threshold (float): 相似度阈值 (0-1)
-            coverage_threshold (float): 覆盖率阈值 (0-1)
-            cleanup_temp (bool): 是否清理临时文件
-            max_iterations (int): 最大迭代次数
-            convergence_threshold (float): 收敛阈值，当序列数变化率低于此值时停止迭代
-            max_cluster_size (int): 最大聚类大小，超过此值会尝试拆分
-            keep_variants (bool): 是否保留亚家族代表变体
-            store_iterations (bool): 是否保存中间迭代结果
-            use_iupac (bool): 使用 IUPAC 模糊碱基表示变异位点
+        Parameters:
+            input_fasta (str): Input FASTA file path
+            output_dir (str): Output directory path
+            cluster_method (str): Clustering method (minimap2/mmseqs/vsearch)
+            threads (int): Number of threads
+            identity_threshold (float): Similarity threshold (0-1)
+            coverage_threshold (float): Coverage threshold (0-1)
+            cleanup_temp (bool): Whether to clean up temporary files
+            max_iterations (int): Maximum number of iterations
+            convergence_threshold (float): Convergence threshold, stop iterations when sequence count change rate is below this value
+            max_cluster_size (int): Maximum cluster size, clusters larger than this will be split
+            keep_variants (bool): Whether to keep subfamily representative variants
+            store_iterations (bool): Whether to save intermediate iteration results
+            use_iupac (bool): Use IUPAC ambiguous bases to represent variant sites
         """
         self.input_fasta = input_fasta
         self.output_dir = output_dir
@@ -64,27 +71,27 @@ class FastClusteringPipeline:
         self.store_iterations = store_iterations
         self.use_iupac = use_iupac
         
-        # 创建输出目录
+        # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # 创建临时目录
+        # Create temporary directory
         self.temp_dir = os.path.join(output_dir, "temp")
         os.makedirs(self.temp_dir, exist_ok=True)
         
-        # 如果需要，创建迭代结果目录
+        # Create iteration results directory if needed
         if self.store_iterations:
             self.iterations_dir = os.path.join(output_dir, "iterations")
             os.makedirs(self.iterations_dir, exist_ok=True)
             
-        # 创建详细信息目录
+        # Create details directory
         self.details_dir = os.path.join(output_dir, "cluster_details")
         os.makedirs(self.details_dir, exist_ok=True)
         
-        # 初始化聚类统计数据
+        # Initialize clustering statistics
         self.cluster_stats = []
         
     def check_tools(self):
-        """检查必要工具是否可用"""
+        """Check if necessary tools are available"""
         tools = ["Refiner_for_Graph"]
         
         if self.cluster_method == "minimap2":
@@ -96,7 +103,7 @@ class FastClusteringPipeline:
         else:
             tools.append("cd-hit-est")
             
-        # 检查增强工具是否可用
+        # Check if enhancement tools are available
         helpful_tools = ["mafft", "fasttree", "mash"]
             
         missing_tools = []
@@ -111,26 +118,26 @@ class FastClusteringPipeline:
                 optional_missing.append(tool)
                 
         if missing_tools:
-            logger.error(f"缺少以下必要工具: {', '.join(missing_tools)}")
+            logger.error(f"Missing the following necessary tools: {', '.join(missing_tools)}")
             return False
             
         if optional_missing:
-            logger.warning(f"以下可选工具缺失，某些高级功能可能受限: {', '.join(optional_missing)}")
+            logger.warning(f"The following optional tools are missing, some advanced features may be limited: {', '.join(optional_missing)}")
             
         return True
         
     def preprocess_sequences(self, input_file):
-        """预处理序列：长度过滤、低复杂度区域过滤等"""
-        logger.info(f"预处理序列: {input_file}")
+        """Preprocess sequences: length filtering, low complexity region filtering, etc."""
+        logger.info(f"Preprocessing sequences: {input_file}")
         
-        min_length = 20  # 最小长度阈值
-        max_n_ratio = 0.1  # 最大N比例
+        min_length = 20  # Minimum length threshold
+        max_n_ratio = 0.1  # Maximum N ratio
         
-        # 读取所有序列
+        # Read all sequences
         sequences = list(SeqIO.parse(input_file, "fasta"))
         input_seq_count = len(sequences)
         
-        # 筛选序列
+        # Filter sequences
         filtered_sequences = []
         for seq in sequences:
             seq_len = len(seq.seq)
@@ -142,16 +149,16 @@ class FastClusteringPipeline:
                 
         output_seq_count = len(filtered_sequences)
         
-        # 写入处理后的序列
+        # Write processed sequences
         preprocessed_file = os.path.join(self.temp_dir, "preprocessed.fa")
         SeqIO.write(filtered_sequences, preprocessed_file, "fasta")
         
-        logger.info(f"预处理完成: {input_seq_count} 序列输入, {output_seq_count} 序列通过筛选")
+        logger.info(f"Preprocessing complete: {input_seq_count} input sequences, {output_seq_count} sequences passed filtering")
         return preprocessed_file
         
     def run_clustering(self, input_file):
-        """使用选定的聚类方法进行序列聚类"""
-        logger.info(f"使用 {self.cluster_method} 进行序列聚类...")
+        """Perform sequence clustering using the selected method"""
+        logger.info(f"Using {self.cluster_method} for sequence clustering...")
         
         if self.cluster_method == "minimap2":
             return self.run_minimap2_clustering(input_file)
@@ -160,27 +167,27 @@ class FastClusteringPipeline:
         elif self.cluster_method == "vsearch":
             return self.run_vsearch_clustering(input_file)
         else:
-            # 回退到CD-HIT-EST
+            # Fall back to CD-HIT-EST
             return self.run_cdhit_clustering(input_file)
             
     def run_minimap2_clustering(self, input_file):
-        """使用minimap2进行快速聚类，优化以提高信息保留"""
+        """Use minimap2 for fast clustering, optimized for improved information retention"""
         paf_file = os.path.join(self.temp_dir, f"minimap2_{int(time.time())}.paf")
         
-        # minimap2参数，针对LTR元素优化
-        # -k 15: 使用较小的k-mer提高敏感度
-        # -p 0.8: 次要比对阈值，0.8为适中值
-        # -c: 输出CIGAR字符串，用于精确计算相似度
+        # minimap2 parameters, optimized for LTR elements
+        # -k 15: Use smaller k-mer to increase sensitivity
+        # -p 0.8: Secondary alignment threshold, 0.8 is a moderate value
+        # -c: Output CIGAR string for precise similarity calculation
         cmd = [
             "minimap2",
-            "-x", "asm20",     # 更适合重复序列的预设
-            "-k", "15",        # 更小的k-mer提高敏感度
-            "-w", "10",        # 窗口大小
-            "-c",              # 输出CIGAR字符串
-            "-p", "0.8",       # 次要比对阈值
-            "-N", "100",       # 更多候选链
-            "--cs",            # 输出详细的比对信息
-            "-D",              # 启用密集比对模式
+            "-x", "asm20",     # Preset more suitable for repeat sequences
+            "-k", "15",        # Smaller k-mer for increased sensitivity
+            "-w", "10",        # Window size
+            "-c",              # Output CIGAR string
+            "-p", "0.8",       # Secondary alignment threshold
+            "-N", "100",       # More candidate chains
+            "--cs",            # Output detailed alignment information
+            "-D",              # Enable dense alignment mode
             "-t", str(self.threads),
             "-o", paf_file,
             input_file, input_file
@@ -188,32 +195,29 @@ class FastClusteringPipeline:
         
         try:
             subprocess.run(cmd, check=True, capture_output=True)
-            logger.info("minimap2比对完成")
+            logger.info("minimap2 alignment complete")
             
-            # 解析PAF文件并构建图
+            # Parse PAF file and build graph
             G = self.parse_minimap2_results(paf_file)
             
-            # 可视化序列相似性图
-            self.visualize_graph(G, os.path.join(self.details_dir, "sequence_similarity_graph.png"))
-            
-            # 使用图算法识别聚类，增加进化视角
+            # Use graph algorithms to identify clusters, adding evolutionary perspective
             clusters = self.identify_clusters_from_graph(G)
             
             return clusters, input_file
             
         except subprocess.CalledProcessError as e:
-            logger.error(f"minimap2运行失败: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            logger.error(f"minimap2 execution failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
             raise
             
     def parse_minimap2_results(self, paf_file):
-        """解析minimap2 PAF输出，构建序列相似性图"""
+        """Parse minimap2 PAF output, build sequence similarity graph"""
         G = nx.Graph()
         
-        # 设置聚类阈值
+        # Set clustering thresholds
         min_identity = self.identity_threshold
         min_coverage = self.coverage_threshold
         
-        # 读取PAF文件
+        # Read PAF file
         with open(paf_file) as f:
             for line in f:
                 fields = line.strip().split("\t")
@@ -223,7 +227,7 @@ class FastClusteringPipeline:
                 query_name = fields[0]
                 target_name = fields[5]
                 
-                # 跳过自身比对
+                # Skip self-alignment
                 if query_name == target_name:
                     continue
                     
@@ -232,17 +236,17 @@ class FastClusteringPipeline:
                 alignment_len = int(fields[10])
                 matches = int(fields[9])
                 
-                # 计算相似度和覆盖率
+                # Calculate similarity and coverage
                 identity = matches / alignment_len if alignment_len > 0 else 0
                 q_coverage = alignment_len / query_len if query_len > 0 else 0
                 t_coverage = alignment_len / target_len if target_len > 0 else 0
-                coverage = min(q_coverage, t_coverage)  # 使用最小覆盖率而非最大，更严格
+                coverage = min(q_coverage, t_coverage)  # Use minimum coverage rather than maximum, more strict
                 
-                # 如果满足阈值，添加边
+                # If thresholds are met, add edge
                 if identity >= min_identity and coverage >= min_coverage:
-                    weight = identity * coverage  # 组合权重
+                    weight = identity * coverage  # Combined weight
                     
-                    # 保存更多信息
+                    # Save more information
                     edge_data = {
                         'weight': weight,
                         'identity': identity,
@@ -253,14 +257,14 @@ class FastClusteringPipeline:
                     }
                     
                     if G.has_edge(query_name, target_name):
-                        # 使用最高权重，并更新边属性
+                        # Use highest weight and update edge attributes
                         current_weight = G[query_name][target_name]['weight']
                         if weight > current_weight:
                             G[query_name][target_name].update(edge_data)
                     else:
                         G.add_edge(query_name, target_name, **edge_data)
                         
-        # 确保所有序列ID都在图中，包括没有高相似性的序列
+        # Ensure all sequence IDs are in the graph, including those without high similarity
         for line in open(paf_file):
             fields = line.strip().split("\t")
             if len(fields) < 2:
@@ -268,162 +272,114 @@ class FastClusteringPipeline:
             G.add_node(fields[0])
             G.add_node(fields[5])
             
-        logger.info(f"从minimap2结果构建了图，包含 {len(G.nodes())} 个节点，{len(G.edges())} 条边")
+        logger.info(f"Graph built from minimap2 results, contains {len(G.nodes())} nodes, {len(G.edges())} edges")
         return G
-        
-    def visualize_graph(self, G, output_file, max_nodes=200):
-        """可视化序列相似性图"""
-        try:
-            if len(G.nodes()) > max_nodes:
-                logger.info(f"图太大 ({len(G.nodes())} 节点)，跳过可视化")
-                return
-                
-            plt.figure(figsize=(12, 12))
-            
-            # 使用社区检测算法找到社区
-            try:
-                from community import best_partition
-                partition = best_partition(G)
-                colors = [partition[node] for node in G.nodes()]
-            except ImportError:
-                # 如果没有安装 python-louvain，使用度中心性
-                degrees = dict(nx.degree(G))
-                colors = [degrees[node] for node in G.nodes()]
-            
-            # 布局
-            pos = nx.spring_layout(G, k=0.15, iterations=50)
-            
-            # 绘制节点
-            nx.draw_networkx_nodes(G, pos, node_size=100, node_color=colors, cmap=plt.cm.viridis, alpha=0.8)
-            
-            # 绘制边，使用权重控制边的宽度
-            edge_weights = [G[u][v]['weight'] * 3 for u, v in G.edges()]
-            nx.draw_networkx_edges(G, pos, width=edge_weights, alpha=0.3)
-            
-            # 为了可读性，只显示部分节点标签
-            if len(G.nodes()) <= 30:
-                nx.draw_networkx_labels(G, pos, font_size=8)
-            else:
-                # 找出高度中心的节点
-                centrality = nx.degree_centrality(G)
-                top_nodes = sorted(centrality.items(), key=lambda x: x[1], reverse=True)[:10]
-                labels = {node: node for node, _ in top_nodes}
-                nx.draw_networkx_labels(G, pos, labels=labels, font_size=8)
-            
-            plt.title("Sequence Similarity Network")
-            plt.axis('off')
-            plt.tight_layout()
-            plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            plt.close()
-            
-        except Exception as e:
-            logger.warning(f"图可视化失败: {e}")
         
     def identify_clusters_from_graph(self, G):
         """
-        从图中识别聚类，考虑进化关系，并限制聚类大小
+        Identify clusters from graph, considering evolutionary relationships, and limiting cluster size
         """
-        # 首先使用连通分量算法进行基本聚类
+        # First use connected components algorithm for basic clustering
         basic_clusters = list(nx.connected_components(G))
-        logger.info(f"基本图聚类识别出 {len(basic_clusters)} 个聚类")
+        logger.info(f"Basic graph clustering identified {len(basic_clusters)} clusters")
         
-        # 识别并处理大聚类
+        # Identify and process large clusters
         final_clusters = []
         for i, cluster in enumerate(basic_clusters):
             if len(cluster) > self.max_cluster_size:
-                logger.info(f"发现大聚类 (ID {i+1}): {len(cluster)} 序列，尝试拆分")
+                logger.info(f"Large cluster found (ID {i+1}): {len(cluster)} sequences, attempting to split")
                 subclusters = self.split_large_cluster(G, cluster)
-                logger.info(f"聚类 {i+1} 被拆分为 {len(subclusters)} 个子聚类")
+                logger.info(f"Cluster {i+1} split into {len(subclusters)} subclusters")
                 final_clusters.extend(subclusters)
             else:
                 final_clusters.append(cluster)
                 
-        logger.info(f"最终识别出 {len(final_clusters)} 个聚类")
+        logger.info(f"Finally identified {len(final_clusters)} clusters")
         
-        # 记录聚类统计信息
+        # Record clustering statistics
         self.record_cluster_stats(final_clusters)
         
         return final_clusters
         
     def split_large_cluster(self, G, cluster_nodes):
         """
-        使用社区检测和子图划分方法拆分大聚类
+        Split large clusters using community detection and subgraph partitioning methods
         """
-        # 提取子图
+        # Extract subgraph
         subgraph = G.subgraph(cluster_nodes).copy()
         
-        # 方法1: 尝试使用社区检测算法
+        # Method 1: Try using community detection algorithm
         try:
             from community import best_partition
             partition = best_partition(subgraph)
             
-            # 构建社区
+            # Build communities
             communities = defaultdict(set)
             for node, community_id in partition.items():
                 communities[community_id].add(node)
                 
             subclusters = list(communities.values())
             
-            # 检查是否有效拆分
+            # Check if effective split
             largest_subcluster = max(subclusters, key=len)
             if len(largest_subcluster) < len(cluster_nodes) * 0.9:
-                logger.info(f"使用社区检测成功拆分聚类: {len(subclusters)} 个子聚类")
+                logger.info(f"Successfully split cluster using community detection: {len(subclusters)} subclusters")
                 return subclusters
                 
-            logger.info("社区检测未能有效拆分聚类，尝试其他方法")
+            logger.info("Community detection did not effectively split the cluster, trying other methods")
             
         except ImportError:
-            logger.info("未安装 python-louvain 库，无法使用社区检测，尝试其他方法")
+            logger.info("python-louvain library not installed, cannot use community detection, trying other methods")
         
-        # 方法2: 使用更严格的边权重阈值
+        # Method 2: Use stricter edge weight threshold
         try:
-            # 复制子图并按权重排序边
+            # Copy subgraph and sort edges by weight
             strict_subgraph = subgraph.copy()
             edges = sorted(strict_subgraph.edges(data=True), key=lambda x: x[2]['weight'])
             
-            # 移除低权重的边，直到达到所需的分裂级别
+            # Remove low weight edges until desired split level is reached
             for i in range(len(edges)):
                 u, v, data = edges[i]
                 strict_subgraph.remove_edge(u, v)
                 
-                # 检查连通分量
+                # Check connected components
                 components = list(nx.connected_components(strict_subgraph))
                 
-                # 如果组件足够小或数量足够多，停止
+                # If components are small enough or numerous enough, stop
                 largest_comp = max(components, key=len)
                 if len(largest_comp) <= self.max_cluster_size or len(components) >= len(cluster_nodes) // self.max_cluster_size:
-                    logger.info(f"通过移除边成功拆分: {len(components)} 个子聚类")
+                    logger.info(f"Successfully split by removing edges: {len(components)} subclusters")
                     return components
                     
-            # 如果无法达到理想拆分，返回最终状态
+            # If ideal split cannot be achieved, return final state
             components = list(nx.connected_components(strict_subgraph))
             if len(components) > 1:
-                logger.info(f"通过移除边部分拆分: {len(components)} 个子聚类")
+                logger.info(f"Partially split by removing edges: {len(components)} subclusters")
                 return components
                 
         except Exception as e:
-            logger.warning(f"边权重拆分失败: {e}")
+            logger.warning(f"Edge weight splitting failed: {e}")
             
-        # 方法3: 使用图分割算法
+        # Method 3: Use graph partitioning algorithm
         try:
             from networkx.algorithms import community
             
             communities = list(community.girvan_newman(subgraph))
             
-            # 取最佳分割
+            # Take best partition
             for comm in communities:
                 subclusters = list(comm)
                 largest = max(subclusters, key=len)
                 
                 if len(largest) <= self.max_cluster_size or len(subclusters) >= 2:
-                    logger.info(f"使用 Girvan-Newman 算法成功拆分: {len(subclusters)} 个子聚类")
+                    logger.info(f"Successfully split using Girvan-Newman algorithm: {len(subclusters)} subclusters")
                     return subclusters
                     
         except ImportError:
-            logger.info("图分割算法不可用")
+            logger.info("Graph partitioning algorithm not available")
             
-        # 方法4: 如果所有方法都失败，使用大小限制进行简单划分
-        logger.warning(f"无法有效拆分聚类，使用大小限制进行简单划分")
+        # Method 4: If all methods fail, use size limit for simple division
+        logger.warning(f"Cannot effectively split cluster, using size limit for simple division")
         nodes = list(cluster_nodes)
         subclusters = []
         
@@ -433,7 +389,7 @@ class FastClusteringPipeline:
         return subclusters
         
     def record_cluster_stats(self, clusters):
-        """记录聚类统计信息用于监控"""
+        """Record clustering statistics for monitoring"""
         stats = {
             'total_clusters': len(clusters),
             'cluster_sizes': [len(c) for c in clusters],
@@ -445,67 +401,24 @@ class FastClusteringPipeline:
         
         self.cluster_stats.append(stats)
         
-        # 输出统计信息
-        logger.info(f"聚类统计: 总数={stats['total_clusters']}, 最大={stats['largest_cluster']}, "
-                    f"平均={stats['avg_cluster_size']:.1f}, 单例={stats['singleton_clusters']}")
-                    
-        # 绘制聚类大小分布
-        self.plot_cluster_size_distribution(stats['cluster_sizes'])
+        # Output statistics
+        logger.info(f"Clustering statistics: Total={stats['total_clusters']}, Largest={stats['largest_cluster']}, "
+                    f"Average={stats['avg_cluster_size']:.1f}, Singletons={stats['singleton_clusters']}")
         
-    def plot_cluster_size_distribution(self, cluster_sizes):
-        """绘制聚类大小分布直方图"""
-        try:
-            plt.figure(figsize=(10, 6))
-            
-            # 设置直方图的区间，根据数据范围调整
-            max_size = max(cluster_sizes) if cluster_sizes else 1
-            bin_width = 1
-            
-            if max_size > 50:
-                bin_width = 5
-            if max_size > 100:
-                bin_width = 10
-            if max_size > 500:
-                bin_width = 50
-                
-            bins = range(1, max_size + bin_width, bin_width)
-            
-            plt.hist(cluster_sizes, bins=bins, alpha=0.7, color='steelblue')
-            plt.xlabel('Cluster Size')
-            plt.ylabel('Frequency')
-            plt.title('Cluster Size Distribution')
-            plt.grid(alpha=0.3)
-            
-            # 添加统计信息
-            avg_size = np.mean(cluster_sizes) if cluster_sizes else 0
-            median_size = np.median(cluster_sizes) if cluster_sizes else 0
-            
-            plt.axvline(avg_size, color='red', linestyle='dashed', linewidth=1, label=f'Mean: {avg_size:.1f}')
-            plt.axvline(median_size, color='green', linestyle='dashed', linewidth=1, label=f'Median: {median_size:.1f}')
-            plt.legend()
-            
-            # 保存图表
-            plt.tight_layout()
-            plt.savefig(os.path.join(self.details_dir, "cluster_size_distribution.png"), dpi=300)
-            plt.close()
-            
-        except Exception as e:
-            logger.warning(f"绘制聚类大小分布图失败: {e}")
-
     def run_mmseqs_clustering(self, input_file):
-        """使用MMseqs2进行超快速聚类，特别适合大型数据集"""
-        # 创建临时目录
+        """Use MMseqs2 for ultra-fast clustering, especially suitable for large datasets"""
+        # Create temporary directory
         mmseqs_tmp = os.path.join(self.temp_dir, f"mmseqs_tmp_{int(time.time())}")
         os.makedirs(mmseqs_tmp, exist_ok=True)
         
-        # 设置输出文件
+        # Set output files
         prefix = os.path.join(self.temp_dir, f"mmseqs_{int(time.time())}")
         db_file = f"{prefix}_DB"
         cluster_file = f"{prefix}_cluster"
         cluster_tsv = f"{prefix}_cluster.tsv"
         
         try:
-            # 步骤1: 创建数据库
+            # Step 1: Create database
             cmd = [
                 "mmseqs", "createdb", 
                 input_file, 
@@ -513,9 +426,9 @@ class FastClusteringPipeline:
             ]
             subprocess.run(cmd, check=True, capture_output=True)
             
-            # 步骤2: 运行聚类
-            # 设置--min-seq-id为相似度阈值
-            # 设置-c为覆盖率阈值
+            # Step 2: Run clustering
+            # Set --min-seq-id as identity threshold
+            # Set -c as coverage threshold
             cmd = [
                 "mmseqs", "cluster",
                 db_file, 
@@ -523,15 +436,15 @@ class FastClusteringPipeline:
                 mmseqs_tmp,
                 "--min-seq-id", str(self.identity_threshold),
                 "-c", str(self.coverage_threshold),
-                "--cov-mode", "2",  # 2代表目标序列覆盖率
-                "--cluster-mode", "0",  # 0: 连接聚类, 1: 单抽样聚类, 2: 平衡聚类
-                "--cluster-steps", "5",  # 更多的聚类步骤，提高敏感性
-                "--max-seqs", "300",  # 保留更多的相似序列
+                "--cov-mode", "2",  # 2 represents target sequence coverage
+                "--cluster-mode", "0",  # 0: connected component clustering, 1: single-linkage clustering, 2: balanced clustering
+                "--cluster-steps", "5",  # More clustering steps, increases sensitivity
+                "--max-seqs", "300",  # Keep more similar sequences
                 "--threads", str(self.threads)
             ]
             subprocess.run(cmd, check=True, capture_output=True)
             
-            # 步骤3: 转换结果为人类可读格式
+            # Step 3: Convert results to human-readable format
             cmd = [
                 "mmseqs", "createtsv",
                 db_file,
@@ -541,21 +454,21 @@ class FastClusteringPipeline:
             ]
             subprocess.run(cmd, check=True, capture_output=True)
             
-            # 解析聚类结果
+            # Parse clustering results
             clusters = self.parse_mmseqs_results(cluster_tsv)
             
-            # 记录聚类统计信息
+            # Record clustering statistics
             self.record_cluster_stats(clusters)
             
             return clusters, input_file
             
         except subprocess.CalledProcessError as e:
-            logger.error(f"MMseqs2运行失败: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
-            # 尝试回退到minimap2
-            logger.info("尝试使用minimap2作为备选方法")
+            logger.error(f"MMseqs2 execution failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            # Try falling back to minimap2
+            logger.info("Trying minimap2 as fallback method")
             return self.run_minimap2_clustering(input_file)
         finally:
-            # 清理临时文件
+            # Clean up temporary files
             if self.cleanup_temp:
                 try:
                     shutil.rmtree(mmseqs_tmp)
@@ -563,50 +476,50 @@ class FastClusteringPipeline:
                     pass
                     
     def parse_mmseqs_results(self, cluster_tsv):
-        """解析MMseqs2聚类结果"""
+        """Parse MMseqs2 clustering results"""
         cluster_dict = defaultdict(set)
         
         with open(cluster_tsv) as f:
             for line in f:
                 fields = line.strip().split("\t")
                 if len(fields) >= 2:
-                    rep_id = fields[0]  # 代表序列ID
-                    member_id = fields[1]  # 成员序列ID
+                    rep_id = fields[0]  # Representative sequence ID
+                    member_id = fields[1]  # Member sequence ID
                     cluster_dict[rep_id].add(member_id)
-                    # 确保代表序列也在集合中
+                    # Ensure representative sequence is also in the set
                     cluster_dict[rep_id].add(rep_id)
         
-        # 转换为列表，并检查大聚类
+        # Convert to list and check large clusters
         basic_clusters = list(cluster_dict.values())
         
-        # 拆分大聚类
+        # Split large clusters
         final_clusters = []
         for i, cluster in enumerate(basic_clusters):
             if len(cluster) > self.max_cluster_size:
-                logger.info(f"发现大聚类 (ID {i+1}): {len(cluster)} 序列，尝试拆分")
-                # MMseqs2无法使用图拆分方法，使用cd-hit-est进行二次聚类
+                logger.info(f"Large cluster found (ID {i+1}): {len(cluster)} sequences, attempting to split")
+                # MMseqs2 cannot use graph splitting method, use cd-hit-est for secondary clustering
                 subclusters = self.split_large_cluster_cdhit(list(cluster), input_file)
-                logger.info(f"聚类 {i+1} 被拆分为 {len(subclusters)} 个子聚类")
+                logger.info(f"Cluster {i+1} split into {len(subclusters)} subclusters")
                 final_clusters.extend(subclusters)
             else:
                 final_clusters.append(cluster)
                 
-        logger.info(f"MMseqs2聚类生成了 {len(final_clusters)} 个聚类")
+        logger.info(f"MMseqs2 clustering generated {len(final_clusters)} clusters")
         return final_clusters
         
     def split_large_cluster_cdhit(self, seq_ids, input_file):
-        """使用CD-HIT-EST拆分大聚类"""
-        # 从输入文件中提取序列
+        """Split large clusters using CD-HIT-EST"""
+        # Extract sequences from input file
         sequences = {}
         for record in SeqIO.parse(input_file, "fasta"):
             if record.id in seq_ids:
                 sequences[record.id] = record
                 
         if not sequences:
-            logger.warning("无法找到聚类中的序列，返回原始聚类")
+            logger.warning("Could not find sequences in cluster, returning original cluster")
             return [set(seq_ids)]
             
-        # 写入临时文件
+        # Write to temporary file
         temp_input = os.path.join(self.temp_dir, f"large_cluster_{int(time.time())}.fa")
         temp_output = temp_input + ".out"
         
@@ -614,8 +527,8 @@ class FastClusteringPipeline:
             for record in sequences.values():
                 SeqIO.write(record, f, "fasta")
                 
-        # 使用更严格的阈值运行CD-HIT-EST
-        # 增加相似度阈值，降低覆盖率阈值
+        # Run CD-HIT-EST with stricter thresholds
+        # Increase identity threshold, decrease coverage threshold
         stricter_identity = min(0.95, self.identity_threshold + 0.1)
         stricter_coverage = max(0.5, self.coverage_threshold - 0.1)
         
@@ -625,30 +538,30 @@ class FastClusteringPipeline:
             "-o", temp_output,
             "-c", str(stricter_identity),
             "-aS", str(stricter_coverage),
-            "-g", "1",  # 使用局部最佳匹配
-            "-G", "0",  # 允许在两个方向上聚类
-            "-M", "8000",  # 内存限制(MB)
-            "-T", str(min(self.threads, 4))  # 限制线程数
+            "-g", "1",  # Use local best match
+            "-G", "0",  # Allow clustering in both directions
+            "-M", "8000",  # Memory limit (MB)
+            "-T", str(min(self.threads, 4))  # Limit number of threads
         ]
         
         try:
             subprocess.run(cmd, check=True, capture_output=True)
             
-            # 解析CD-HIT聚类结果
+            # Parse CD-HIT clustering results
             clusters_file = temp_output + ".clstr"
             subclusters = self.parse_cdhit_clusters(clusters_file)
             
-            # 检查结果
+            # Check results
             if len(subclusters) <= 1:
-                logger.warning("CD-HIT未能拆分聚类，尝试使用更严格的参数")
+                logger.warning("CD-HIT failed to split cluster, trying with stricter parameters")
                 
-                # 更严格的参数
+                # Stricter parameters
                 stricter_cmd = [
                     "cd-hit-est",
                     "-i", temp_input,
                     "-o", temp_output + ".strict",
-                    "-c", "0.98",  # 非常高的相似度要求
-                    "-aS", "0.4",  # 更低的覆盖率要求
+                    "-c", "0.98",  # Very high similarity requirement
+                    "-aS", "0.4",  # Lower coverage requirement
                     "-g", "1",
                     "-G", "0",
                     "-M", "8000",
@@ -661,8 +574,8 @@ class FastClusteringPipeline:
                 if len(stricter_clusters) > 1:
                     return stricter_clusters
                     
-                # 如果仍然不能拆分，使用简单的大小限制
-                logger.warning("无法有效拆分聚类，使用大小限制进行简单划分")
+                # If still can't split, use simple size limit
+                logger.warning("Cannot effectively split cluster, using size limit for simple division")
                 seq_list = list(seq_ids)
                 simple_subclusters = []
                 
@@ -674,10 +587,10 @@ class FastClusteringPipeline:
             return subclusters
             
         except subprocess.CalledProcessError as e:
-            logger.error(f"CD-HIT-EST拆分失败: {e}")
+            logger.error(f"CD-HIT-EST splitting failed: {e}")
             return [set(seq_ids)]
         finally:
-            # 清理临时文件
+            # Clean up temporary files
             if self.cleanup_temp:
                 for f in [temp_input, temp_output, temp_output + ".clstr",
                           temp_output + ".strict", temp_output + ".strict.clstr"]:
@@ -688,14 +601,14 @@ class FastClusteringPipeline:
                             pass
         
     def run_vsearch_clustering(self, input_file):
-        """使用vsearch进行快速聚类"""
-        # 设置输出文件
+        """Use vsearch for fast clustering"""
+        # Set output file
         cluster_file = os.path.join(self.temp_dir, f"vsearch_{int(time.time())}.uc")
         
         try:
-            # 运行vsearch聚类
-            # --id: 相似度阈值
-            # --strand both: 检查两条链
+            # Run vsearch clustering
+            # --id: Identity threshold
+            # --strand both: Check both strands
             cmd = [
                 "vsearch",
                 "--cluster_fast", input_file,
@@ -703,40 +616,40 @@ class FastClusteringPipeline:
                 "--strand", "both",
                 "--uc", cluster_file,
                 "--threads", str(self.threads),
-                "--qmask", "none",  # 不使用掩码
-                "--minseqlength", "100",  # 最小序列长度
-                "--query_cov", str(self.coverage_threshold),  # 查询覆盖率
-                "--target_cov", str(self.coverage_threshold)  # 目标覆盖率
+                "--qmask", "none",  # Don't use masking
+                "--minseqlength", "100",  # Minimum sequence length
+                "--query_cov", str(self.coverage_threshold),  # Query coverage
+                "--target_cov", str(self.coverage_threshold)  # Target coverage
             ]
             subprocess.run(cmd, check=True, capture_output=True)
             
-            # 解析聚类结果
+            # Parse clustering results
             clusters = self.parse_vsearch_results(cluster_file)
             
-            # 检查并拆分大聚类
+            # Check and split large clusters
             final_clusters = []
             for i, cluster in enumerate(clusters):
                 if len(cluster) > self.max_cluster_size:
-                    logger.info(f"发现大聚类 (ID {i+1}): {len(cluster)} 序列，尝试拆分")
+                    logger.info(f"Large cluster found (ID {i+1}): {len(cluster)} sequences, attempting to split")
                     subclusters = self.split_large_cluster_cdhit(list(cluster), input_file)
-                    logger.info(f"聚类 {i+1} 被拆分为 {len(subclusters)} 个子聚类")
+                    logger.info(f"Cluster {i+1} split into {len(subclusters)} subclusters")
                     final_clusters.extend(subclusters)
                 else:
                     final_clusters.append(cluster)
             
-            # 记录聚类统计信息
+            # Record clustering statistics
             self.record_cluster_stats(final_clusters)
             
             return final_clusters, input_file
             
         except subprocess.CalledProcessError as e:
-            logger.error(f"vsearch运行失败: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
-            # 尝试回退到minimap2
-            logger.info("尝试使用minimap2作为备选方法")
+            logger.error(f"vsearch execution failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            # Try falling back to minimap2
+            logger.info("Trying minimap2 as fallback method")
             return self.run_minimap2_clustering(input_file)
             
     def parse_vsearch_results(self, cluster_file):
-        """解析vsearch聚类结果"""
+        """Parse vsearch clustering results"""
         cluster_dict = defaultdict(set)
         
         with open(cluster_file) as f:
@@ -747,65 +660,65 @@ class FastClusteringPipeline:
                         cluster_id = fields[1]
                         seq_id = fields[8]
                         if seq_id == '*':
-                            seq_id = fields[9]  # 有时代表序列在第10个字段
+                            seq_id = fields[9]  # Sometimes representative sequence is in the 10th field
                         cluster_dict[cluster_id].add(seq_id)
         
-        # 转换为列表
+        # Convert to list
         clusters = list(cluster_dict.values())
-        logger.info(f"vsearch聚类生成了 {len(clusters)} 个聚类")
+        logger.info(f"vsearch clustering generated {len(clusters)} clusters")
         return clusters
         
     def run_cdhit_clustering(self, input_file):
-        """使用CD-HIT-EST进行初始聚类"""
+        """Use CD-HIT-EST for initial clustering"""
         output_file = os.path.join(self.temp_dir, f"cdhit_{int(time.time())}.fa")
         clusters_file = output_file + ".clstr"
         
-        # CD-HIT参数
+        # CD-HIT parameters
         cmd = [
             "cd-hit-est",
             "-i", input_file,
             "-o", output_file,
-            "-aS", str(self.coverage_threshold),  # 序列覆盖率
-            "-c", str(self.identity_threshold),   # 序列相似度
-            "-g", "1",             # 使用局部最佳匹配
-            "-G", "0",             # 允许在两个方向上聚类
-            "-A", "80",            # 最小对齐长度
-            "-M", "10000",         # 内存限制(MB)
+            "-aS", str(self.coverage_threshold),  # Sequence coverage
+            "-c", str(self.identity_threshold),   # Sequence identity
+            "-g", "1",             # Use local best match
+            "-G", "0",             # Allow clustering in both directions
+            "-A", "80",            # Minimum alignment length
+            "-M", "10000",         # Memory limit (MB)
             "-T", str(self.threads)
         ]
         
         try:
             subprocess.run(cmd, check=True, capture_output=True)
-            logger.info("CD-HIT聚类完成")
+            logger.info("CD-HIT clustering complete")
             
-            # 解析聚类结果
+            # Parse clustering results
             if os.path.exists(clusters_file):
                 clusters = self.parse_cdhit_clusters(clusters_file)
                 
-                # 检查并拆分大聚类
+                # Check and split large clusters
                 final_clusters = []
                 for i, cluster in enumerate(clusters):
                     if len(cluster) > self.max_cluster_size:
-                        logger.info(f"发现大聚类 (ID {i+1}): {len(cluster)} 序列，尝试拆分")
+                        logger.info(f"Large cluster found (ID {i+1}): {len(cluster)} sequences, attempting to split")
                         
-                        # 对于CD-HIT，可以直接用更严格的参数重新聚类
+                        # For CD-HIT, can directly re-cluster with stricter parameters
                         stricter_identity = min(0.95, self.identity_threshold + 0.1)
                         
-                        # 准备临时文件
+                        # Prepare temporary files
                         temp_input = os.path.join(self.temp_dir, f"large_cluster_{i+1}.fa")
                         temp_output = temp_input + ".refined"
                         
-                        # 提取序列
+                        # Extract sequences
                         seqs_to_extract = {}
                         for seq in SeqIO.parse(input_file, "fasta"):
                             if seq.id in cluster:
                                 seqs_to_extract[seq.id] = seq
                                 
-                        # 写入临时文件
+                        # Write to temporary file
                         with open(temp_input, "w") as f:
                             SeqIO.write(seqs_to_extract.values(), f, "fasta")
                             
-                        # 用更严格的参数运行CD-HIT
+                        # Run CD-HIT with stricter parameters
                         stricter_cmd = [
                             "cd-hit-est",
                             "-i", temp_input,
@@ -824,20 +737,20 @@ class FastClusteringPipeline:
                             strict_clusters = self.parse_cdhit_clusters(temp_output + ".clstr")
                             
                             if len(strict_clusters) > 1:
-                                logger.info(f"成功拆分聚类 {i+1} 为 {len(strict_clusters)} 个子聚类")
+                                logger.info(f"Successfully split cluster {i+1} into {len(strict_clusters)} subclusters")
                                 final_clusters.extend(strict_clusters)
                             else:
-                                logger.warning(f"无法有效拆分聚类 {i+1}，使用简单分割")
+                                logger.warning(f"Cannot effectively split cluster {i+1}, using simple division")
                                 seq_list = list(cluster)
                                 for j in range(0, len(seq_list), self.max_cluster_size):
                                     final_clusters.append(set(seq_list[j:j+self.max_cluster_size]))
                         except:
-                            logger.warning(f"拆分聚类 {i+1} 失败，使用简单分割")
+                            logger.warning(f"Splitting cluster {i+1} failed, using simple division")
                             seq_list = list(cluster)
                             for j in range(0, len(seq_list), self.max_cluster_size):
                                 final_clusters.append(set(seq_list[j:j+self.max_cluster_size]))
                                 
-                        # 清理临时文件
+                        # Clean up temporary files
                         if self.cleanup_temp:
                             for f in [temp_input, temp_output, temp_output + ".clstr"]:
                                 if os.path.exists(f):
@@ -848,22 +761,22 @@ class FastClusteringPipeline:
                     else:
                         final_clusters.append(cluster)
                 
-                # 记录聚类统计信息
+                # Record clustering statistics
                 self.record_cluster_stats(final_clusters)
                 
-                logger.info(f"CD-HIT生成了 {len(final_clusters)} 个聚类")
+                logger.info(f"CD-HIT generated {len(final_clusters)} clusters")
                 return final_clusters, output_file
             else:
-                logger.warning(f"聚类文件 {clusters_file} 不存在")
+                logger.warning(f"Cluster file {clusters_file} does not exist")
                 return [], input_file
                 
         except subprocess.CalledProcessError as e:
-            logger.error(f"CD-HIT运行失败: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
-            # 如果CD-HIT失败，返回空聚类列表
+            logger.error(f"CD-HIT execution failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            # If CD-HIT fails, return empty cluster list
             return [], input_file
             
     def parse_cdhit_clusters(self, clusters_file):
-        """解析CD-HIT聚类文件"""
+        """Parse CD-HIT cluster file"""
         cluster_dict = defaultdict(set)
         current_cluster = None
         
@@ -873,29 +786,29 @@ class FastClusteringPipeline:
                 if line.startswith(">Cluster"):
                     current_cluster = line.split()[1]
                 elif line and current_cluster is not None:
-                    # 提取序列ID
+                    # Extract sequence ID
                     parts = line.split(">")
                     if len(parts) > 1:
                         seq_id = parts[1].split("...")[0]
                         cluster_dict[current_cluster].add(seq_id)
         
-        # 转换为列表
+        # Convert to list
         return list(cluster_dict.values())
     
     def refine_cluster(self, cluster_seqs, cluster_id):
         """
-        对含有多条序列的聚类进行refine，生成代表序列和变体
-        增强信息保留和进化感知
+        Refine clusters containing multiple sequences, generate representative sequences and variants
+        Enhance information retention and evolutionary awareness
         
-        参数:
-            cluster_seqs (list): 聚类中的序列对象列表
-            cluster_id (str/int): 聚类ID
+        Parameters:
+            cluster_seqs (list): List of sequence objects in the cluster
+            cluster_id (str/int): Cluster ID
             
-        返回:
-            dict: 包含共识序列和变体的字典
+        Returns:
+            dict: Dictionary containing consensus sequence and variants
         """
         if len(cluster_seqs) == 1:
-            # 单序列聚类，直接返回
+            # Single sequence cluster, return directly
             return {
                 'consensus': cluster_seqs[0],
                 'variants': [],
@@ -907,16 +820,16 @@ class FastClusteringPipeline:
                 }
             }
             
-        logger.info(f"对聚类 {cluster_id} (包含 {len(cluster_seqs)} 条序列) 进行refine")
+        logger.info(f"Refining cluster {cluster_id} (containing {len(cluster_seqs)} sequences)")
         
-        # 验证序列
+        # Validate sequences
         valid_seqs = []
         for seq in cluster_seqs:
-            if len(seq.seq) >= 50:  # 确保序列长度足够
+            if len(seq.seq) >= 50:  # Ensure sequence length is sufficient
                 valid_seqs.append(seq)
                 
         if not valid_seqs:
-            logger.warning(f"聚类 {cluster_id} 没有有效序列，跳过refine")
+            logger.warning(f"Cluster {cluster_id} has no valid sequences, skipping refinement")
             return {
                 'consensus': cluster_seqs[0] if cluster_seqs else None,
                 'variants': [],
@@ -929,7 +842,7 @@ class FastClusteringPipeline:
             }
             
         if len(valid_seqs) == 1:
-            # 如果只有一个有效序列，直接返回
+            # If only one valid sequence, return directly
             return {
                 'consensus': valid_seqs[0],
                 'variants': [],
@@ -941,16 +854,16 @@ class FastClusteringPipeline:
                 }
             }
         
-        # 创建临时文件用于Refiner_for_Graph
+        # Create temporary files for Refiner_for_Graph
         cluster_fasta = os.path.join(self.temp_dir, f"cluster_{cluster_id}.fa")
         output_fasta = os.path.join(self.temp_dir, f"refined_{cluster_id}.fa")
         
-        # 写入聚类序列
+        # Write cluster sequences
         SeqIO.write(valid_seqs, cluster_fasta, "fasta")
         
-        # 检查文件大小确保写入成功
+        # Check file size to ensure successful write
         if os.path.getsize(cluster_fasta) == 0:
-            logger.warning(f"聚类 {cluster_id} 写入文件为空，使用最长序列作为代表")
+            logger.warning(f"Cluster {cluster_id} write file is empty, using longest sequence as representative")
             return {
                 'consensus': max(valid_seqs, key=lambda x: len(x.seq)),
                 'variants': [],
@@ -963,28 +876,28 @@ class FastClusteringPipeline:
             }
         
         try:
-            # 避免浮点精度问题
+            # Avoid floating point precision issues
             distance_threshold = round(1 - self.identity_threshold, 2)
             
-            # 准备增强型 Refiner_for_Graph 参数
+            # Prepare enhanced Refiner_for_Graph parameters
             cmd = [
                 "Refiner_for_Graph",
                 cluster_fasta,
                 output_fasta,
                 "--distance-threshold", str(distance_threshold),
-                "--entropy-threshold", "0.4",  # 熵阈值，用于保守区块识别
-                "--min-conserved-block", "15",  # 最小保守区块长度
-                "--max-cluster-size", str(self.max_cluster_size),  # 最大聚类大小
-                "--use-iupac" if self.use_iupac else "",  # 使用 IUPAC 模糊碱基
-                "--keep-variants" if self.keep_variants else "",  # 保留变体
-                "--details-dir", self.details_dir,  # 输出详细信息
-                "-t", str(min(self.threads, 4))  # 限制每个refine使用的线程数
+                "--entropy-threshold", "0.4",  # Entropy threshold, used for conserved block identification
+                "--min-conserved-block", "15",  # Minimum conserved block length
+                "--max-cluster-size", str(self.max_cluster_size),  # Maximum cluster size
+                "--use-iupac" if self.use_iupac else "",  # Use IUPAC ambiguous bases
+                "--keep-variants" if self.keep_variants else "",  # Keep variants
+                "--details-dir", self.details_dir,  # Output detailed information
+                "-t", str(min(self.threads, 4))  # Limit number of threads used per refinement
             ]
             
-            # 过滤掉空参数
+            # Filter out empty parameters
             cmd = [arg for arg in cmd if arg]
             
-            # 尝试捕获详细错误信息
+            # Try to capture detailed error information
             process = subprocess.run(
                 cmd, 
                 capture_output=True, 
@@ -992,18 +905,18 @@ class FastClusteringPipeline:
             )
             
             if process.returncode != 0:
-                logger.warning(f"Refiner_for_Graph返回错误 (代码 {process.returncode}):")
+                logger.warning(f"Refiner_for_Graph returned error (code {process.returncode}):")
                 logger.warning(f"STDERR: {process.stderr}")
                 logger.warning(f"STDOUT: {process.stdout}")
-                # 如果Refiner_for_Graph失败，尝试使用其他方法
+                # If Refiner_for_Graph fails, try using other methods
                 return self._fallback_refine(valid_seqs, cluster_id)
             
-            # 读取refine结果
+            # Read refinement results
             if os.path.exists(output_fasta) and os.path.getsize(output_fasta) > 0:
                 refined_seqs = list(SeqIO.parse(output_fasta, "fasta"))
                 
                 if refined_seqs:
-                    # 解析结果，区分共识和变体
+                    # Parse results, distinguish consensus and variants
                     consensus = None
                     variants = []
                     
@@ -1011,16 +924,16 @@ class FastClusteringPipeline:
                         if "_variant_" in seq.id:
                             variants.append(seq)
                         else:
-                            # 找到共识序列
+                            # Found consensus sequence
                             consensus = seq
-                            # 更新序列描述，添加聚类信息
+                            # Update sequence description, add cluster information
                             consensus.description = f"refined from cluster {cluster_id} ({len(valid_seqs)} sequences)"
                             
-                    # 如果没有找到共识序列，使用第一个序列
+                    # If no consensus sequence found, use first sequence
                     if not consensus and refined_seqs:
                         consensus = refined_seqs[0]
                         
-                    # 尝试读取统计文件
+                    # Try to read statistics file
                     stats_file = output_fasta + ".stats"
                     statistics = {
                         'size': len(valid_seqs),
@@ -1035,7 +948,7 @@ class FastClusteringPipeline:
                                     try:
                                         entropy = float(line.split("=")[1].strip())
                                         statistics['mean_entropy'] = entropy
-                                        # 近似计算平均同一性 (1 - 熵)
+                                        # Approximate average identity calculation (1 - entropy)
                                         statistics['mean_identity'] = 1.0 - entropy
                                     except:
                                         pass
@@ -1050,21 +963,21 @@ class FastClusteringPipeline:
                     return {
                         'consensus': consensus,
                         'variants': variants,
-                        'alignment': None,  # 多序列比对不容易从Refiner_for_Graph中提取
+                        'alignment': None,  # Multiple sequence alignment not easily extracted from Refiner_for_Graph
                         'statistics': statistics
                     }
             
-            logger.warning(f"Refiner_for_Graph未能生成结果，使用备选方法")
+            logger.warning(f"Refiner_for_Graph failed to generate results, using fallback method")
             return self._fallback_refine(valid_seqs, cluster_id)
             
         except Exception as e:
-            logger.error(f"Refiner_for_Graph处理聚类 {cluster_id} 失败: {e}")
+            logger.error(f"Refiner_for_Graph processing cluster {cluster_id} failed: {e}")
             import traceback
-            logger.error(f"异常详情: {traceback.format_exc()}")
-            # 失败时使用备选方法
+            logger.error(f"Exception details: {traceback.format_exc()}")
+            # Use fallback method on failure
             return self._fallback_refine(valid_seqs, cluster_id)
         finally:
-            # 可选地清理临时文件
+            # Optionally clean up temporary files
             if self.cleanup_temp:
                 for f in [cluster_fasta, output_fasta]:
                     if os.path.exists(f):
@@ -1074,44 +987,44 @@ class FastClusteringPipeline:
                             pass
                             
     def _fallback_refine(self, sequences, cluster_id):
-        """在Refiner_for_Graph失败时的备选方法"""
-        logger.info(f"使用备选方法处理聚类 {cluster_id}")
+        """Fallback method when Refiner_for_Graph fails"""
+        logger.info(f"Using fallback method for cluster {cluster_id}")
         
-        # 策略1: 尝试使用cd-hit-est
+        # Strategy 1: Try using cd-hit-est
         try:
-            # 创建临时文件
+            # Create temporary files
             input_file = os.path.join(self.temp_dir, f"fallback_{cluster_id}_input.fa")
             output_file = os.path.join(self.temp_dir, f"fallback_{cluster_id}_output.fa")
             
-            # 写入序列
+            # Write sequences
             SeqIO.write(sequences, input_file, "fasta")
             
-            # 运行cd-hit-est
+            # Run cd-hit-est
             cmd = [
                 "cd-hit-est",
                 "-i", input_file,
                 "-o", output_file,
-                "-c", "0.9",       # 更高的相似度阈值
+                "-c", "0.9",       # Higher identity threshold
                 "-aS", "0.8",
                 "-g", "1",
-                "-d", "0",         # 使用完整序列描述
-                "-T", "1"          # 单线程，避免并发问题
+                "-d", "0",         # Use full sequence description
+                "-T", "1"          # Single thread, avoid concurrency issues
             ]
             
             process = subprocess.run(cmd, capture_output=True, text=True)
             
             if process.returncode == 0 and os.path.exists(output_file):
-                # 读取结果
+                # Read results
                 cdhit_seqs = list(SeqIO.parse(output_file, "fasta"))
                 
                 if cdhit_seqs:
                     consensus = cdhit_seqs[0]
                     consensus.description = f"cd-hit consensus for cluster {cluster_id} ({len(sequences)} sequences)"
                     
-                    # 选择代表性变体
+                    # Select representative variants
                     variants = []
                     if len(cdhit_seqs) > 1 and self.keep_variants:
-                        # 如果有多个序列，选择最不同的2-3个作为变体
+                        # If multiple sequences, select 2-3 most different ones as variants
                         var_candidates = cdhit_seqs[1:min(4, len(cdhit_seqs))]
                         
                         for i, var in enumerate(var_candidates):
@@ -1127,71 +1040,71 @@ class FastClusteringPipeline:
                         'statistics': {
                             'size': len(sequences),
                             'is_single': False,
-                            'mean_identity': 0.9  # 估计值，基于cd-hit-est参数
+                            'mean_identity': 0.9  # Estimated value, based on cd-hit-est parameters
                         }
                     }
         except Exception as e:
-            logger.warning(f"cd-hit-est 备选方法失败: {e}")
+            logger.warning(f"cd-hit-est fallback method failed: {e}")
         
-        # 策略2: 如果cd-hit-est也失败，使用多序列比对和简单共识建立
+        # Strategy 2: If cd-hit-est also fails, use multiple sequence alignment and simple consensus building
         try:
-            # 创建临时文件
+            # Create temporary files
             input_file = os.path.join(self.temp_dir, f"mafft_{cluster_id}_input.fa")
             output_file = os.path.join(self.temp_dir, f"mafft_{cluster_id}_output.fa")
             
-            # 写入序列
+            # Write sequences
             SeqIO.write(sequences, input_file, "fasta")
             
-            # 使用MAFFT进行多序列比对
+            # Use MAFFT for multiple sequence alignment
             cmd = ["mafft", "--auto", "--quiet", input_file]
             
             process = subprocess.run(cmd, capture_output=True, text=True)
             
             if process.returncode == 0:
-                # 保存比对结果
+                # Save alignment results
                 with open(output_file, "w") as f:
                     f.write(process.stdout)
                     
-                # 从比对构建简单共识
+                # Build simple consensus from alignment
                 align_seqs = list(SeqIO.parse(output_file, "fasta"))
                 
                 if align_seqs:
-                    # 构建共识
+                    # Build consensus
                     from Bio.Align import MultipleSeqAlignment
                     from Bio.Seq import Seq
                     
-                    # 创建比对对象
+                    # Create alignment object
                     alignment = MultipleSeqAlignment(align_seqs)
                     
-                    # 构建共识序列
+                    # Build consensus sequence
                     consensus_seq = ""
                     for i in range(alignment.get_alignment_length()):
                         column = alignment[:, i]
-                        # 移除间隙
+                        # Remove gaps
                         bases = [b for b in column if b != '-']
                         
                         if not bases:
-                            continue  # 跳过全是间隙的列
+                            continue  # Skip columns that are all gaps
                             
-                        # 计算频率
+                        # Calculate frequencies
                         base_counts = {}
                         for base in bases:
                             base_counts[base] = base_counts.get(base, 0) + 1
                             
-                        # 找出最常见的碱基
+                        # Find most common base
                         most_common = max(base_counts.items(), key=lambda x: x[1])
                         
                         if self.use_iupac and len(base_counts) > 1:
-                            # 使用 IUPAC 表示多种碱基
+                            # Use IUPAC to represent multiple bases
                             total = sum(base_counts.values())
                             significant_bases = set()
                             
                             for base, count in base_counts.items():
-                                if count / total >= 0.2:  # 至少 20% 频率
+                                if count / total >= 0.2:  # At least 20% frequency
                                     significant_bases.add(base)
                                     
                             if len(significant_bases) > 1:
-                                # 查找 IUPAC 代码
+                                # Look up IUPAC code
                                 for iupac_set, code in {
                                     frozenset(['A', 'G']): 'R',
                                     frozenset(['C', 'T']): 'Y',
@@ -1215,29 +1128,29 @@ class FastClusteringPipeline:
                         else:
                             consensus_seq += most_common[0]
                     
-                    # 创建新序列记录
+                    # Create new sequence record
                     consensus = SeqRecord(
                         Seq(consensus_seq),
                         id=f"cluster_{cluster_id}_consensus",
                         description=f"MAFFT consensus for cluster {cluster_id} ({len(sequences)} sequences)"
                     )
                     
-                    # 选择变体（如果需要）
+                    # Select variants (if needed)
                     variants = []
                     if self.keep_variants and len(align_seqs) > 1:
-                        # 选择最不同的几个序列作为变体
-                        # 计算每个序列与共识的差异
+                        # Select the most different sequences as variants
+                        # Calculate differences between each sequence and consensus
                         differences = []
                         for i, seq in enumerate(align_seqs):
                             diff_count = sum(1 for a, b in zip(str(seq.seq), consensus_seq) if a != b)
                             diff_ratio = diff_count / len(consensus_seq) if consensus_seq else 0
                             differences.append((i, diff_ratio))
                             
-                        # 排序并选择最不同的2-3个
+                        # Sort and select 2-3 most different ones
                         differences.sort(key=lambda x: x[1], reverse=True)
                         for i, (idx, _) in enumerate(differences[:min(3, len(differences))]):
                             var = align_seqs[idx]
-                            # 移除比对中的间隙
+                            # Remove gaps from alignment
                             var_seq = str(var.seq).replace('-', '')
                             
                             var_record = SeqRecord(
@@ -1254,15 +1167,15 @@ class FastClusteringPipeline:
                         'statistics': {
                             'size': len(sequences),
                             'is_single': False,
-                            'mean_identity': 0.8  # 估计值
+                            'mean_identity': 0.8  # Estimated value
                         }
                     }
                     
         except Exception as e:
-            logger.warning(f"MAFFT备选方法失败: {e}")
+            logger.warning(f"MAFFT fallback method failed: {e}")
         
-        # 策略3: 如果其他都失败，使用最长序列
-        logger.info(f"使用最长序列作为聚类 {cluster_id} 的代表")
+        # Strategy 3: If all else fails, use longest sequence
+        logger.info(f"Using longest sequence as representative for cluster {cluster_id}")
         longest_seq = max(sequences, key=lambda x: len(x.seq))
         longest_seq.description = f"Longest sequence from cluster {cluster_id} ({len(sequences)} sequences)"
         
@@ -1273,51 +1186,51 @@ class FastClusteringPipeline:
             'statistics': {
                 'size': len(sequences),
                 'is_single': False,
-                'mean_identity': 0.0  # 未知
+                'mean_identity': 0.0  # Unknown
             }
         }
 
     def process_clusters(self, clusters, sequences_file):
         """
-        处理聚类结果：
-        - 对多序列聚类进行refine
-        - 单序列聚类直接使用
-        - 保留变体和统计信息
+        Process clustering results:
+        - Refine multi-sequence clusters
+        - Use single-sequence clusters directly
+        - Keep variants and statistics
         
-        参数:
-            clusters (list): 聚类列表，每个元素是一个序列ID集合
-            sequences_file (str): 序列文件路径
+        Parameters:
+            clusters (list): List of clusters, each element is a set of sequence IDs
+            sequences_file (str): Sequence file path
             
-        返回:
-            处理后的序列列表和统计信息
+        Returns:
+            Processed sequence list and statistics
         """
-        logger.info(f"处理 {len(clusters)} 个聚类...")
+        logger.info(f"Processing {len(clusters)} clusters...")
         
-        # 读取所有序列
+        # Read all sequences
         sequences = SeqIO.to_dict(SeqIO.parse(sequences_file, "fasta"))
         
-        # 准备结果
+        # Prepare results
         consensus_results = []
         variant_results = []
         all_stats = []
         
-        # 并行处理聚类
+        # Process clusters in parallel
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
             future_to_cluster = {}
             
             for i, cluster in enumerate(clusters):
-                # 获取该聚类的序列
+                # Get sequences for this cluster
                 cluster_seqs = [sequences[seq_id] for seq_id in cluster if seq_id in sequences]
                 
                 if not cluster_seqs:
                     continue
                     
-                # 提交处理任务
+                # Submit processing task
                 future = executor.submit(self.refine_cluster, cluster_seqs, i)
                 future_to_cluster[future] = i
             
-            # 收集结果
-            for future in tqdm(future_to_cluster, desc="处理聚类"):
+            # Collect results
+            for future in tqdm(future_to_cluster, desc="Processing clusters"):
                 cluster_id = future_to_cluster[future]
                 try:
                     result = future.result()
@@ -1332,181 +1245,118 @@ class FastClusteringPipeline:
                         if variants:
                             variant_results.extend(variants)
                             
-                        # 添加聚类ID并保存统计信息
+                        # Add cluster ID and save statistics
                         stats['cluster_id'] = cluster_id
                         all_stats.append(stats)
                         
                 except Exception as e:
-                    logger.error(f"处理聚类 {cluster_id} 失败: {e}")
+                    logger.error(f"Processing cluster {cluster_id} failed: {e}")
         
-        # 记录聚类处理统计信息
+        # Record cluster processing statistics
         self.save_cluster_stats(all_stats)
         
-        logger.info(f"共生成 {len(consensus_results)} 条共识序列和 {len(variant_results)} 条变体序列")
+        logger.info(f"Generated {len(consensus_results)} consensus sequences and {len(variant_results)} variant sequences")
         return consensus_results, variant_results, all_stats
         
     def save_cluster_stats(self, stats):
-        """保存聚类统计信息到文件"""
+        """Save cluster statistics to file"""
         stats_file = os.path.join(self.output_dir, "cluster_stats.tsv")
         
         try:
-            # 转换为DataFrame
+            # Convert to DataFrame
             df = pd.DataFrame(stats)
             
-            # 排序
+            # Sort
             if not df.empty:
                 df = df.sort_values(by='cluster_id')
                 
-                # 保存到TSV
+                # Save to TSV
                 df.to_csv(stats_file, sep='\t', index=False)
                 
-                # 绘制聚类统计信息
-                self.plot_cluster_stats(df)
-                
         except Exception as e:
-            logger.warning(f"保存聚类统计信息失败: {e}")
-            
-    def plot_cluster_stats(self, stats_df):
-        """绘制聚类统计信息可视化"""
-        try:
-            if stats_df.empty:
-                return
-                
-            # 1. 聚类大小与平均相似度散点图
-            if 'size' in stats_df.columns and 'mean_identity' in stats_df.columns:
-                plt.figure(figsize=(10, 6))
-                
-                # 过滤掉缺失值
-                plot_df = stats_df[['size', 'mean_identity']].dropna()
-                
-                if not plot_df.empty:
-                    plt.scatter(plot_df['size'], plot_df['mean_identity'], 
-                                alpha=0.7, c='steelblue', s=30)
-                    
-                    plt.xlabel('Cluster Size')
-                    plt.ylabel('Mean Identity')
-                    plt.title('Cluster Size vs. Mean Identity')
-                    plt.grid(alpha=0.3)
-                    
-                    # 添加趋势线
-                    if len(plot_df) > 1:
-                        try:
-                            from scipy import stats
-                            slope, intercept, r_value, p_value, std_err = stats.linregress(
-                                plot_df['size'], plot_df['mean_identity']
-                            )
-                            
-                            x = np.array([min(plot_df['size']), max(plot_df['size'])])
-                            y = slope * x + intercept
-                            plt.plot(x, y, 'r--', label=f'Trend (r={r_value:.2f})')
-                            plt.legend()
-                        except:
-                            pass
-                    
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(self.details_dir, "cluster_size_vs_identity.png"), dpi=300)
-                    plt.close()
-                    
-            # 2. 聚类进化统计箱线图
-            if 'mean_identity' in stats_df.columns:
-                plt.figure(figsize=(8, 6))
-                
-                non_single = stats_df[~stats_df['is_single']]
-                
-                if not non_single.empty and len(non_single) > 1:
-                    plt.boxplot(non_single['mean_identity'].dropna())
-                    plt.ylabel('Mean Identity')
-                    plt.title('Distribution of Mean Identity Across Clusters')
-                    plt.grid(axis='y', alpha=0.3)
-                    
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(self.details_dir, "identity_distribution.png"), dpi=300)
-                    plt.close()
-                    
-        except Exception as e:
-            logger.warning(f"绘制聚类统计图表失败: {e}")
+            logger.warning(f"Failed to save cluster statistics: {e}")
 
     def run_iteration(self, input_file, iteration):
-        """运行单次聚类迭代"""
-        logger.info(f"开始第 {iteration} 次迭代...")
+        """Run a single clustering iteration"""
+        logger.info(f"Starting iteration {iteration}...")
         
-        # 创建迭代输出目录（如果需要）
+        # Create iteration output directory (if needed)
         if self.store_iterations:
             iter_dir = os.path.join(self.iterations_dir, f"iteration_{iteration}")
             os.makedirs(iter_dir, exist_ok=True)
         else:
             iter_dir = self.temp_dir
             
-        # 预处理序列
+        # Preprocess sequences
         if iteration == 1:
-            # 首次迭代时进行完整预处理
+            # Complete preprocessing on first iteration
             preprocessed_file = self.preprocess_sequences(input_file)
         else:
-            # 后续迭代使用上一次的结果
+            # Use previous results for subsequent iterations
             preprocessed_file = input_file
             
-        # 运行聚类
-        # 根据迭代次数调整阈值
+        # Run clustering
+        # Adjust thresholds based on iteration number
         if iteration > 1:
-            # 随着迭代次数增加，放宽阈值以捕获更远的关系
+            # Relax thresholds as iterations increase to capture more distant relationships
             adjusted_identity = max(0.6, self.identity_threshold - 0.1 * (iteration - 1))
             adjusted_coverage = max(0.5, self.coverage_threshold - 0.1 * (iteration - 1))
             
-            logger.info(f"调整第 {iteration} 次迭代的阈值: 相似度={adjusted_identity:.2f}, 覆盖率={adjusted_coverage:.2f}")
+            logger.info(f"Adjusting thresholds for iteration {iteration}: identity={adjusted_identity:.2f}, coverage={adjusted_coverage:.2f}")
             
-            # 临时调整参数
+            # Temporarily adjust parameters
             original_identity = self.identity_threshold
             original_coverage = self.coverage_threshold
             
             self.identity_threshold = adjusted_identity
             self.coverage_threshold = adjusted_coverage
             
-            # 运行聚类
+            # Run clustering
             clusters, seq_file = self.run_clustering(preprocessed_file)
             
-            # 恢复原始参数
+            # Restore original parameters
             self.identity_threshold = original_identity
             self.coverage_threshold = original_coverage
         else:
-            # 第一次迭代使用原始参数
+            # Use original parameters for first iteration
             clusters, seq_file = self.run_clustering(preprocessed_file)
             
-        # 处理聚类
+        # Process clusters
         consensus_seqs, variant_seqs, stats = self.process_clusters(clusters, seq_file)
         
-        # 保存结果
+        # Save results
         if self.store_iterations:
             iter_consensus_file = os.path.join(iter_dir, "consensus.fa")
             iter_all_file = os.path.join(iter_dir, "all_sequences.fa")
             
-            # 保存共识序列
+            # Save consensus sequences
             SeqIO.write(consensus_seqs, iter_consensus_file, "fasta")
             
-            # 保存所有序列（共识+变体）
+            # Save all sequences (consensus + variants)
             SeqIO.write(consensus_seqs + variant_seqs, iter_all_file, "fasta")
             
-            # 生成迭代报告
+            # Generate iteration report
             with open(os.path.join(iter_dir, "report.txt"), "w") as f:
-                f.write(f"迭代 {iteration} 报告\n")
-                f.write(f"输入序列数量: {len(list(SeqIO.parse(preprocessed_file, 'fasta')))}\n")
-                f.write(f"识别的聚类数量: {len(clusters)}\n")
-                f.write(f"生成的共识序列数量: {len(consensus_seqs)}\n")
-                f.write(f"保留的变体序列数量: {len(variant_seqs)}\n")
+                f.write(f"Iteration {iteration} Report\n")
+                f.write(f"Input sequence count: {len(list(SeqIO.parse(preprocessed_file, 'fasta')))}\n")
+                f.write(f"Identified clusters count: {len(clusters)}\n")
+                f.write(f"Generated consensus sequences count: {len(consensus_seqs)}\n")
+                f.write(f"Retained variant sequences count: {len(variant_seqs)}\n")
                 
                 if iteration > 1:
-                    f.write(f"调整的参数: 相似度={adjusted_identity:.2f}, 覆盖率={adjusted_coverage:.2f}\n")
+                    f.write(f"Adjusted parameters: identity={adjusted_identity:.2f}, coverage={adjusted_coverage:.2f}\n")
                     
-                # 添加更多统计信息
+                # Add more statistics
                 largest_cluster = max([len(c) for c in clusters]) if clusters else 0
-                f.write(f"最大聚类大小: {largest_cluster}\n")
+                f.write(f"Largest cluster size: {largest_cluster}\n")
                 
                 singleton_clusters = sum(1 for c in clusters if len(c) == 1)
-                f.write(f"单序列聚类数量: {singleton_clusters}\n")
+                f.write(f"Single-sequence clusters count: {singleton_clusters}\n")
                 
-        # 创建输出文件用于下一次迭代
+        # Create output file for next iteration
         output_file = os.path.join(self.temp_dir, f"iteration_{iteration}_output.fa")
         
-        # 根据策略决定是否包含变体
+        # Decide whether to include variants based on strategy
         if self.keep_variants:
             SeqIO.write(consensus_seqs + variant_seqs, output_file, "fasta")
             return output_file, len(consensus_seqs) + len(variant_seqs)
@@ -1515,54 +1365,54 @@ class FastClusteringPipeline:
             return output_file, len(consensus_seqs)
 
     def run(self):
-        """运行完整的LTR去冗余流程，包括迭代优化"""
-        logger.info("启动增强型LTR聚类和去冗余流程...")
+        """Run complete LTR redundancy removal process, including iterative optimization"""
+        logger.info("Starting enhanced LTR clustering and redundancy removal process...")
         
         try:
-            # 检查工具
+            # Check tools
             if not self.check_tools():
                 return None
                 
-            # 迭代优化
+            # Iterative optimization
             current_input = self.input_fasta
             prev_seq_count = float('inf')
             current_iteration = 1
             
             while current_iteration <= self.max_iterations:
-                # 运行当前迭代
+                # Run current iteration
                 new_input, seq_count = self.run_iteration(current_input, current_iteration)
                 
-                # 检查收敛
+                # Check convergence
                 if prev_seq_count > 0:
                     reduction_rate = (prev_seq_count - seq_count) / prev_seq_count
-                    logger.info(f"迭代 {current_iteration} 结果: {prev_seq_count} → {seq_count} 序列 (减少率: {reduction_rate:.2%})")
+                    logger.info(f"Iteration {current_iteration} result: {prev_seq_count} → {seq_count} sequences (reduction rate: {reduction_rate:.2%})")
                     
-                    # 如果序列数量减少率低于阈值，认为已收敛
+                    # If sequence count reduction rate is below threshold, consider converged
                     if reduction_rate < self.convergence_threshold:
-                        logger.info(f"迭代收敛! 序列数量减少率 ({reduction_rate:.2%}) 低于阈值 ({self.convergence_threshold:.2%})")
+                        logger.info(f"Iteration converged! Sequence count reduction rate ({reduction_rate:.2%}) below threshold ({self.convergence_threshold:.2%})")
                         break
                 else:
-                    logger.info(f"迭代 {current_iteration} 结果: {seq_count} 序列")
+                    logger.info(f"Iteration {current_iteration} result: {seq_count} sequences")
                 
-                # 设置下一次迭代
+                # Set up next iteration
                 current_input = new_input
                 prev_seq_count = seq_count
                 current_iteration += 1
                 
-                # 如果已经达到最大迭代次数，退出
+                # If maximum iteration count reached, exit
                 if current_iteration > self.max_iterations:
-                    logger.info(f"达到最大迭代次数 ({self.max_iterations})")
+                    logger.info(f"Maximum iteration count reached ({self.max_iterations})")
                     break
             
-            # 生成最终输出
+            # Generate final output
             final_file = os.path.join(self.output_dir, "consensi.fa")
             final_variants_file = os.path.join(self.output_dir, "variants.fa")
             final_all_file = os.path.join(self.output_dir, "all_sequences.fa")
             
-            # 读取最终结果
+            # Read final results
             final_seqs = list(SeqIO.parse(current_input, "fasta"))
             
-            # 分离共识和变体
+            # Separate consensus and variants
             consensus_seqs = []
             variant_seqs = []
             
@@ -1572,7 +1422,7 @@ class FastClusteringPipeline:
                 else:
                     consensus_seqs.append(seq)
             
-            # 保存结果
+            # Save results
             SeqIO.write(consensus_seqs, final_file, "fasta")
             
             if variant_seqs:
@@ -1580,7 +1430,7 @@ class FastClusteringPipeline:
                 
             SeqIO.write(final_seqs, final_all_file, "fasta")
             
-            # 生成最终报告
+            # Generate final report
             self.generate_final_report(
                 input_file=self.input_fasta,
                 consensus_file=final_file,
@@ -1588,32 +1438,32 @@ class FastClusteringPipeline:
                 iterations=current_iteration - 1
             )
             
-            logger.info(f"处理完成，结果保存至: {final_file}")
-            logger.info(f"共有 {len(consensus_seqs)} 条共识序列和 {len(variant_seqs)} 条变体序列")
+            logger.info(f"Processing complete, results saved to: {final_file}")
+            logger.info(f"Total {len(consensus_seqs)} consensus sequences and {len(variant_seqs)} variant sequences")
             
             return final_file
             
         except Exception as e:
-            logger.error(f"处理过程中发生错误: {e}")
+            logger.error(f"Error occurred during processing: {e}")
             import traceback
-            logger.error(f"异常详情: {traceback.format_exc()}")
+            logger.error(f"Exception details: {traceback.format_exc()}")
             return None
             
         finally:
-            # 清理临时文件
+            # Clean up temporary files
             if self.cleanup_temp:
                 try:
-                    logger.info("清理临时文件...")
+                    logger.info("Cleaning up temporary files...")
                     shutil.rmtree(self.temp_dir)
                 except Exception as e:
-                    logger.warning(f"清理临时文件失败: {e}")
+                    logger.warning(f"Failed to clean up temporary files: {e}")
                     
     def generate_final_report(self, input_file, consensus_file, variants_file, iterations):
-        """生成最终报告"""
+        """Generate final report"""
         report_file = os.path.join(self.output_dir, "final_report.txt")
         
         try:
-            # 计算统计信息
+            # Calculate statistics
             input_seqs = list(SeqIO.parse(input_file, "fasta"))
             consensus_seqs = list(SeqIO.parse(consensus_file, "fasta"))
             
@@ -1622,82 +1472,82 @@ class FastClusteringPipeline:
                 variant_seqs = list(SeqIO.parse(variants_file, "fasta"))
                 variant_count = len(variant_seqs)
                 
-            # 准备报告内容
+            # Prepare report content
             report = []
-            report.append("# LTR序列聚类与去冗余最终报告")
-            report.append(f"生成日期: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            report.append("\n## 处理概述")
-            report.append(f"输入序列数量: {len(input_seqs)}")
-            report.append(f"生成共识序列数量: {len(consensus_seqs)}")
-            report.append(f"保留变体序列数量: {variant_count}")
-            report.append(f"完成的迭代次数: {iterations}")
-            report.append(f"减少率: {(len(input_seqs) - len(consensus_seqs)) / len(input_seqs):.2%}")
+            report.append("# LTR Sequence Clustering and Redundancy Removal Final Report")
+            report.append(f"Generation date: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            report.append("\n## Processing Overview")
+            report.append(f"Input sequence count: {len(input_seqs)}")
+            report.append(f"Generated consensus sequence count: {len(consensus_seqs)}")
+            report.append(f"Retained variant sequence count: {variant_count}")
+            report.append(f"Completed iteration count: {iterations}")
+            report.append(f"Reduction rate: {(len(input_seqs) - len(consensus_seqs)) / len(input_seqs):.2%}")
             
-            # 添加参数信息
-            report.append("\n## 运行参数")
-            report.append(f"聚类方法: {self.cluster_method}")
-            report.append(f"初始相似度阈值: {self.identity_threshold}")
-            report.append(f"初始覆盖率阈值: {self.coverage_threshold}")
-            report.append(f"最大聚类大小: {self.max_cluster_size}")
-            report.append(f"使用IUPAC表示变异: {self.use_iupac}")
-            report.append(f"保留变体: {self.keep_variants}")
+            # Add parameter information
+            report.append("\n## Run Parameters")
+            report.append(f"Clustering method: {self.cluster_method}")
+            report.append(f"Initial identity threshold: {self.identity_threshold}")
+            report.append(f"Initial coverage threshold: {self.coverage_threshold}")
+            report.append(f"Maximum cluster size: {self.max_cluster_size}")
+            report.append(f"Use IUPAC for variants: {self.use_iupac}")
+            report.append(f"Keep variants: {self.keep_variants}")
             
-            # 添加聚类统计信息
+            # Add clustering statistics
             if self.cluster_stats:
-                report.append("\n## 迭代统计")
+                report.append("\n## Iteration Statistics")
                 for i, stats in enumerate(self.cluster_stats, 1):
-                    report.append(f"\n### 迭代 {i}")
-                    report.append(f"聚类总数: {stats['total_clusters']}")
-                    report.append(f"最大聚类大小: {stats['largest_cluster']}")
-                    report.append(f"平均聚类大小: {stats['avg_cluster_size']:.1f}")
-                    report.append(f"单序列聚类数量: {stats['singleton_clusters']}")
+                    report.append(f"\n### Iteration {i}")
+                    report.append(f"Total clusters: {stats['total_clusters']}")
+                    report.append(f"Largest cluster size: {stats['largest_cluster']}")
+                    report.append(f"Average cluster size: {stats['avg_cluster_size']:.1f}")
+                    report.append(f"Single-sequence cluster count: {stats['singleton_clusters']}")
                     
-            # 保存报告
+            # Save report
             with open(report_file, "w") as f:
                 f.write("\n".join(report))
                 
-            logger.info(f"最终报告保存至: {report_file}")
+            logger.info(f"Final report saved to: {report_file}")
                 
         except Exception as e:
-            logger.warning(f"生成最终报告失败: {e}")
+            logger.warning(f"Failed to generate final report: {e}")
 
 def main():
-    """命令行入口函数"""
+    """Command line entry function"""
     parser = argparse.ArgumentParser(
-        description="增强型LTR序列聚类和去冗余工具 - 减少信息丢失并增加进化感知"
+        description="Enhanced LTR Sequence Clustering and Redundancy Removal Tool - Reducing Information Loss and Increasing Evolutionary Awareness"
     )
     
-    parser.add_argument("input_fasta", help="输入FASTA文件")
-    parser.add_argument("output_dir", help="输出目录")
+    parser.add_argument("input_fasta", help="Input FASTA file")
+    parser.add_argument("output_dir", help="Output directory")
     
     parser.add_argument("--method", choices=["minimap2", "mmseqs", "vsearch", "cdhit"], 
-                       default="minimap2", help="聚类方法 (默认: minimap2)")
+                       default="minimap2", help="Clustering method (default: minimap2)")
     parser.add_argument("--identity", type=float, default=0.8,
-                       help="序列相似度阈值 (0-1, 默认: 0.8)")
+                       help="Sequence identity threshold (0-1, default: 0.8)")
     parser.add_argument("--coverage", type=float, default=0.8,
-                       help="序列覆盖率阈值 (0-1, 默认: 0.8)")
+                       help="Sequence coverage threshold (0-1, default: 0.8)")
     parser.add_argument("--threads", type=int, default=1,
-                       help="线程数 (默认: 1)")
+                       help="Number of threads (default: 1)")
     parser.add_argument("--keep-temp", action="store_false", dest="cleanup_temp",
-                       help="保留临时文件")
+                       help="Keep temporary files")
     parser.add_argument("--max-iterations", type=int, default=3,
-                        help="最大迭代次数 (默认: 3)")
+                        help="Maximum number of iterations (default: 3)")
     parser.add_argument("--convergence", type=float, default=0.05,
-                        help="收敛阈值，序列数量变化率低于此值时停止 (默认: 0.05)")
+                        help="Convergence threshold, stop when sequence count change rate is below this value (default: 0.05)")
     parser.add_argument("--max-cluster-size", type=int, default=50,
-                        help="最大聚类大小，超过此值会尝试拆分 (默认: 50)")
+                        help="Maximum cluster size, clusters larger than this will be split (default: 50)")
     parser.add_argument("--use-iupac", action="store_true", default=True,
-                        help="使用IUPAC模糊碱基表示变异位点 (默认: 开启)")
+                        help="Use IUPAC ambiguous bases to represent variant sites (default: enabled)")
     parser.add_argument("--no-iupac", action="store_false", dest="use_iupac",
-                        help="不使用IUPAC模糊碱基")
+                        help="Don't use IUPAC ambiguous bases")
     parser.add_argument("--keep-variants", action="store_true", default=True,
-                        help="保留亚家族代表变体 (默认: 开启)")
+                        help="Keep subfamily representative variants (default: enabled)")
     parser.add_argument("--no-variants", action="store_false", dest="keep_variants",
-                        help="不保留亚家族代表变体")
+                        help="Don't keep subfamily representative variants")
     parser.add_argument("--store-iterations", action="store_true", default=True,
-                        help="保存中间迭代结果 (默认: 开启)")
+                        help="Save intermediate iteration results (default: enabled)")
     parser.add_argument("--no-store-iterations", action="store_false", dest="store_iterations",
-                        help="不保存中间迭代结果")
+                        help="Don't save intermediate iteration results")
     
     args = parser.parse_args()
     

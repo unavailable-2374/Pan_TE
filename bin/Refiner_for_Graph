@@ -22,8 +22,6 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Align import MultipleSeqAlignment
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,28 +66,28 @@ IUPAC_REVERSE = {
 
 @dataclass
 class PositionStats:
-    """存储单个位点的统计信息"""
-    base_counts: Dict[str, int]  # 每个碱基的计数
-    entropy: float               # 多样性度量  
-    gap_freq: float              # 间隙频率
-    consensus: str               # 共识碱基
+    """Store statistics for a single position"""
+    base_counts: Dict[str, int]  # Count of each base
+    entropy: float               # Diversity measure  
+    gap_freq: float              # Gap frequency
+    consensus: str               # Consensus base
     
     @classmethod
     def from_column(cls, column):
-        """从比对的单列创建位点统计"""
+        """Create position statistics from an alignment column"""
         bases = [b.upper() for b in column if b != '-']
         total = len(column)
         base_counts = Counter(bases)
         
-        # 计算间隙频率
+        # Calculate gap frequency
         gap_count = column.count('-')
         gap_freq = gap_count / total if total > 0 else 0
         
-        # 如果全是间隙，返回间隙
+        # If all gaps, return gap
         if gap_freq == 1.0:
             return cls(base_counts, 0.0, gap_freq, '-')
             
-        # 计算熵(多样性)
+        # Calculate entropy (diversity)
         entropy = 0.0
         if bases:
             probs = [count / len(bases) for count in base_counts.values()]
@@ -97,14 +95,14 @@ class PositionStats:
                 if p > 0:
                     entropy -= p * np.log2(p)
                     
-        # 确定共识碱基 - 使用 IUPAC 表示
+        # Determine consensus base - using IUPAC representation
         if base_counts:
-            # 如果一个碱基出现频率超过 70%，使用该碱基
+            # If one base appears with frequency > 70%, use that base
             most_common = base_counts.most_common(1)[0]
             if most_common[1] / len(bases) >= 0.7:
                 consensus = most_common[0]
             else:
-                # 否则，找出所有频率 >= 20% 的碱基
+                # Otherwise, find all bases with frequency >= 20%
                 significant_bases = frozenset(
                     base for base, count in base_counts.items() 
                     if count / len(bases) >= 0.2
@@ -134,7 +132,7 @@ class RMBlastAlignment:
 
 
 class EnhancedConsensus:
-    """增强型共识序列，包含位点频率和变异信息"""
+    """Enhanced consensus sequence with position frequency and variation information"""
     
     def __init__(self, seq_id, consensus_seq, position_stats=None, 
                  entropy=None, conservation_blocks=None, alignment=None):
@@ -146,17 +144,17 @@ class EnhancedConsensus:
         self.alignment = alignment
         
     def to_seqrecord(self):
-        """转换为 Bio.SeqRecord 对象"""
+        """Convert to Bio.SeqRecord object"""
         desc_parts = []
         
-        # 添加保守区块信息
+        # Add conservation block information
         if self.conservation_blocks:
             block_info = []
             for start, end, cons in self.conservation_blocks:
                 block_info.append(f"{start}-{end}:{cons:.2f}")
             desc_parts.append(f"conserved_blocks={','.join(block_info)}")
             
-        # 添加平均熵
+        # Add average entropy
         if self.entropy:
             mean_entropy = sum(self.entropy) / len(self.entropy) if self.entropy else 0
             desc_parts.append(f"mean_entropy={mean_entropy:.4f}")
@@ -170,69 +168,25 @@ class EnhancedConsensus:
         )
     
     def to_detailed_seqrecord(self):
-        """转换为详细的 SeqRecord，包含位点注释"""
+        """Convert to detailed SeqRecord with position annotations"""
         record = self.to_seqrecord()
         
-        # 每20个位点添加一个位点注释行
+        # Add a position annotation line every 20 positions
         annotations = []
         for i in range(0, len(self.position_stats), 20):
             block = self.position_stats[i:i+20]
             annotation_line = []
             for pos in block:
-                if pos.entropy > 0.5:  # 高变异位点
+                if pos.entropy > 0.5:  # High variation position
                     annotation_line.append('*')
                 else:
                     annotation_line.append(' ')
             annotations.append(''.join(annotation_line))
             
-        # 添加到 record 的注释中
+        # Add to record annotations
         record.annotations['site_annotations'] = annotations
         
         return record
-        
-    def generate_logo_plot(self, output_file):
-        """生成序列 logo 可视化"""
-        try:
-            import logomaker
-            import pandas as pd
-            
-            # 准备数据
-            data = []
-            for i, stats in enumerate(self.position_stats):
-                if stats.consensus == '-':
-                    continue
-                    
-                row = {'A': 0, 'C': 0, 'G': 0, 'T': 0, 'position': i+1}
-                total = sum(stats.base_counts.values())
-                
-                if total > 0:
-                    for base, count in stats.base_counts.items():
-                        if base in 'ACGT':
-                            row[base] = count / total
-                
-                data.append(row)
-                
-            if not data:
-                logger.warning("No valid data for sequence logo generation")
-                return
-                
-            # 创建 DataFrame
-            matrix = pd.DataFrame(data)
-            matrix = matrix.set_index('position')
-            
-            # 生成 logo
-            plt.figure(figsize=(10, 3))
-            logo = logomaker.Logo(matrix, color_scheme='classic')
-            logo.style_spines(visible=False)
-            logo.ax.set_ylabel('Frequency')
-            logo.ax.set_xlabel('Position')
-            
-            plt.tight_layout()
-            plt.savefig(output_file, dpi=300)
-            plt.close()
-            
-        except ImportError:
-            logger.warning("Logomaker or pandas not available. Skipping logo generation.")
 
 
 class SequenceClusterer:
@@ -287,38 +241,6 @@ class SequenceClusterer:
             except OSError as e:
                 logger.warning(f"Error cleaning up temporary files: {e}")
 
-    def visualize_distance_matrix(self, distances, sequences, output_file):
-        """可视化距离矩阵"""
-        try:
-            n_seqs = len(sequences)
-            fig, ax = plt.subplots(figsize=(10, 8))
-            
-            # 创建自定义颜色映射 - 从蓝色(相似)到红色(不同)
-            cmap = LinearSegmentedColormap.from_list('custom_cmap', ['blue', 'white', 'red'])
-            
-            im = ax.imshow(distances, cmap=cmap, vmin=0, vmax=1)
-            plt.colorbar(im, ax=ax, label='Distance')
-            
-            # 标注轴
-            if n_seqs <= 30:  # 只有较少序列时才添加标签
-                ax.set_xticks(np.arange(n_seqs))
-                ax.set_yticks(np.arange(n_seqs))
-                
-                # 截断长ID以适应图表
-                labels = [seq.id[:15] + '...' if len(seq.id) > 15 else seq.id 
-                         for seq in sequences]
-                
-                ax.set_xticklabels(labels, rotation=90, fontsize=8)
-                ax.set_yticklabels(labels, fontsize=8)
-            
-            plt.title('Sequence Distance Matrix')
-            plt.tight_layout()
-            plt.savefig(output_file, dpi=300)
-            plt.close()
-            
-        except Exception as e:
-            logger.warning(f"Error visualizing distance matrix: {e}")
-
     def cluster_sequences(self, sequences):
         if len(sequences) == 1:
             return [[sequences[0]]]
@@ -326,11 +248,6 @@ class SequenceClusterer:
         logger.info("Calculating distance matrix...")
         distances = self.calculate_distance_matrix(sequences)
         
-        # 可视化距离矩阵
-        matrix_viz = os.path.join(self.te_builder.temp_dir, "distance_matrix.png")
-        self.visualize_distance_matrix(distances, sequences, matrix_viz)
-        logger.info(f"Distance matrix visualization saved to {matrix_viz}")
-
         logger.info("Performing hierarchical clustering...")
         try:
             distances = np.maximum(distances, distances.T)
@@ -338,17 +255,17 @@ class SequenceClusterer:
             linkage_matrix = linkage(condensed_distances, method='average')
             clusters = fcluster(linkage_matrix, t=self.distance_threshold, criterion='distance')
 
-            # 分配序列到聚类
+            # Assign sequences to clusters
             cluster_dict = defaultdict(list)
             for seq, cluster_id in zip(sequences, clusters):
                 cluster_dict[cluster_id].append(seq)
                 
-            # 检查大聚类并拆分
+            # Check for large clusters and split
             final_clusters = []
             for cluster_id, cluster_seqs in cluster_dict.items():
                 if len(cluster_seqs) > self.max_cluster_size:
                     logger.info(f"Large cluster detected with {len(cluster_seqs)} sequences. Attempting to split.")
-                    # 尝试用更严格的阈值拆分
+                    # Try splitting with stricter threshold
                     subclusters = self.split_large_cluster(cluster_seqs)
                     final_clusters.extend(subclusters)
                 else:
@@ -362,16 +279,16 @@ class SequenceClusterer:
             raise
             
     def split_large_cluster(self, sequences):
-        """尝试拆分大聚类，使用进化树方法"""
+        """Try to split large clusters using evolutionary tree methods"""
         logger.info(f"Splitting large cluster with {len(sequences)} sequences")
         
-        # 方法1: 使用更严格的层次聚类阈值
+        # Method 1: Use stricter hierarchical clustering threshold
         try:
             distances = self.calculate_distance_matrix(sequences)
             condensed_distances = squareform(distances)
             linkage_matrix = linkage(condensed_distances, method='average')
             
-            # 尝试递减阈值，直到获得合理大小的聚类
+            # Try decreasing thresholds until reasonable cluster sizes
             thresholds = [self.subclustering_threshold, 0.3, 0.2, 0.1]
             for threshold in thresholds:
                 subclusters = fcluster(linkage_matrix, t=threshold, criterion='distance')
@@ -380,7 +297,7 @@ class SequenceClusterer:
                 for seq, cluster_id in zip(sequences, subclusters):
                     subcluster_dict[cluster_id].append(seq)
                     
-                # 检查最大聚类大小
+                # Check maximum cluster size
                 max_size = max(len(seqs) for seqs in subcluster_dict.values())
                 n_clusters = len(subcluster_dict)
                 
@@ -393,7 +310,7 @@ class SequenceClusterer:
         except Exception as e:
             logger.warning(f"Failed to split using hierarchical clustering: {e}")
             
-        # 方法2: 如果层次聚类失败，尝试随机抽样
+        # Method 2: If hierarchical clustering fails, try random sampling
         if len(sequences) > self.max_cluster_size:
             logger.warning(f"Could not split cluster effectively. Using random sampling to create manageable clusters.")
             random.shuffle(sequences)
@@ -421,12 +338,12 @@ class TEConsensusBuilder:
         self.use_iupac = use_iupac
         self.keep_variants = keep_variants
 
-        # 检查 MAFFT 是否存在，并获得其路径
+        # Check if MAFFT exists and get its path
         self.mafft_path = shutil.which("mafft")
         if not self.mafft_path:
             raise FileNotFoundError("mafft not found in system PATH")
             
-        # 检查是否可以使用 FastTree
+        # Check if FastTree can be used
         self.fasttree_path = shutil.which("fasttree")
         if not self.fasttree_path:
             logger.warning("FastTree not found. Phylogenetic methods will be limited.")
@@ -525,11 +442,11 @@ class TEConsensusBuilder:
 
     def build_multiple_alignment(self, sequences, reference=None, generate_tree=True):
         """
-        利用 MAFFT 对聚类内所有序列进行全局多序列比对，返回比对后的序列列表
-        增强版可以选择代表序列作为参考，并可选择生成进化树
+        Use MAFFT to perform global multiple sequence alignment on all sequences in a cluster
+        Enhanced version can select a representative sequence as reference and optionally generate a phylogenetic tree
         """
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".fa", dir=self.temp_dir) as temp_in:
-            # 如果指定了参考序列，将其放在第一位
+            # If reference sequence specified, place it first
             if reference is not None:
                 SeqIO.write([reference] + [s for s in sequences if s.id != reference.id], temp_in, "fasta")
             else:
@@ -540,9 +457,9 @@ class TEConsensusBuilder:
         tree_file = temp_in_name + ".tree"
 
         try:
-            # 运行 MAFFT 进行多序列比对
+            # Run MAFFT for multiple sequence alignment
             if reference is not None:
-                # 使用 --add 选项，以保持参考序列不变
+                # Use --add option to keep reference sequence fixed
                 cmd = [
                     self.mafft_path, 
                     "--retree", "2",
@@ -557,23 +474,23 @@ class TEConsensusBuilder:
             logger.info("Running MAFFT for multiple sequence alignment: " + " ".join(cmd))
             result = subprocess.run(cmd, check=True, capture_output=True, text=True)
             
-            # 保存比对结果
+            # Save alignment results
             with open(alignment_file, "w") as f:
                 f.write(result.stdout)
                 
-            # 从结果中解析对齐序列
+            # Parse aligned sequences from results
             aligned_output = result.stdout
             alignment = AlignIO.read(StringIO(aligned_output), "fasta")
             
-            # 如果请求，生成进化树
+            # Generate phylogenetic tree if requested
             if generate_tree and self.fasttree_path and len(sequences) >= 3:
                 try:
-                    # 运行 FastTree 生成进化树
+                    # Run FastTree to generate phylogenetic tree
                     tree_cmd = [
                         self.fasttree_path,
-                        "-nt", # 核酸序列
-                        "-gtr", # 通用时间可逆模型
-                        "-gamma", # Gamma分布模型
+                        "-nt", # nucleotide sequences
+                        "-gtr", # general time reversible model
+                        "-gamma", # Gamma distribution model
                     ]
                     
                     logger.info("Generating phylogenetic tree with FastTree")
@@ -606,62 +523,62 @@ class TEConsensusBuilder:
             os.remove(temp_in_name)
 
     def analyze_alignment(self, alignment):
-        """分析多序列比对结果，计算位点统计和保守区块"""
+        """Analyze multiple sequence alignment results, calculate position statistics and conserved blocks"""
         if not alignment:
             return [], [], []
             
-        # 计算每个位点的统计信息
+        # Calculate statistics for each position
         position_stats = []
         for i in range(alignment.get_alignment_length()):
             column = alignment[:, i]
             stats = PositionStats.from_column(column)
             position_stats.append(stats)
             
-        # 计算位点熵
+        # Calculate position entropy
         entropy = [stats.entropy for stats in position_stats]
         
-        # 识别保守区块
+        # Identify conserved blocks
         conservation_blocks = []
         current_block = None
         
         for i, stats in enumerate(position_stats):
             if stats.entropy < self.entropy_threshold and stats.gap_freq < 0.2:
-                # 保守位点
+                # Conserved position
                 if current_block is None:
-                    # 开始新块
+                    # Start new block
                     current_block = [i, i, 1.0 - stats.entropy]
                 else:
-                    # 继续现有块
+                    # Continue existing block
                     current_block[1] = i
                     current_block[2] = (current_block[2] * (i - current_block[0]) + (1.0 - stats.entropy)) / ((i - current_block[0]) + 1)
             else:
-                # 非保守位点
+                # Non-conserved position
                 if current_block is not None:
-                    # 如果块足够长，保存它
+                    # If block is long enough, save it
                     if current_block[1] - current_block[0] + 1 >= self.min_conserved_block:
                         conservation_blocks.append(tuple(current_block))
                     current_block = None
                     
-        # 检查最后一个块
+        # Check the last block
         if current_block is not None and current_block[1] - current_block[0] + 1 >= self.min_conserved_block:
             conservation_blocks.append(tuple(current_block))
             
         return position_stats, entropy, conservation_blocks
 
     def build_enhanced_consensus(self, alignment, seq_id, reference_idx=None):
-        """构建增强型共识序列，包含位点频率和变异信息"""
+        """Build enhanced consensus sequence with position frequency and variation information"""
         if not alignment:
             return EnhancedConsensus(seq_id, "")
             
-        # 分析比对
+        # Analyze alignment
         position_stats, entropy, conservation_blocks = self.analyze_alignment(alignment)
         
-        # 构建共识序列
+        # Build consensus sequence
         consensus_seq = []
         
         for i, stats in enumerate(position_stats):
-            if stats.gap_freq > 0.5:  # 大多数为间隙
-                consensus_seq.append("")  # 不添加任何字符
+            if stats.gap_freq > 0.5:  # Majority gaps
+                consensus_seq.append("")  # Don't add any character
             else:
                 if self.use_iupac:
                     consensus_seq.append(stats.consensus)
@@ -674,7 +591,7 @@ class TEConsensusBuilder:
         
         consensus_seq = "".join(consensus_seq)
         
-        # 创建增强型共识对象
+        # Create enhanced consensus object
         enhanced_consensus = EnhancedConsensus(
             seq_id=seq_id,
             consensus_seq=consensus_seq,
@@ -687,30 +604,30 @@ class TEConsensusBuilder:
         return enhanced_consensus
 
     def select_representative_variants(self, sequences, alignment, tree_file=None, max_variants=3):
-        """从聚类中选择代表性变体"""
+        """Select representative variants from the cluster"""
         if len(sequences) <= 1:
             return sequences
             
         if len(sequences) <= max_variants:
             return sequences
             
-        # 尝试基于系统发育树选择变体
+        # Try selecting variants based on phylogenetic tree
         if tree_file and os.path.exists(tree_file):
             try:
-                # 使用 Phylo 读取树
+                # Use Phylo to read the tree
                 tree = Phylo.read(tree_file, "newick")
                 
-                # 获取最深的分支
+                # Get the deepest branches
                 depths = {}
                 for clade in tree.find_clades():
                     if clade.name:
                         depths[clade.name] = tree.distance(tree.root, clade)
                 
-                # 选择不同分支的代表
+                # Select representatives from different branches
                 variants = []
                 seq_by_id = {seq.id: seq for seq in sequences}
                 
-                # 按深度排序并选择前几个
+                # Sort by depth and select the first few
                 sorted_seqs = sorted(depths.items(), key=lambda x: x[1], reverse=True)
                 for name, _ in sorted_seqs[:max_variants]:
                     if name in seq_by_id:
@@ -723,33 +640,33 @@ class TEConsensusBuilder:
             except Exception as e:
                 logger.warning(f"Error selecting variants from phylogenetic tree: {e}")
         
-        # 备选方法: 基于序列长度和变异
+        # Alternative method: Based on sequence length and variation
         try:
-            # 计算每个序列的特征
+            # Calculate features for each sequence
             seq_features = []
             avg_len = sum(len(seq.seq) for seq in sequences) / len(sequences)
             
             for i, seq in enumerate(sequences):
-                # 长度偏差
+                # Length deviation
                 len_dev = abs(len(seq.seq) - avg_len) / avg_len if avg_len > 0 else 0
                 
-                # 序列变异性
+                # Sequence variability
                 n_count = str(seq.seq).upper().count('N')
                 n_ratio = n_count / len(seq.seq) if len(seq.seq) > 0 else 0
                 
                 seq_features.append((seq, len_dev, n_ratio, i))
             
-            # 选择一个接近平均长度的序列
-            seq_features.sort(key=lambda x: x[1])  # 按长度偏差排序
+            # Select a sequence close to average length
+            seq_features.sort(key=lambda x: x[1])  # Sort by length deviation
             variants = [seq_features[0][0]]
             
-            # 再选择几个最不同的序列
+            # Then select a few most different sequences
             if len(seq_features) > 1:
-                # 先移除已选序列
+                # First remove already selected sequences
                 remaining = seq_features[1:]
                 
-                # 基于N含量和长度偏差选择不同的序列
-                remaining.sort(key=lambda x: (-x[2], x[1]))  # N率低且长度不同
+                # Select based on N content and length deviation
+                remaining.sort(key=lambda x: (-x[2], x[1]))  # Lower N rate and different length
                 
                 for i in range(min(max_variants-1, len(remaining))):
                     variants.append(remaining[i][0])
@@ -760,14 +677,14 @@ class TEConsensusBuilder:
         except Exception as e:
             logger.warning(f"Error selecting variants based on features: {e}")
             
-        # 最保守的方法：随机选择
+        # Most conservative method: Random selection
         return random.sample(sequences, min(max_variants, len(sequences)))
 
     def mash_precluster(self, sequences, mash_threshold=0.1):
         temp_fa = None
         sketch_prefix = None
         try:
-            # 创建临时文件并写入序列
+            # Create temporary file and write sequences
             with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".fa", dir=self.temp_dir) as temp:
                 SeqIO.write(sequences, temp, "fasta")
                 temp_fa = temp.name
@@ -775,18 +692,18 @@ class TEConsensusBuilder:
                 temp.flush()
                 os.fsync(temp.fileno())
 
-            # 保存序列 ID 到文件名的映射
+            # Save mapping of sequence IDs to filenames
             seq_id_map = {str(seq.id): seq for seq in sequences}
             
             sketch_prefix = temp_fa + ".mash"
             
-            # 检查 mash 命令
+            # Check mash command
             mash_path = shutil.which("mash")
             if not mash_path:
                 raise FileNotFoundError("mash command not found in system PATH")
             logger.info(f"Found mash at: {mash_path}")
                 
-            # 运行 mash sketch
+            # Run mash sketch
             sketch_cmd = [mash_path, "sketch", "-k", "16", "-m", "2", "-o", sketch_prefix, temp_fa]
             logger.info("Running mash sketch: " + " ".join(sketch_cmd))
             result = subprocess.run(sketch_cmd, 
@@ -796,13 +713,13 @@ class TEConsensusBuilder:
             if result.stderr:
                 logger.info(f"Mash sketch stderr: {result.stderr}")
 
-            # 检查 mash sketch 输出文件
+            # Check mash sketch output file
             msh_file = sketch_prefix + ".msh"
             if not os.path.exists(msh_file):
                 raise FileNotFoundError(f"Mash sketch output file not found: {msh_file}")
             logger.info(f"Mash sketch file created: {msh_file}")
 
-            # 运行 mash dist
+            # Run mash dist
             dist_cmd = [mash_path, "dist", msh_file, temp_fa]
             logger.info("Running mash dist: " + " ".join(dist_cmd))
             result = subprocess.run(dist_cmd, 
@@ -817,19 +734,19 @@ class TEConsensusBuilder:
             if not mash_output.strip():
                 raise RuntimeError("Mash dist produced no output")
 
-            # 处理聚类
+            # Process clustering
             try:
-                # 使用序列ID初始化UnionFind，而不是文件路径
+                # Initialize UnionFind with sequence IDs, not file paths
                 uf = UnionFind([str(seq.id) for seq in sequences])
                 logger.info(f"Initialized UnionFind with {len(sequences)} sequences")
                 
                 cluster_count = 0
                 for line in mash_output.strip().split("\n"):
-                    parts = line.split("\t")  # 使用tab作为分隔符
+                    parts = line.split("\t")  # Use tab as separator
                     if len(parts) < 3:
                         continue
                     
-                    # 从文件名中提取序列ID
+                    # Extract sequence ID from filename
                     seq1_path = parts[0]
                     seq2_path = parts[1]
                     seq1_id = os.path.basename(seq1_path)
@@ -846,7 +763,7 @@ class TEConsensusBuilder:
                         
                 logger.info(f"Created {cluster_count} initial clusters")
 
-                # 构建聚类结果
+                # Build clustering results
                 clusters_dict = defaultdict(list)
                 for seq in sequences:
                     seq_id = str(seq.id)
@@ -856,7 +773,7 @@ class TEConsensusBuilder:
                 preclusters = list(clusters_dict.values())
                 logger.info(f"Formed {len(preclusters)} preclusters")
 
-                # 进行细粒度聚类
+                # Perform fine-grained clustering
                 final_clusters = []
                 clusterer = SequenceClusterer(self)
                 for i, group in enumerate(preclusters):
@@ -881,7 +798,7 @@ class TEConsensusBuilder:
             raise
 
         finally:
-            # 清理临时文件
+            # Clean up temporary files
             try:
                 if temp_fa and os.path.exists(temp_fa):
                     os.remove(temp_fa)
@@ -943,7 +860,7 @@ class TEConsensusBuilder:
             os.chdir(self.temp_dir)
             logger.info(f"Created temporary directory: {self.temp_dir}")
             
-            # 创建详细信息目录
+            # Create details directory
             if details_dir:
                 details_path = os.path.abspath(details_dir)
                 os.makedirs(details_path, exist_ok=True)
@@ -979,7 +896,7 @@ class TEConsensusBuilder:
                 logger.info(f"Processing cluster {i} with {len(cluster)} sequences")
                 
                 if len(cluster) == 1:
-                    # 单序列聚类
+                    # Single sequence cluster
                     consensus_seq = str(cluster[0].seq)
                     consensus_desc = f"single sequence from cluster {i}"
                     consensus_record = SeqRecord(
@@ -989,7 +906,7 @@ class TEConsensusBuilder:
                     )
                     consensus_records.append(consensus_record)
                     
-                    # 单序列不需要变体
+                    # No variants for single sequences
                     cluster_stats.append({
                         "cluster_id": cluster_id,
                         "size": 1,
@@ -999,25 +916,21 @@ class TEConsensusBuilder:
                     })
                     
                 else:
-                    # 多序列聚类
-                    # 1. 多序列比对
+                    # Multiple sequence cluster
+                    # 1. Multiple sequence alignment
                     alignment, aln_file, tree_file = self.build_multiple_alignment(cluster)
                     
-                    # 保存比对文件以供参考
+                    # Save alignment file for reference
                     cluster_aln_file = os.path.join(details_path, f"{cluster_id}_alignment.fa")
                     shutil.copy(aln_file, cluster_aln_file)
                     
-                    # 2. 构建增强型共识序列
+                    # 2. Build enhanced consensus sequence
                     enhanced_consensus = self.build_enhanced_consensus(alignment, cluster_id)
                     
-                    # 3. 生成序列logo
-                    logo_file = os.path.join(details_path, f"{cluster_id}_logo.png")
-                    enhanced_consensus.generate_logo_plot(logo_file)
-                    
-                    # 4. 添加到结果
+                    # 3. Add to results
                     consensus_records.append(enhanced_consensus.to_seqrecord())
                     
-                    # 5. 如果需要，选择代表性变体
+                    # 4. If needed, select representative variants
                     if self.keep_variants:
                         variants = self.select_representative_variants(
                             cluster, alignment, tree_file, max_variants=min(3, len(cluster))
@@ -1032,7 +945,7 @@ class TEConsensusBuilder:
                             )
                             variant_records.append(var_record)
                     
-                    # 6. 收集统计信息
+                    # 5. Collect statistics
                     cluster_stats.append({
                         "cluster_id": cluster_id,
                         "size": len(cluster),
@@ -1042,12 +955,12 @@ class TEConsensusBuilder:
                         "mean_entropy": sum(enhanced_consensus.entropy) / len(enhanced_consensus.entropy) if enhanced_consensus.entropy else 0
                     })
             
-            # 写入结果
+            # Write results
             all_records = consensus_records + variant_records
             SeqIO.write(all_records, output_path, "fasta")
             logger.info(f"Written {len(all_records)} sequences to {output_path}")
             
-            # 写入统计信息
+            # Write statistics
             stats_output = stats_file or f"{output_path}.stats"
             with open(stats_output, "w") as f:
                 f.write(f"Original sequences: {len(sequences)}\n")
@@ -1215,12 +1128,12 @@ if __name__ == "__main__":
             keep_variants=args.keep_variants
         )
         
-        # 创建SequenceClusterer并设置最大聚类大小
+        # Create SequenceClusterer and set maximum cluster size
         clusterer = SequenceClusterer(
             builder,
             distance_threshold=args.distance_threshold,
             max_cluster_size=args.max_cluster_size,
-            subclustering_threshold=args.distance_threshold * 0.6  # 更严格的二级聚类阈值
+            subclustering_threshold=args.distance_threshold * 0.6  # Stricter secondary clustering threshold
         )
         
         result = builder.build_clustered_consensus(

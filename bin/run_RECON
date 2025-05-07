@@ -133,8 +133,9 @@ sub process_repeat_masker {
     
     run_cmd("sample_for_genome $genome_file.fai out.bed $times $batch_size");
     run_cmd("seqtk subseq $genome_file out.bed > tmp.fa");
+    run_cmd("renameTE TE ../raw.fa ../re.fa");
     
-    system("Refiner_for_LTR ../raw.fa ./ --threads $threads > refine.log 2> refine.err") == 0 
+    system("Refiner_for_LTR ../re.fa ./ --threads $threads > refine.log 2> refine.err") == 0 
         or die "Failed to Combine LTR & RepeatScout\n";
     
     `mv consensi.fa lib.fa`;
