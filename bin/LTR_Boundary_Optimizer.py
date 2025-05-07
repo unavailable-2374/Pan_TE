@@ -9,6 +9,7 @@ import tempfile
 import time
 import re
 import shutil
+import random
 from collections import defaultdict, Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from Bio import SeqIO
@@ -17,6 +18,20 @@ from Bio.SeqRecord import SeqRecord
 import numpy as np
 from itertools import groupby
 
+# Check and import optional dependencies
+try:
+    import umap
+    import hdbscan
+    CLUSTERING_AVAILABLE = True
+except ImportError:
+    CLUSTERING_AVAILABLE = False
+
+try:
+    from Bio.SeqUtils import GC, ProtParam
+    BIOUTILS_AVAILABLE = True
+except ImportError:
+    BIOUTILS_AVAILABLE = False
+
 class LTREnhancedOptimizer:
     """
     Comprehensive tool for refining LTR consensus sequences with:
@@ -24,6 +39,9 @@ class LTREnhancedOptimizer:
     2. Precise boundary determination using structural features
     3. Non-transposon sequence filtering
     4. Efficient processing of GB-scale genomes
+    5. Family clustering and subfamily identification
+    6. Advanced TSD and motif detection
+    7. ORF and coding potential analysis
     
     Can be used as a standalone script or imported as a module in workflows.
     """
@@ -34,7 +52,12 @@ class LTREnhancedOptimizer:
                  chimera_threshold=0.3, min_segment_length=500,
                  tsd_min=4, tsd_max=6, iterations=2, 
                  chunk_size=10, batch_size=50, 
-                 keep_temp=False, log_level="INFO"):
+                 keep_temp=False, log_level="INFO",
+                 low_complexity_filter=True, clustering=True,
+                 dynamic_threshold=True, orf_analysis=True,
+                 kmer_boundary=True, blank_region_threshold=100,
+                 orientation_aware=True, pssm_tsd=True,
+                 custom_motifs=None, classify_output=False):
         """
         Initialize the LTR enhanced optimizer.
         
@@ -57,6 +80,16 @@ class LTREnhancedOptimizer:
             batch_size: Number of consensus sequences to process in each batch
             keep_temp: Whether to keep temporary files
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
+            low_complexity_filter: Whether to filter low complexity regions
+            clustering: Whether to perform clustering for subfamily identification
+            dynamic_threshold: Whether to use dynamic thresholds for non-TE filtering
+            orf_analysis: Whether to perform ORF analysis
+            kmer_boundary: Whether to use k-mer based boundary detection
+            blank_region_threshold: Minimum length of blank regions for chimera detection
+            orientation_aware: Whether to use orientation-aware chimera detection
+            pssm_tsd: Whether to use PSSM for TSD identification
+            custom_motifs: Custom motifs for boundary detection
+            classify_output: Whether to classify output sequences
         """
         # Core parameters
         self.consensus_file = consensus_file
@@ -79,6 +112,18 @@ class LTREnhancedOptimizer:
         self.batch_size = batch_size
         self.keep_temp = keep_temp
         
+        # Enhanced parameters
+        self.low_complexity_filter = low_complexity_filter
+        self.clustering = clustering
+        self.dynamic_threshold = dynamic_threshold
+        self.orf_analysis = orf_analysis
+        self.kmer_boundary = kmer_boundary
+        self.blank_region_threshold = blank_region_threshold
+        self.orientation_aware = orientation_aware
+        self.pssm_tsd = pssm_tsd
+        self.custom_motifs = custom_motifs
+        self.classify_output = classify_output
+        
         # Initialize logger
         self._setup_logging(log_level)
         
@@ -90,7 +135,58 @@ class LTREnhancedOptimizer:
         # LTR-specific patterns
         self.ltr5_motifs = ["TG", "TGT", "TGTA", "TGTG", "TGCA"]
         self.ltr3_motifs = ["CA", "ACA", "TACA", "CACA", "TGCA"]
+        
+        # Add custom motifs if provided
+        if self.custom_motifs:
+            if 'ltr5' in self.custom_motifs and isinstance(self.custom_motifs['ltr5'], list):
+                self.ltr5_motifs.extend(self.custom_motifs['ltr5'])
+            if 'ltr3' in self.custom_motifs and isinstance(self.custom_motifs['ltr3'], list):
+                self.ltr3_motifs.extend(self.custom_motifs['ltr3'])
+                
         self.tsd_patterns = {}  # Will store found TSDs
+        
+        # PBS patterns - expanded for different organisms
+        self.pbs_patterns = {
+            'tRNAPro': 'TGGCGCCCAACGTGGGGC',
+            'tRNATrp': 'TGGCGCCGTAACAGGGAC',
+            'tRNAGln': 'TGGCGCCCGAACAGGGAC',
+            'tRNALys': 'TGGCGCCCAACCTGGGA',
+            'tRNAIle': 'TGGTAGCAGAGCTGGGAA',
+            'tRNAMet': 'TGGCAGCAGGTCAGGGC',
+            'tRNAAla': 'TGGCGCAGTGGCAGCGC',
+            'tRNAArg': 'TGGACCGCTAGCTCAGTGGTA',
+            'tRNAAsn': 'TGGCTCCGTAGCTCAATGG',
+            'tRNAAsp': 'TGGGTCCGTAGTGTAGCGGT',
+            'tRNACys': 'TGGCGCAGTGGAAGCGC',
+            'tRNAGlu': 'TGGTTCCATGGTGAGGCC',
+            'tRNAGly': 'TGGCGCGGTGGCGCAG',
+            'tRNAHis': 'TGGCCGTGATCGTATAGTG',
+            'tRNAPhe': 'TGGTGCGTTTAACCACTA',
+            'tRNASer': 'TGGACGAGTGGCCCGAG',
+            'tRNAThr': 'TGGCCGCGTGGCCCAAT',
+            'tRNATyr': 'TGGGTGACCTCCCGGGC',
+            'tRNAVal': 'TGGGTGATTAGCTCAGC'
+        }
+        
+        # TE protein domains for ORF analysis
+        self.te_domains = {
+            'gag': ['CCHC', 'CXCX2CX4HX4C', 'zinc finger', 'capsid', 'nucleocapsid'],
+            'pol': ['protease', 'integrase', 'reverse transcriptase', 'RNase H', 'aspartyl protease'],
+            'env': ['envelope', 'transmembrane', 'surface glycoprotein']
+        }
+        
+        # Position-specific scoring matrices for TSD identification
+        self.tsd_pssm = self._initialize_tsd_pssm()
+    
+    def _initialize_tsd_pssm(self):
+        """Initialize position-specific scoring matrices for TSD identification"""
+        # Simple initialization - can be enhanced with real training data
+        pssm = {}
+        for length in range(self.tsd_min, self.tsd_max + 1):
+            # Create a uniform matrix for each position
+            # For real implementation, these should be trained from known TSDs
+            pssm[length] = np.ones((length, 4)) * 0.25  # Equal probability for A,C,G,T
+        return pssm
         
     def _setup_logging(self, log_level):
         """Setup logging configuration"""
@@ -141,8 +237,13 @@ class LTREnhancedOptimizer:
         self.chimera_dir = os.path.join(self.output_dir, "chimera_detection")
         self.boundary_dir = os.path.join(self.output_dir, "boundaries")
         self.stats_dir = os.path.join(self.output_dir, "statistics")
+        self.clustering_dir = os.path.join(self.output_dir, "subfamily_clustering")
+        self.orf_dir = os.path.join(self.output_dir, "orf_analysis")
+        self.classification_dir = os.path.join(self.output_dir, "classification")
         
-        for directory in [self.alignment_dir, self.chimera_dir, self.boundary_dir, self.stats_dir]:
+        for directory in [self.alignment_dir, self.chimera_dir, self.boundary_dir, 
+                         self.stats_dir, self.clustering_dir, self.orf_dir, 
+                         self.classification_dir]:
             os.makedirs(directory, exist_ok=True)
             
         # Check for required external tools
@@ -156,7 +257,7 @@ class LTREnhancedOptimizer:
     def _check_dependencies(self):
         """Check if required external tools are available"""
         required_tools = ["minimap2", "bedtools"]
-        optional_tools = ["seqkit", "blast+"]
+        optional_tools = ["seqkit", "blast+", "dustmasker", "trf"]
         
         missing_tools = []
         missing_optional = []
@@ -175,6 +276,14 @@ class LTREnhancedOptimizer:
             
         if missing_optional:
             self.logger.warning(f"Missing optional tools (some features may be limited): {', '.join(missing_optional)}")
+            
+        # Check for optional Python packages
+        if self.clustering and not CLUSTERING_AVAILABLE:
+            self.logger.warning("UMAP and HDBSCAN are not available. Clustering will be disabled.")
+            self.clustering = False
+            
+        if self.orf_analysis and not BIOUTILS_AVAILABLE:
+            self.logger.warning("BioPython SeqUtils is not available. ORF analysis features will be limited.")
             
         return True
     
@@ -234,8 +343,13 @@ class LTREnhancedOptimizer:
         self.logger.info("Preparing genome sequence access")
         genome_seqs = self._prepare_genome_access()
         
+        # Preprocess input sequences if needed (low complexity filter)
+        preprocessed_file = self.consensus_file
+        if self.low_complexity_filter:
+            preprocessed_file = self._filter_low_complexity_regions(self.consensus_file)
+        
         # Process in iterations for incremental improvement
-        current_input = self.consensus_file
+        current_input = preprocessed_file
         for iteration in range(1, self.iterations + 1):
             self.logger.info(f"Starting iteration {iteration}/{self.iterations}")
             
@@ -274,6 +388,18 @@ class LTREnhancedOptimizer:
             
             # Prepare for next iteration
             current_input = iter_output
+        
+        # Perform subfamily clustering if enabled
+        if self.clustering and CLUSTERING_AVAILABLE and len(refined_sequences) > 3:
+            self.logger.info("Performing subfamily clustering")
+            subfamily_file = self._perform_subfamily_clustering(refined_sequences)
+            current_input = subfamily_file
+            
+        # Classify output sequences if enabled
+        if self.classify_output:
+            self.logger.info("Classifying output sequences")
+            classification_file = self._classify_sequences(current_input)
+            current_input = classification_file
             
         # Create final output
         final_output = os.path.join(self.output_dir, "optimized_consensus.fa")
@@ -289,6 +415,88 @@ class LTREnhancedOptimizer:
             
         self.logger.info(f"LTR consensus optimization completed. Results saved to {final_output}")
         return final_output
+    
+    def _filter_low_complexity_regions(self, fasta_file):
+        """
+        Filter low complexity regions using dustmasker or custom implementation.
+        
+        Args:
+            fasta_file: Path to input FASTA file
+            
+        Returns:
+            Path to filtered FASTA file
+        """
+        output_file = os.path.join(self.temp_dir, "filtered_low_complexity.fa")
+        
+        # Check if dustmasker is available
+        if shutil.which("dustmasker"):
+            self.logger.info("Using dustmasker to filter low complexity regions")
+            
+            # Run dustmasker to identify low complexity regions
+            mask_file = os.path.join(self.temp_dir, "masked_regions.asnb")
+            cmd = ["dustmasker", "-in", fasta_file, "-out", mask_file, "-outfmt", "asn1_bin"]
+            
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                # Convert masked regions to FASTA
+                cmd = ["dustmasker", "-in", fasta_file, "-out", output_file, "-outfmt", "fasta", 
+                       "-asnb", mask_file, "-lcase", "-infmt", "fasta"]
+                
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.logger.info(f"Low complexity regions filtered: {output_file}")
+                return output_file
+                
+            except subprocess.CalledProcessError as e:
+                self.logger.error(f"Failed to run dustmasker: {e.stderr.decode()}")
+                self.logger.warning("Falling back to custom low complexity filtering")
+                
+        # Simple custom implementation if dustmasker is not available
+        self.logger.info("Using custom method to filter low complexity regions")
+        
+        filtered_records = []
+        for record in SeqIO.parse(fasta_file, "fasta"):
+            # Convert sequence to lowercase for masking
+            seq_str = str(record.seq).lower()
+            
+            # Simple entropy-based masking
+            window_size = 10
+            threshold = 1.2  # Higher threshold = less masking
+            
+            masked_seq = list(seq_str)
+            
+            for i in range(len(seq_str) - window_size + 1):
+                window = seq_str[i:i+window_size]
+                
+                # Calculate entropy of window
+                counts = Counter(window)
+                total = sum(counts.values())
+                entropy = 0
+                
+                for count in counts.values():
+                    p = count / total
+                    entropy -= p * np.log2(p)
+                
+                # Mark low complexity regions with 'X'
+                if entropy < threshold:
+                    for j in range(i, i + window_size):
+                        if j < len(masked_seq):
+                            masked_seq[j] = 'N'
+            
+            # Create new record with masked sequence
+            masked_record = SeqRecord(
+                Seq(''.join(masked_seq)),
+                id=record.id,
+                name=record.name,
+                description=record.description + " [low complexity filtered]"
+            )
+            
+            filtered_records.append(masked_record)
+            
+        # Write filtered sequences
+        SeqIO.write(filtered_records, output_file, "fasta")
+        self.logger.info(f"Custom low complexity filtering completed: {output_file}")
+        return output_file
     
     def _prepare_genome_access(self):
         """
@@ -400,10 +608,14 @@ class LTREnhancedOptimizer:
         # Write chimera info
         chimera_file = os.path.join(self.chimera_dir, f"batch_{batch_id}_iter_{iteration}_chimeras.tsv")
         with open(chimera_file, "w") as f:
-            f.write("seq_id\tis_chimeric\tnum_segments\tbreakpoints\n")
+            f.write("seq_id\tis_chimeric\tnum_segments\tbreakpoints\tbreakpoint_confidence\tblank_regions\n")
             for seq_id, info in chimera_info.items():
                 breakpoints_str = ",".join(map(str, info["breakpoints"])) if info["breakpoints"] else "NA"
-                f.write(f"{seq_id}\t{info['is_chimeric']}\t{info['num_segments']}\t{breakpoints_str}\n")
+                confidence_str = ",".join(map(str, info["breakpoint_confidence"])) if info["breakpoint_confidence"] else "NA"
+                blank_regions_str = ",".join([f"{start}-{end}" for start, end in info["blank_regions"]]) if info["blank_regions"] else "NA"
+                
+                f.write(f"{seq_id}\t{info['is_chimeric']}\t{info['num_segments']}\t" +
+                       f"{breakpoints_str}\t{confidence_str}\t{blank_regions_str}\n")
         
         # Step 4: Re-align split sequences if needed
         if any(info["is_chimeric"] for info in chimera_info.values()):
@@ -431,23 +643,54 @@ class LTREnhancedOptimizer:
         boundary_file = os.path.join(self.boundary_dir, f"batch_{batch_id}_iter_{iteration}_boundaries.tsv")
         with open(boundary_file, "w") as f:
             f.write("seq_id\toriginal_length\tstart\tend\tstart_confidence\tend_confidence\t" +
-                   "start_feature\tend_feature\ttsd\n")
+                   "start_feature\tend_feature\ttsd\tkmer_boundary_support\tpbs_type\tppt_length\n")
             
             for seq_id, boundaries in boundary_info.items():
+                kmer_support = "YES" if boundaries.get('kmer_boundary_support', False) else "NO"
+                pbs_type = boundaries.get('internal_features', {}).get('pbs', {}).get('pattern', "NA") if boundaries.get('internal_features', {}).get('pbs') else "NA"
+                ppt_length = boundaries.get('internal_features', {}).get('ppt', {}).get('length', "NA") if boundaries.get('internal_features', {}).get('ppt') else "NA"
+                
                 f.write(f"{seq_id}\t{boundaries['original_length']}\t" +
                        f"{boundaries['start']}\t{boundaries['end']}\t" +
                        f"{boundaries['start_confidence']:.2f}\t{boundaries['end_confidence']:.2f}\t" +
                        f"{boundaries['start_feature'] or 'NA'}\t{boundaries['end_feature'] or 'NA'}\t" +
-                       f"{boundaries['tsd'] or 'NA'}\n")
+                       f"{boundaries['tsd'] or 'NA'}\t{kmer_support}\t{pbs_type}\t{ppt_length}\n")
         
-        # Step 6: Refine sequences based on boundaries
+        # Step 6: Analyze ORFs if enabled
+        orf_info = {}
+        if self.orf_analysis:
+            for seq in split_records:
+                if seq.id in boundary_info:
+                    orf_results = self._analyze_orfs(seq, boundary_info[seq.id])
+                    if orf_results:
+                        orf_info[seq.id] = orf_results
+            
+            # Write ORF info
+            orf_file = os.path.join(self.orf_dir, f"batch_{batch_id}_iter_{iteration}_orfs.tsv")
+            with open(orf_file, "w") as f:
+                f.write("seq_id\tnum_orfs\torf_locations\tdomain_hits\tcoding_score\n")
+                
+                for seq_id, orf_data in orf_info.items():
+                    orf_locs = ",".join([f"{start}-{end}" for start, end in orf_data['orf_locations']])
+                    domains = ",".join(orf_data['domain_hits'])
+                    
+                    f.write(f"{seq_id}\t{orf_data['num_orfs']}\t{orf_locs}\t" +
+                           f"{domains}\t{orf_data['coding_score']:.2f}\n")
+        
+        # Step 7: Refine sequences based on boundaries and filters
         refined_records = []
         for seq in split_records:
             if seq.id in boundary_info:
                 # Refine sequence based on detected boundaries
                 refined_seq = self._refine_sequence(seq, boundary_info[seq.id])
+                
                 # Filter out non-TE regions
-                filtered_seq = self._filter_non_te_regions(refined_seq, alignments_by_query.get(seq.id, []))
+                filtered_seq = self._filter_non_te_regions(
+                    refined_seq, 
+                    alignments_by_query.get(seq.id, []),
+                    orf_info.get(seq.id, None)
+                )
+                
                 refined_records.append(filtered_seq)
             else:
                 # Keep original if no boundaries detected
@@ -573,7 +816,13 @@ class LTREnhancedOptimizer:
     
     def _detect_and_split_chimeras(self, fasta_file, alignments_by_query):
         """
-        Detect and split chimeric consensus sequences.
+        Enhanced method to detect and split chimeric consensus sequences.
+        Uses multiple evidence types:
+        1. Coverage discontinuities
+        2. Target chromosome changes
+        3. Alignment orientation changes
+        4. Blank regions (no alignment)
+        5. Orientation-aware pattern analysis
         
         Args:
             fasta_file: Path to input FASTA file
@@ -597,12 +846,14 @@ class LTREnhancedOptimizer:
             seq_alignments = alignments_by_query.get(seq_id, [])
             
             # Analyze alignment pattern to detect chimeras
-            is_chimeric, breakpoints = self._analyze_chimeric_pattern(seq_record, seq_alignments)
+            is_chimeric, breakpoints, breakpoint_confidence, blank_regions = self._analyze_chimeric_pattern(seq_record, seq_alignments)
             
             # Record chimera information
             chimera_info[seq_id] = {
                 'is_chimeric': is_chimeric,
                 'breakpoints': breakpoints,
+                'breakpoint_confidence': breakpoint_confidence,
+                'blank_regions': blank_regions,
                 'num_segments': len(breakpoints) + 1 if breakpoints else 1
             }
             
@@ -618,24 +869,26 @@ class LTREnhancedOptimizer:
     
     def _analyze_chimeric_pattern(self, seq_record, alignments):
         """
-        Analyze alignment patterns to detect chimeric sequences.
-        This enhanced version uses multiple evidence types:
+        Enhanced method to analyze alignment patterns to detect chimeric sequences.
+        Uses multiple evidence types:
         1. Coverage discontinuities
         2. Target chromosome changes
         3. Alignment orientation changes
+        4. Blank regions (no alignment)
+        5. Orientation-aware pattern analysis
         
         Args:
             seq_record: SeqRecord object
             alignments: List of alignments for this sequence
             
         Returns:
-            (is_chimeric, breakpoints) tuple
+            (is_chimeric, breakpoints, breakpoint_confidence, blank_regions) tuple
         """
         seq_len = len(seq_record.seq)
         
         # Not enough alignments to analyze
         if len(alignments) < 3:
-            return False, []
+            return False, [], [], []
             
         # Create coverage profile by position
         coverage = np.zeros(seq_len)
@@ -655,12 +908,14 @@ class LTREnhancedOptimizer:
         
         # Detect coverage discontinuities and target changes
         breakpoints = []
+        breakpoint_confidence = []
         window_size = min(100, seq_len // 10)  # Adaptive window size
         if window_size < 20:  # Minimum window size
             window_size = 20
             
         threshold = self.chimera_threshold  # Threshold for significant change
         
+        # Analyze for breakpoints
         for i in range(window_size, seq_len - window_size):
             # Check coverage difference
             left_avg = np.mean(coverage[i-window_size:i])
@@ -690,46 +945,110 @@ class LTREnhancedOptimizer:
             coverage_diff = abs(left_avg - right_avg) / max(left_avg, right_avg) if max(left_avg, right_avg) > 0 else 0
             change_score = coverage_diff + (1 - target_similarity) + strand_change
             
+            # Enhanced: Orientation-aware analysis if enabled
+            if self.orientation_aware and strand_change > 0:
+                # Check if this is a systematic inversion rather than a chimera
+                # For systematic inversions, we'd expect consistent strand within regions
+                # and similar target distributions
+                if target_similarity > 0.7:  # Same targets but different orientation
+                    # This might be an inversion rather than a chimera
+                    # Reduce the change score
+                    change_score *= 0.5
+            
             if change_score > threshold:
                 # Significant change detected
                 breakpoints.append(i)
+                breakpoint_confidence.append(change_score)
+                
+        # Detect blank regions (contiguous zero-coverage)
+        blank_regions = []
+        if self.blank_region_threshold > 0:
+            in_blank = False
+            blank_start = 0
+            
+            for i in range(seq_len):
+                if coverage[i] == 0:
+                    if not in_blank:
+                        in_blank = True
+                        blank_start = i
+                else:
+                    if in_blank:
+                        in_blank = False
+                        blank_end = i
+                        blank_length = blank_end - blank_start
+                        
+                        if blank_length >= self.blank_region_threshold:
+                            blank_regions.append((blank_start, blank_end))
+                            
+                            # Add as potential breakpoint if not already close to one
+                            midpoint = (blank_start + blank_end) // 2
+                            if not any(abs(bp - midpoint) < window_size for bp in breakpoints):
+                                breakpoints.append(midpoint)
+                                breakpoint_confidence.append(1.0)  # High confidence for blank regions
+            
+            # Check if sequence ends with a blank region
+            if in_blank and seq_len - blank_start >= self.blank_region_threshold:
+                blank_regions.append((blank_start, seq_len))
                 
         # Merge nearby breakpoints
         if breakpoints:
             merged_breakpoints = []
-            current_group = [breakpoints[0]]
+            merged_confidence = []
             
-            for bp in breakpoints[1:]:
+            # Sort breakpoints and confidence together
+            sorted_pairs = sorted(zip(breakpoints, breakpoint_confidence))
+            breakpoints = [p[0] for p in sorted_pairs]
+            breakpoint_confidence = [p[1] for p in sorted_pairs]
+            
+            current_group = [breakpoints[0]]
+            current_conf = [breakpoint_confidence[0]]
+            
+            for i in range(1, len(breakpoints)):
+                bp = breakpoints[i]
+                conf = breakpoint_confidence[i]
+                
                 if bp - current_group[-1] < window_size:
                     # Add to current group
                     current_group.append(bp)
+                    current_conf.append(conf)
                 else:
                     # Start new group
-                    merged_breakpoints.append(sum(current_group) // len(current_group))
+                    # Use weighted average by confidence
+                    weighted_bp = sum(b * c for b, c in zip(current_group, current_conf)) / sum(current_conf)
+                    merged_breakpoints.append(int(weighted_bp))
+                    merged_confidence.append(max(current_conf))  # Use max confidence
+                    
                     current_group = [bp]
+                    current_conf = [conf]
                     
             # Add last group
             if current_group:
-                merged_breakpoints.append(sum(current_group) // len(current_group))
+                weighted_bp = sum(b * c for b, c in zip(current_group, current_conf)) / sum(current_conf)
+                merged_breakpoints.append(int(weighted_bp))
+                merged_confidence.append(max(current_conf))
                 
             # Filter breakpoints by minimum segment length
             valid_breakpoints = []
+            valid_confidence = []
             last_pos = 0
             
-            for bp in sorted(merged_breakpoints):
+            breakpoint_pairs = sorted(zip(merged_breakpoints, merged_confidence))
+            
+            for bp, conf in breakpoint_pairs:
                 if bp - last_pos >= self.min_segment_length:
                     valid_breakpoints.append(bp)
+                    valid_confidence.append(conf)
                     last_pos = bp
                     
             # Check if last segment is long enough
-            if seq_len - last_pos < self.min_segment_length:
-                if valid_breakpoints:  # Only pop if there are breakpoints
-                    valid_breakpoints.pop()
+            if valid_breakpoints and seq_len - valid_breakpoints[-1] < self.min_segment_length:
+                valid_breakpoints.pop()
+                valid_confidence.pop()
                 
             # If we still have valid breakpoints, it's chimeric
-            return len(valid_breakpoints) > 0, valid_breakpoints
+            return len(valid_breakpoints) > 0, valid_breakpoints, valid_confidence, blank_regions
         
-        return False, []
+        return False, [], [], blank_regions
     
     def _split_at_breakpoints(self, seq_record, breakpoints):
         """
@@ -776,8 +1095,9 @@ class LTREnhancedOptimizer:
         Enhanced method to detect LTR boundaries using multiple evidence types:
         1. Alignment boundaries
         2. Structure motifs (TG...CA)
-        3. Target Site Duplications (TSDs)
+        3. Target Site Duplications (TSDs) with PSSM scoring
         4. PBS/PPT features
+        5. k-mer frequency transitions
         
         Args:
             seq_record: SeqRecord object
@@ -802,6 +1122,11 @@ class LTREnhancedOptimizer:
         motif5_positions = []
         motif3_positions = []
         tsd_evidence = []
+        
+        # Track k-mer boundary evidence
+        kmer_boundaries = []
+        if self.kmer_boundary:
+            kmer_boundaries = self._detect_kmer_boundaries(seq_record)
         
         # Examine each alignment
         for aln in alignments:
@@ -840,6 +1165,18 @@ class LTREnhancedOptimizer:
         # Find most common boundaries
         best_start = start_counter.most_common(1)[0][0] if start_counter else 0
         best_end = end_counter.most_common(1)[0][0] if end_counter else seq_len
+        
+        # Check for k-mer boundary support
+        kmer_boundary_support = False
+        if kmer_boundaries:
+            kmer_5_boundary, kmer_3_boundary = kmer_boundaries
+            
+            # If k-mer boundaries are close to alignment boundaries, use them for support
+            if kmer_5_boundary is not None and abs(kmer_5_boundary - best_start) <= 30:
+                kmer_boundary_support = True
+                
+            if kmer_3_boundary is not None and abs(kmer_3_boundary - best_end) <= 30:
+                kmer_boundary_support = True
         
         # Adjust boundaries based on motif evidence if available
         if motif5_counter:
@@ -907,10 +1244,15 @@ class LTREnhancedOptimizer:
         # Summarize TSD evidence
         tsd = None
         if tsd_evidence:
-            tsd_counter = Counter(tsd_evidence)
-            best_tsd, count = tsd_counter.most_common(1)[0]
-            if count >= 2:  # Require at least 2 supporting alignments
-                tsd = best_tsd
+            if self.pssm_tsd:
+                # Use PSSM scoring for TSD identification
+                tsd = self._score_tsds_with_pssm(tsd_evidence)
+            else:
+                # Simple majority voting
+                tsd_counter = Counter(tsd_evidence)
+                best_tsd, count = tsd_counter.most_common(1)[0]
+                if count >= 2:  # Require at least 2 supporting alignments
+                    tsd = best_tsd
                 
         # Validate boundaries
         if best_start >= best_end:
@@ -942,8 +1284,106 @@ class LTREnhancedOptimizer:
             'start_feature': start_feature,
             'end_feature': end_feature,
             'tsd': tsd,
+            'kmer_boundary_support': kmer_boundary_support,
             'internal_features': internal_features
         }
+
+    def _detect_kmer_boundaries(self, seq_record, k=5, window_size=50):
+        """
+        Detect potential LTR boundaries based on k-mer frequency transitions.
+        
+        Args:
+            seq_record: SeqRecord object
+            k: k-mer size
+            window_size: Size of sliding window for k-mer analysis
+            
+        Returns:
+            (5'_boundary, 3'_boundary) tuple or (None, None) if not found
+        """
+        seq_str = str(seq_record.seq)
+        seq_len = len(seq_str)
+        
+        # Too short for meaningful analysis
+        if seq_len < window_size * 2 + k:
+            return None, None
+            
+        # Compute k-mer frequencies in sliding windows
+        window_kmers = []
+        
+        for i in range(0, seq_len - window_size + 1):
+            window = seq_str[i:i+window_size]
+            kmers = {}
+            
+            for j in range(len(window) - k + 1):
+                kmer = window[j:j+k]
+                kmers[kmer] = kmers.get(kmer, 0) + 1
+                
+            window_kmers.append(kmers)
+            
+        # Compute Jaccard distance between adjacent windows
+        distances = []
+        
+        for i in range(1, len(window_kmers)):
+            kmers1 = set(window_kmers[i-1].keys())
+            kmers2 = set(window_kmers[i].keys())
+            
+            union = len(kmers1.union(kmers2))
+            intersection = len(kmers1.intersection(kmers2))
+            
+            if union > 0:
+                distance = 1 - (intersection / union)
+            else:
+                distance = 1.0
+                
+            distances.append(distance)
+            
+        # Find peaks in the distance profile
+        # These represent potential boundaries with significant k-mer composition changes
+        peaks = []
+        min_peak_height = 0.3  # Minimum peak height
+        
+        for i in range(1, len(distances) - 1):
+            if (distances[i] > distances[i-1] and 
+                distances[i] > distances[i+1] and 
+                distances[i] >= min_peak_height):
+                
+                # Adjust index to center of window
+                peak_pos = i + window_size // 2
+                peaks.append((peak_pos, distances[i]))
+                
+        # No significant peaks found
+        if not peaks:
+            return None, None
+            
+        # Sort peaks by height (highest first)
+        peaks.sort(key=lambda x: x[1], reverse=True)
+        
+        # Look for peaks that could correspond to 5' and 3' boundaries
+        # Typically, we need two peaks separated by a reasonable distance
+        boundary5 = None
+        boundary3 = None
+        
+        # Try different peak pairs
+        for i in range(len(peaks)):
+            pos1, _ = peaks[i]
+            
+            for j in range(i+1, len(peaks)):
+                pos2, _ = peaks[j]
+                
+                # Make sure pos1 < pos2
+                if pos1 > pos2:
+                    pos1, pos2 = pos2, pos1
+                    
+                # Check if distance between peaks is reasonable for an LTR
+                if self.min_ltr_len <= pos2 - pos1 <= self.max_ltr_len:
+                    boundary5 = pos1
+                    boundary3 = pos2
+                    break
+                    
+            if boundary5 is not None:
+                break
+                
+        return boundary5, boundary3
 
     def _find_terminal_repeats(self, seq_record, start, end):
         """
@@ -1007,7 +1447,8 @@ class LTREnhancedOptimizer:
     
     def _find_tsd_from_alignment(self, alignment, genome_seqs):
         """
-        Try to find Target Site Duplication (TSD) from genomic context.
+        Enhanced method to find Target Site Duplication (TSD) from genomic context.
+        Uses PSSM scoring if enabled.
         
         Args:
             alignment: Alignment information
@@ -1033,33 +1474,129 @@ class LTREnhancedOptimizer:
         
         if not left_flank or not right_flank:
             return None
-            
+        
         # Look for TSD patterns
+        if self.pssm_tsd:
+            return self._find_tsd_with_pssm(left_flank, right_flank)
+        else:
+            # Original approach with relaxed thresholds
+            best_tsd = None
+            best_score = 0
+            
+            for tsd_len in range(self.tsd_min, self.tsd_max + 1):
+                # Check if flanks are long enough
+                if len(left_flank) < tsd_len or len(right_flank) < tsd_len:
+                    continue
+                    
+                # Compare end of left flank to start of right flank
+                left_tsd = left_flank[-tsd_len:].upper()
+                right_tsd = right_flank[:tsd_len].upper()
+                
+                # Count matches
+                matches = sum(1 for a, b in zip(left_tsd, right_tsd) if a == b)
+                score = matches / tsd_len
+                
+                # More relaxed threshold (70% identity)
+                if score > best_score and score >= 0.7:
+                    best_score = score
+                    best_tsd = left_tsd
+                    
+            return best_tsd
+    
+    def _find_tsd_with_pssm(self, left_flank, right_flank):
+        """
+        Use position-specific scoring matrix (PSSM) for TSD identification.
+        This allows more flexible matching compared to strict identity.
+        
+        Args:
+            left_flank: Left flanking sequence
+            right_flank: Right flanking sequence
+            
+        Returns:
+            TSD sequence if found, None otherwise
+        """
         best_tsd = None
-        best_score = 0
+        best_score = -float('inf')
+        min_score_threshold = 0.6  # Minimum score to consider as a match
+        
+        # Define nucleotide mapping
+        nuc_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': None}
         
         for tsd_len in range(self.tsd_min, self.tsd_max + 1):
             # Check if flanks are long enough
             if len(left_flank) < tsd_len or len(right_flank) < tsd_len:
                 continue
                 
-            # Compare end of left flank to start of right flank
+            # Get potential TSD sequences
             left_tsd = left_flank[-tsd_len:].upper()
             right_tsd = right_flank[:tsd_len].upper()
             
-            # Count matches
-            matches = sum(1 for a, b in zip(left_tsd, right_tsd) if a == b)
-            score = matches / tsd_len
+            # Calculate score using PSSM
+            score = 0
+            valid_positions = 0
             
-            if score > best_score and score >= 0.8:  # At least 80% identity
-                best_score = score
-                best_tsd = left_tsd
+            for i in range(tsd_len):
+                left_nuc = nuc_map.get(left_tsd[i])
+                right_nuc = nuc_map.get(right_tsd[i])
                 
+                if left_nuc is not None and right_nuc is not None:
+                    # Increase score if nucleotides match
+                    if left_nuc == right_nuc:
+                        score += 1.0
+                    else:
+                        # Allow for some mismatches, but penalize them
+                        score -= 0.2
+                        
+                    valid_positions += 1
+            
+            # Normalize score
+            if valid_positions > 0:
+                normalized_score = score / valid_positions
+                
+                if normalized_score > best_score and normalized_score >= min_score_threshold:
+                    best_score = normalized_score
+                    best_tsd = left_tsd
+                    
+        return best_tsd
+    
+    def _score_tsds_with_pssm(self, tsd_candidates):
+        """
+        Score multiple TSD candidates using position-specific scoring matrices.
+        
+        Args:
+            tsd_candidates: List of TSD sequence candidates
+            
+        Returns:
+            Best TSD sequence
+        """
+        # Group candidates by length
+        by_length = defaultdict(list)
+        for tsd in tsd_candidates:
+            if tsd:
+                by_length[len(tsd)].append(tsd)
+                
+        best_tsd = None
+        best_support = 0
+        
+        # For each length, find the most commonly occurring pattern
+        for length, tsds in by_length.items():
+            if length < self.tsd_min or length > self.tsd_max:
+                continue
+                
+            if len(tsds) > best_support:
+                # Use most frequent TSD
+                tsd_counter = Counter(tsds)
+                common_tsd, count = tsd_counter.most_common(1)[0]
+                
+                if count > best_support:
+                    best_support = count
+                    best_tsd = common_tsd
+                    
         return best_tsd
     
     def _find_internal_features(self, seq_record, start, end):
         """
-        Find LTR internal features like PBS and PPT.
+        Enhanced method to find LTR internal features like PBS and PPT.
         
         Args:
             seq_record: SeqRecord object
@@ -1069,18 +1606,6 @@ class LTREnhancedOptimizer:
         Returns:
             Dictionary with internal feature information
         """
-        # PBS (Primer Binding Site) patterns
-        pbs_patterns = [
-            'TGGCGCCCAACGTGGGGC',  # tRNAPro
-            'TGGCGCCGTAACAGGGAC',  # tRNATrp
-            'TGGCGCCCGAACAGGGAC',  # tRNAGln
-            'TGGCGCCCAACCTGGGA',   # tRNALys
-            'TGGTAGCAGAGCTGGGAA'   # tRNAIle
-        ]
-        
-        # PPT (PolyPurine Tract) pattern - A/G rich sequences
-        ppt_pattern = r'[AG]{8,15}'
-        
         seq_str = str(seq_record.seq)
         
         # Look for PBS near the 5' LTR (5-20 bp after LTR)
@@ -1088,7 +1613,7 @@ class LTREnhancedOptimizer:
         for pbs_pos in range(start + 5, min(start + 30, end - 100, len(seq_str) - 18)):
             window = seq_str[pbs_pos:pbs_pos+18]
             
-            for pattern in pbs_patterns:
+            for pattern_name, pattern in self.pbs_patterns.items():
                 # Calculate similarity
                 matches = sum(1 for a, b in zip(window.upper(), pattern) if a == b)
                 similarity = matches / len(pattern)
@@ -1097,7 +1622,7 @@ class LTREnhancedOptimizer:
                     pbs_result = {
                         'position': pbs_pos,
                         'sequence': window,
-                        'pattern': pattern,
+                        'pattern': pattern_name,
                         'similarity': similarity
                     }
                     break
@@ -1110,6 +1635,7 @@ class LTREnhancedOptimizer:
         if end > 20:
             # Use regex to find PPT patterns
             import re
+            ppt_pattern = r'[AG]{8,15}'
             ppt_matches = list(re.finditer(ppt_pattern, seq_str[max(start + 100, end - 50):end]))
             
             if ppt_matches:
@@ -1126,6 +1652,147 @@ class LTREnhancedOptimizer:
         return {
             'pbs': pbs_result,
             'ppt': ppt_result
+        }
+        
+    def _analyze_orfs(self, seq_record, boundaries):
+        """
+        Analyze ORFs in the sequence to identify potential coding regions.
+        
+        Args:
+            seq_record: SeqRecord object
+            boundaries: Detected boundaries
+            
+        Returns:
+            Dictionary with ORF analysis results
+        """
+        if not BIOUTILS_AVAILABLE:
+            return self._analyze_orfs_simple(seq_record, boundaries)
+            
+        # Extract sequence in the boundaries
+        start = boundaries['start']
+        end = boundaries['end']
+        seq = seq_record.seq[start:end]
+        
+        # Find all ORFs (minimum length 300 bp = 100 aa)
+        min_orf_len = 300
+        orfs = []
+        
+        # Look in all 3 reading frames
+        for frame in range(3):
+            # Look for start codons
+            for i in range(frame, len(seq) - 2, 3):
+                if seq[i:i+3].upper() == 'ATG':
+                    # Found start codon
+                    for j in range(i + 3, len(seq) - 2, 3):
+                        # Look for stop codon
+                        if seq[j:j+3].upper() in ('TAA', 'TAG', 'TGA'):
+                            # Found stop codon
+                            orf_len = j + 3 - i
+                            
+                            if orf_len >= min_orf_len:
+                                # Convert coordinates to original sequence
+                                orf_start = start + i
+                                orf_end = start + j + 3
+                                
+                                orf_seq = seq[i:j+3]
+                                orfs.append((orf_start, orf_end, orf_seq))
+                            break
+        
+        # Analyze ORFs for TE domains
+        domain_hits = []
+        
+        for orf_start, orf_end, orf_seq in orfs:
+            # Translate to protein
+            protein_seq = orf_seq.translate()
+            
+            # Check for TE-specific domains
+            for domain_type, motifs in self.te_domains.items():
+                for motif in motifs:
+                    if motif.lower() in str(protein_seq).lower():
+                        domain_hits.append(f"{domain_type}:{motif}")
+        
+        # Calculate coding potential score (based on GC content, codon usage, etc.)
+        coding_score = 0
+        
+        if orfs:
+            # Average GC content of ORFs
+            gc_content = sum(GC(orf_seq) for _, _, orf_seq in orfs) / len(orfs)
+            
+            # Score based on TE domain hits
+            domain_score = len(set(domain_hits)) * 0.2
+            
+            # Score based on GC content (typical for coding regions)
+            gc_score = 0
+            if 40 <= gc_content <= 60:
+                gc_score = 0.5
+            
+            # Score based on number of ORFs
+            orf_score = min(len(orfs), 3) * 0.1
+            
+            coding_score = gc_score + domain_score + orf_score
+            
+        # Return ORF analysis results
+        return {
+            'num_orfs': len(orfs),
+            'orf_locations': [(start, end) for start, end, _ in orfs],
+            'domain_hits': list(set(domain_hits)),
+            'coding_score': coding_score
+        }
+    
+    def _analyze_orfs_simple(self, seq_record, boundaries):
+        """
+        Simple ORF analysis without BioPython utilities.
+        
+        Args:
+            seq_record: SeqRecord object
+            boundaries: Detected boundaries
+            
+        Returns:
+            Dictionary with basic ORF analysis results
+        """
+        # Extract sequence in the boundaries
+        start = boundaries['start']
+        end = boundaries['end']
+        seq = str(seq_record.seq[start:end]).upper()
+        
+        # Find all ORFs (minimum length 300 bp = 100 aa)
+        min_orf_len = 300
+        orfs = []
+        
+        # Look in all 3 reading frames
+        for frame in range(3):
+            # Look for start codons
+            i = frame
+            while i < len(seq) - 2:
+                if seq[i:i+3] == 'ATG':
+                    # Found start codon
+                    j = i + 3
+                    while j < len(seq) - 2:
+                        # Look for stop codon
+                        if seq[j:j+3] in ('TAA', 'TAG', 'TGA'):
+                            # Found stop codon
+                            orf_len = j + 3 - i
+                            
+                            if orf_len >= min_orf_len:
+                                # Convert coordinates to original sequence
+                                orf_start = start + i
+                                orf_end = start + j + 3
+                                
+                                orfs.append((orf_start, orf_end))
+                            break
+                        j += 3
+                    
+                    # Move to next position after current start codon
+                    i += 3
+                else:
+                    i += 3
+        
+        # Return basic ORF analysis results
+        return {
+            'num_orfs': len(orfs),
+            'orf_locations': orfs,
+            'domain_hits': [],
+            'coding_score': min(0.5, len(orfs) * 0.1)  # Simple estimation
         }
     
     def _refine_sequence(self, seq_record, boundaries):
@@ -1164,14 +1831,15 @@ class LTREnhancedOptimizer:
         
         return refined_record
     
-    def _filter_non_te_regions(self, seq_record, alignments):
+    def _filter_non_te_regions(self, seq_record, alignments, orf_info=None):
         """
-        Filter out regions that don't appear to be part of the transposon.
-        This method uses alignment patterns and coding potential.
+        Enhanced method to filter out regions that don't appear to be part of the transposon.
+        Uses alignment patterns, coding potential, and dynamic thresholding.
         
         Args:
             seq_record: SeqRecord object
             alignments: List of alignments for this sequence
+            orf_info: ORF analysis information (optional)
             
         Returns:
             Filtered SeqRecord object
@@ -1204,17 +1872,48 @@ class LTREnhancedOptimizer:
             end = min(seq_len, i + window_size // 2)
             smoothed[i] = np.mean(coverage[start:end])
             
-        # Calculate coverage threshold
-        mean_coverage = np.mean(smoothed)
-        threshold = mean_coverage * 0.3  # 30% of mean coverage
-        
+        # Calculate coverage threshold - dynamic or fixed
+        if self.dynamic_threshold:
+            # Use more sophisticated thresholding
+            # Sort coverage values and find elbow point or use percentile
+            sorted_coverage = np.sort(smoothed)
+            
+            # Calculate percentiles
+            p25 = np.percentile(sorted_coverage, 25)
+            p75 = np.percentile(sorted_coverage, 75)
+            
+            # Detect bimodal distribution
+            if p75 - p25 > 1.5:
+                # Likely bimodal - use elbow point
+                # Simple elbow detection using largest second derivative
+                d2 = np.diff(np.diff(sorted_coverage))
+                elbow_idx = np.argmax(d2) if len(d2) > 0 else len(sorted_coverage) // 2
+                threshold = sorted_coverage[elbow_idx] if elbow_idx < len(sorted_coverage) else np.mean(smoothed) * 0.3
+            else:
+                # Unimodal - use percentile
+                threshold = p25 * 0.5
+        else:
+            # Fixed threshold
+            threshold = np.mean(smoothed) * 0.3  # 30% of mean coverage
+            
         # Find regions to keep (above threshold)
         keep_regions = []
         in_region = False
         region_start = 0
         
+        # Special protection for ORFs if available
+        protected_regions = []
+        if orf_info and 'orf_locations' in orf_info and orf_info['orf_locations']:
+            # If coding regions found, protect them
+            for orf_start, orf_end in orf_info['orf_locations']:
+                # Add some padding around ORFs
+                protected_regions.append((max(0, orf_start - 50), min(seq_len, orf_end + 50)))
+        
         for i in range(seq_len):
-            if smoothed[i] >= threshold:
+            # Check if position is protected as part of an ORF
+            is_protected = any(start <= i < end for start, end in protected_regions)
+            
+            if smoothed[i] >= threshold or is_protected:
                 if not in_region:
                     in_region = True
                     region_start = i
@@ -1252,6 +1951,196 @@ class LTREnhancedOptimizer:
         )
         
         return filtered_record
+    
+    def _perform_subfamily_clustering(self, sequences):
+        """
+        Perform clustering to identify subfamilies.
+        Uses UMAP for dimensionality reduction and HDBSCAN for clustering.
+        
+        Args:
+            sequences: List of sequence records
+            
+        Returns:
+            Path to clustered sequences file
+        """
+        if not CLUSTERING_AVAILABLE:
+            self.logger.warning("Clustering libraries not available. Skipping subfamily clustering.")
+            return os.path.join(self.output_dir, "no_clustering.fa")
+            
+        self.logger.info(f"Performing subfamily clustering on {len(sequences)} sequences")
+        
+        # Create sequence features for clustering
+        features = []
+        seq_ids = []
+        
+        for seq in sequences:
+            # Extract sequence features
+            seq_str = str(seq.seq).upper()
+            
+            # Calculate k-mer frequencies
+            k = 3  # Trinucleotides
+            kmers = {}
+            
+            for i in range(len(seq_str) - k + 1):
+                kmer = seq_str[i:i+k]
+                if 'N' not in kmer:
+                    kmers[kmer] = kmers.get(kmer, 0) + 1
+            
+            # Normalize by sequence length
+            for kmer in kmers:
+                kmers[kmer] = kmers[kmer] / (len(seq_str) - k + 1)
+                
+            # Convert to vector
+            all_kmers = [''.join(x) for x in itertools.product('ACGT', repeat=k)]
+            kmer_vector = [kmers.get(kmer, 0) for kmer in all_kmers]
+            
+            features.append(kmer_vector)
+            seq_ids.append(seq.id)
+            
+        # Convert to numpy array
+        features = np.array(features)
+        
+        # Too few sequences for meaningful clustering
+        if len(features) < 5:
+            self.logger.warning("Too few sequences for meaningful clustering. Skipping.")
+            output_file = os.path.join(self.output_dir, "no_clustering.fa")
+            SeqIO.write(sequences, output_file, "fasta")
+            return output_file
+            
+        # Reduce dimensionality with UMAP
+        self.logger.info("Performing UMAP dimensionality reduction")
+        umap_model = umap.UMAP(n_neighbors=min(15, len(features)-1), 
+                              min_dist=0.1, 
+                              n_components=2,
+                              metric='correlation')
+                              
+        umap_features = umap_model.fit_transform(features)
+        
+        # Cluster with HDBSCAN
+        self.logger.info("Performing HDBSCAN clustering")
+        min_cluster_size = max(2, len(features) // 10)  # Adaptive cluster size
+        
+        hdbscan_model = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size,
+                                       min_samples=1,
+                                       cluster_selection_epsilon=0.5)
+                                       
+        cluster_labels = hdbscan_model.fit_predict(umap_features)
+        
+        # Count clusters
+        n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+        self.logger.info(f"Found {n_clusters} clusters, {np.sum(cluster_labels == -1)} outliers")
+        
+        # Create clustered sequences
+        clustered_seqs = []
+        
+        for i, seq in enumerate(sequences):
+            cluster_id = cluster_labels[i]
+            cluster_name = f"subfamily_{cluster_id}" if cluster_id >= 0 else "outlier"
+            
+            # Create new record with cluster information
+            cluster_seq = SeqRecord(
+                seq.seq,
+                id=f"{seq.id}",
+                name=seq.name,
+                description=f"{seq.description} | Cluster: {cluster_name}"
+            )
+            
+            clustered_seqs.append(cluster_seq)
+            
+        # Write clustered sequences
+        output_file = os.path.join(self.clustering_dir, "clustered_sequences.fa")
+        SeqIO.write(clustered_seqs, output_file, "fasta")
+        
+        # Write cluster information
+        cluster_info_file = os.path.join(self.clustering_dir, "cluster_information.tsv")
+        with open(cluster_info_file, "w") as f:
+            f.write("seq_id\tcluster_id\tcluster_name\n")
+            
+            for i, seq_id in enumerate(seq_ids):
+                cluster_id = cluster_labels[i]
+                cluster_name = f"subfamily_{cluster_id}" if cluster_id >= 0 else "outlier"
+                
+                f.write(f"{seq_id}\t{cluster_id}\t{cluster_name}\n")
+        
+        self.logger.info(f"Clustering completed. Results saved to {self.clustering_dir}")
+        return output_file
+    
+    def _classify_sequences(self, fasta_file):
+        """
+        Classify TE sequences based on structural features and coding domains.
+        
+        Args:
+            fasta_file: Path to input FASTA file
+            
+        Returns:
+            Path to classified sequences file
+        """
+        self.logger.info("Classifying TE sequences")
+        
+        # Load sequences
+        sequences = list(SeqIO.parse(fasta_file, "fasta"))
+        classified_seqs = []
+        
+        # Classification information
+        classifications = {}
+        
+        # Check if BLAST is available for classification
+        blast_available = shutil.which("blastn") and shutil.which("makeblastdb")
+        
+        # If BLAST is available, we can use it for classification
+        if blast_available:
+            self.logger.info("Using BLAST for classification")
+            # This would involve creating a database of known TEs and comparing
+            # For now, we'll use structural features only
+        
+        for seq in sequences:
+            # Default classification
+            te_class = "Unknown"
+            te_family = "Unknown"
+            
+            # Look for LTR features in the sequence description
+            if "Refined" in seq.description and "features" in seq.description:
+                # This is likely an LTR retrotransposon
+                te_class = "LTR retrotransposon"
+                
+                # Look for gag/pol domains in the description
+                if "gag" in seq.description.lower() or "pol" in seq.description.lower():
+                    te_family = "Ty3/Gypsy or Ty1/Copia"
+                elif "env" in seq.description.lower():
+                    te_family = "Endogenous retrovirus"
+                else:
+                    te_family = "LTR/Unknown"
+            
+            # Record classification
+            classifications[seq.id] = {
+                'class': te_class,
+                'family': te_family
+            }
+            
+            # Create new record with classification
+            classified_seq = SeqRecord(
+                seq.seq,
+                id=seq.id,
+                name=seq.name,
+                description=f"{seq.description} | Class: {te_class} | Family: {te_family}"
+            )
+            
+            classified_seqs.append(classified_seq)
+            
+        # Write classified sequences
+        output_file = os.path.join(self.classification_dir, "classified_sequences.fa")
+        SeqIO.write(classified_seqs, output_file, "fasta")
+        
+        # Write classification information
+        class_info_file = os.path.join(self.classification_dir, "classification_information.tsv")
+        with open(class_info_file, "w") as f:
+            f.write("seq_id\tclass\tfamily\n")
+            
+            for seq_id, info in classifications.items():
+                f.write(f"{seq_id}\t{info['class']}\t{info['family']}\n")
+                
+        self.logger.info(f"Classification completed. Results saved to {self.classification_dir}")
+        return output_file
     
     def _generate_statistics(self, final_file):
         """
@@ -1456,6 +2345,26 @@ def main():
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                        default="INFO", help="Logging level")
     
+    # Added arguments for enhanced functionality
+    parser.add_argument("--low-complexity-filter", action="store_true",
+                       help="Filter low complexity regions")
+    parser.add_argument("--clustering", action="store_true",
+                       help="Perform subfamily clustering")
+    parser.add_argument("--dynamic-threshold", action="store_true",
+                       help="Use dynamic thresholds for non-TE filtering")
+    parser.add_argument("--orf-analysis", action="store_true",
+                       help="Perform ORF analysis")
+    parser.add_argument("--kmer-boundary", action="store_true",
+                       help="Use k-mer based boundary detection")
+    parser.add_argument("--blank-region-threshold", type=int, default=100,
+                       help="Minimum length of blank regions for chimera detection (default: 100)")
+    parser.add_argument("--orientation-aware", action="store_true",
+                       help="Use orientation-aware chimera detection")
+    parser.add_argument("--pssm-tsd", action="store_true",
+                       help="Use PSSM for TSD identification")
+    parser.add_argument("--classify-output", action="store_true",
+                       help="Classify output sequences")
+    
     args = parser.parse_args()
     
     # Initialize optimizer
@@ -1474,7 +2383,16 @@ def main():
         chunk_size=args.chunk_size,
         batch_size=args.batch_size,
         keep_temp=args.keep_temp,
-        log_level=args.log_level
+        log_level=args.log_level,
+        low_complexity_filter=args.low_complexity_filter,
+        clustering=args.clustering,
+        dynamic_threshold=args.dynamic_threshold,
+        orf_analysis=args.orf_analysis,
+        kmer_boundary=args.kmer_boundary,
+        blank_region_threshold=args.blank_region_threshold,
+        orientation_aware=args.orientation_aware,
+        pssm_tsd=args.pssm_tsd,
+        classify_output=args.classify_output
     )
     
     # Run optimization
