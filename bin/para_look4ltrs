@@ -146,7 +146,7 @@ system("filter-stage-1.prl LTR.fa > LTR.fa.filter 2>> look4ltr.log") == 0
 $cmdString = "Refiner_for_LTR LTR.fa.filter ./ --threads $ARGV[1] > refine.log 2> refine.err";
 system($cmdString) == 0 or die "Failed to execute: $cmdString\n";
 
-$cmdString = "LTR_Boundary_Optimizer.py consensi.fa ../genome/genome.fa output_dir --threads 32 --min-identity 85 --chimera-threshold 0.4";
+$cmdString = "LTR_Boundary_Optimizer.py consensi.fa ../genome/genome.fa output_dir --threads 32 --advanced-tsd --weighted-evidence --kmer-boundary --orientation-aware --low-complexity-filter --clustering --dynamic-threshold --orf-analysis";
 system($cmdString) == 0 or die "Failed to execute: $cmdString\n";
 
 `cp output_dir/optimized_consensus.fa consensi.fa`;
