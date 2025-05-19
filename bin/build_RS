@@ -279,12 +279,12 @@ sub refine_consensus {
     
     # Ensure all input files exist
     die "Input file missing: $input\n" unless -f $input;
-    
+    my $tmp_fa="$config{tmp_dir}/tmp.fa";
     my $cmd = join(" ",
         "$FindBin::RealBin/Refiner_for_RS",
         $config{tmp_dir},               # work_dir
         $output,                        # consensi_file 
-        $config{genome_file},           # sample_file
+        $tmp_fa,	                # sample_file
         $families_file,                 # families_file
         $config{threads},               # threads
         $config{rmblast_dir},           # rmblast_path
@@ -328,3 +328,4 @@ sub run_cmd {
     $logger->debug("Command completed successfully");
     return $output;
 }
+

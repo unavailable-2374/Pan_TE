@@ -287,3 +287,4 @@ sub run_cmd {
 sub usage {
     return "Usage: $0 workDir consensiFile sampleFile familiesFile threads rmblast_path output_dir\n";
 }
+

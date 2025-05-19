@@ -1065,8 +1065,8 @@ class FastClusteringPipeline:
                 with open(output_file, "w") as f:
                     f.write(process.stdout)
                     
-                # Build simple consensus from alignment
-                align_seqs = list(SeqIO.parse(output_file, "fasta"))
+                # Parse aligned sequences from results
+                align_seqs = list(SeqIO.parse(StringIO(process.stdout), "fasta"))
                 
                 if align_seqs:
                     # Build consensus
@@ -1206,30 +1206,51 @@ class FastClusteringPipeline:
         """
         logger.info(f"Processing {len(clusters)} clusters...")
         
-        # Read all sequences
-        sequences = SeqIO.to_dict(SeqIO.parse(sequences_file, "fasta"))
+        # 修复: 解决读取序列时ID重复的问题
+        # 首先读取所有序列作为列表而不是字典
+        all_sequences = list(SeqIO.parse(sequences_file, "fasta"))
         
-        # Prepare results
+        # 检查重复ID
+        seen_ids = set()
+        duplicate_ids = set()
+        for seq in all_sequences:
+            if seq.id in seen_ids:
+                duplicate_ids.add(seq.id)
+            seen_ids.add(seq.id)
+        
+        # 如果有重复ID, 重命名它们
+        if duplicate_ids:
+            logger.warning(f"Found {len(duplicate_ids)} duplicate sequence IDs. Renaming them.")
+            for i, seq in enumerate(all_sequences):
+                if seq.id in duplicate_ids:
+                    original_id = seq.id
+                    seq.id = f"{seq.id}_unique_{i}"
+                    logger.info(f"Renamed sequence ID from '{original_id}' to '{seq.id}'")
+        
+        # 创建ID到序列的映射
+        sequences = {seq.id: seq for seq in all_sequences}
+        
+        # 准备结果
         consensus_results = []
         variant_results = []
         all_stats = []
         
-        # Process clusters in parallel
+        # 使用多线程处理集群
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
             future_to_cluster = {}
             
             for i, cluster in enumerate(clusters):
-                # Get sequences for this cluster
+                # 获取此集群的序列
                 cluster_seqs = [sequences[seq_id] for seq_id in cluster if seq_id in sequences]
                 
                 if not cluster_seqs:
                     continue
                     
-                # Submit processing task
+                # 提交处理任务
                 future = executor.submit(self.refine_cluster, cluster_seqs, i)
                 future_to_cluster[future] = i
             
-            # Collect results
+            # 收集结果
             for future in tqdm(future_to_cluster, desc="Processing clusters"):
                 cluster_id = future_to_cluster[future]
                 try:
@@ -1245,14 +1266,14 @@ class FastClusteringPipeline:
                         if variants:
                             variant_results.extend(variants)
                             
-                        # Add cluster ID and save statistics
+                        # 添加集群ID并保存统计信息
                         stats['cluster_id'] = cluster_id
                         all_stats.append(stats)
                         
                 except Exception as e:
                     logger.error(f"Processing cluster {cluster_id} failed: {e}")
         
-        # Record cluster processing statistics
+        # 记录集群处理统计
         self.save_cluster_stats(all_stats)
         
         logger.info(f"Generated {len(consensus_results)} consensus sequences and {len(variant_results)} variant sequences")
@@ -1535,9 +1556,9 @@ def main():
     parser.add_argument("--convergence", type=float, default=0.05,
                         help="Convergence threshold, stop when sequence count change rate is below this value (default: 0.05)")
     parser.add_argument("--max-cluster-size", type=int, default=50,
-                        help="Maximum cluster size, clusters larger than this will be split (default: 50)")
+                        help="Maximum cluster size before splitting (default: 50)")
     parser.add_argument("--use-iupac", action="store_true", default=True,
-                        help="Use IUPAC ambiguous bases to represent variant sites (default: enabled)")
+                        help="Use IUPAC ambiguity codes for variable positions (default: enabled)")
     parser.add_argument("--no-iupac", action="store_false", dest="use_iupac",
                         help="Don't use IUPAC ambiguous bases")
     parser.add_argument("--keep-variants", action="store_true", default=True,
