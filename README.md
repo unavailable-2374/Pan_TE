@@ -11,7 +11,7 @@ Design for linear or graph genome TE detection and annotation
 
     cd Pan_TE
     chmod 750 bin/*
-    echo 'export PATH="/YOUR/PATH/TO/bin:$PATH"' >> ~/.bashrc //* like: echo 'export PATH=/public/home/soft/Pan_TE/bin:$PATH"' >> ~/.bashrc
+    echo 'export PATH="/YOUR/PATH/TO/bin:$PATH"' >> ~/.bashrc //* like: echo 'export PATH="/public/home/soft/Pan_TE/bin:$PATH"' >> ~/.bashrc
     mamba env create -f env/pgta.yml
     ln -s /PATH/TO/miniconda3/envs/PGTA/bin/x86_64-conda-linux-gnu-g++ /PATH/TO/miniconda3/envs/PGTA/bin/g++
     echo 'export PERL5LIB=/home/tool/Pan_TE/share:/home/tool/miniconda3/envs/PGTA/share/RepeatMasker:$PERL5LIB"' >> ~/.bashrc
