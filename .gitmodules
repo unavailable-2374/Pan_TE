@@ -1,0 +1,9 @@
+[submodule "Inpactor2"]
+	path = Inpactor2
+	url = https://github.com/simonorozcoarias/Inpactor2.git
+[submodule "Look4LTRs"]
+	path = Look4LTRs
+	url = https://github.com/BioinformaticsToolsmith/Look4LTRs.git
+[submodule "ClassifyTE"]
+	path = ClassifyTE
+	url = https://github.com/manisa/ClassifyTE.git
