@@ -1,0 +1,61 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Cwd qw(abs_path getcwd);
+use File::Basename qw(dirname basename);
+use File::Path qw(make_path);
+
+# Usage check
+my $fasta_file = abs_path($ARGV[0]);
+unless ($fasta_file && -e $fasta_file) {
+    die "Usage: $0 <fasta_file> <threads> <out_dir>\n";
+}
+
+my $threads = $ARGV[1] || 1;
+my $out_dir = abs_path($ARGV[2]);
+make_path($out_dir) unless -d $out_dir;
+chdir $out_dir or die "Cannot change to directory $out_dir: $!\n";
+
+# Create inpactor2 directory
+make_path("Inpactor2") unless -d "Inpactor2";
+chdir "Inpactor2" or die "Cannot change to Inpactor2 directory: $!\n";
+
+# Run Inpactor2
+print "Running Inpactor2 on the entire genome...\n";
+my $current_dir = getcwd();
+
+# Execute Inpactor2
+if (-e "$current_dir/Inpactor2_library.fasta") {
+	print "Inpactor2 was done!\n";
+}else{
+	my $inpactor2_cmd = "conda run -n Inpactor2 Inpactor2.py -f $fasta_file -o $current_dir -t $threads -a no -n 100 -c no >inpactor2.log  2>> inpactor2.log";
+	print "Executing: $inpactor2_cmd\n";
+	system($inpactor2_cmd) == 0 or die "Failed to execute Inpactor2: $!\n";
+	my $refine_cmd = "Refiner_for_LTR Inpactor2_library.fasta ./ --threads $threads";
+	print "Executing: $inpactor2_cmd\n";
+	system($refine_cmd) == 0 or die "Failed to execute refinement: $!\n";
+}
+# Check output file
+my $inpactor2_output = "$current_dir/all_sequences.fa";
+unless (-e $inpactor2_output) {
+    die "Inpactor2 output file not found: $inpactor2_output\n";
+}
+
+# Copy output file to expected location for downstream processing
+system("sed 's:N::g' $inpactor2_output > $current_dir/LTR.fa") == 0
+    or die "Failed to copy Inpactor2 output file\n";
+
+# Run filtering step to maintain compatibility with original workflow
+if (! -e "$current_dir/LTR.fa") {
+    die "LTR.fa file not found\n";
+}
+
+# Run LTR_Boundary_Optimizer
+my $optimizer_cmd = "LTR_Boundary_Optimizer.py LTR.fa ../genome/genome.fa output_dir --threads $threads --advanced-tsd --weighted-evidence --kmer-boundary --orientation-aware --low-complexity-filter --clustering --dynamic-threshold --orf-analysis";
+system($optimizer_cmd) == 0 or die "Failed to execute: $optimizer_cmd\n";
+
+# Copy final results
+system("cp output_dir/optimized_consensus.fa consensi.fa") == 0
+    or die "Failed to copy optimized consensus\n";
+
+print "LTR identification and refinement completed successfully\n";

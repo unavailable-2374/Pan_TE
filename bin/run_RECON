@@ -138,11 +138,9 @@ sub process_repeat_masker {
     system("Refiner_for_LTR ../re.fa ./ --threads $threads > refine.log 2> refine.err") == 0 
         or die "Failed to Combine LTR & RepeatScout\n";
     
-    `mv consensi.fa lib.fa`;
-    
     # Use -div 10 for the main RepeatMasker run (keeping original parameter)
-    run_cmd("RepeatMasker -lib lib.fa -e rmblast -lcambig -dir repeat " . 
-            "-pa $cpu_threads -q tmp.fa -div 15 > rm.log 2>&1");
+    run_cmd("RepeatMasker -lib all_sequences.fa -e rmblast -lcambig -dir repeat " . 
+            "-pa $cpu_threads -q tmp.fa > rm.log 2>&1");
 }
 
 sub process_blast_db {

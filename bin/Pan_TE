@@ -32,6 +32,7 @@ Parameters:
     -M <int>                 Memory limit (in MB), default: 0 (unlimited).
     --threads <int>          Default: 4. Number of threads, preferably in multiples of 4.
     --fragment_size <int>    Default: 40000. Length for fragment.
+    --ltr-mode <string>      Default: inpactor2. LTR detection mode (inpactor2 or look4ltrs).
     --help|-h                Display this help information.
 
 Version: {VERSION}
@@ -89,6 +90,11 @@ def parse_arguments():
                        type=int,
                        default=40000,
                        help='Length for fragment')
+    parser.add_argument('--ltr-mode',
+                       type=str,
+                       choices=['inpactor2', 'look4ltrs'],
+                       default='inpactor2',
+                       help='LTR detection mode (default: inpactor2)')
     parser.add_argument('--help', '-h',
                        action='help',
                        help='Display help information')
@@ -105,7 +111,8 @@ class PanTEPipeline:
     """Implementation of the Pan TE Pipeline with step tracking and checkpoints."""
     
     def __init__(self, genome_file: Optional[str], output_dir: str, threads: int = 4, 
-                 model_dir: Optional[str] = None, vcf_dir: Optional[str] = None):
+                 model_dir: Optional[str] = None, vcf_dir: Optional[str] = None,
+                 ltr_mode: str = 'inpactor2'):
         """Initialize the pipeline with configuration parameters."""
         self.genome_file = os.path.abspath(genome_file) if genome_file else None
         self.vcf_dir = os.path.abspath(vcf_dir) if vcf_dir else None
@@ -113,6 +120,7 @@ class PanTEPipeline:
         self.threads = threads
         self.model_dir = os.path.abspath(model_dir)
         self.processed_genome = os.path.join(self.output_dir, 'genome', 'genome.fa')
+        self.ltr_mode = ltr_mode
 
         # Verify inputs
         if not self.genome_file:
@@ -147,11 +155,16 @@ class PanTEPipeline:
         directories = [
             self.output_dir,
             os.path.join(self.output_dir, 'genome'),
-            os.path.join(self.output_dir, 'look4ltrs'),
             os.path.join(self.output_dir, 'RepeatScout'),
             os.path.join(self.output_dir, 'RECON'),
             os.path.join(self.output_dir, 'Combine')
         ]
+        
+        # Create LTR directory based on mode
+        if self.ltr_mode == 'look4ltrs':
+            directories.append(os.path.join(self.output_dir, 'look4ltrs'))
+        else:
+            directories.append(os.path.join(self.output_dir, 'Inpactor2'))
         
         for directory in directories:
             os.makedirs(directory, exist_ok=True)
@@ -274,12 +287,24 @@ class PanTEPipeline:
         logger.info("Single genome processing completed")
 
     def process_ltr(self):
-        """Process LTRs using allocated threads."""
+        """Process LTRs using the selected mode."""
         if self.check_checkpoint('ltr'):
             logger.info("LTR processing already completed")
             return
-            
-        logger.info(f"Starting LTR processing with {self.ltr_threads} threads")
+        
+        logger.info(f"Starting LTR processing using {self.ltr_mode} mode")
+        
+        if self.ltr_mode == 'look4ltrs':
+            self.process_ltr_look4ltrs()
+        else:
+            self.process_ltr_inpactor2()
+        
+        self.create_checkpoint('ltr')
+        logger.info("LTR processing completed")
+
+    def process_ltr_look4ltrs(self):
+        """Process LTRs using look4ltrs (original method)."""
+        logger.info(f"Starting LTR processing with look4ltrs using {self.ltr_threads} threads")
         ltr_dir = os.path.join(self.output_dir, 'look4ltrs')
         os.makedirs(ltr_dir, exist_ok=True)
         
@@ -295,9 +320,53 @@ class PanTEPipeline:
         # Run para_look4ltrs with the processed genome file
         cmd = f"para_look4ltrs {self.processed_genome} {self.ltr_threads} {self.output_dir}"
         self.run_cmd(cmd, ltr_dir)
+
+    def process_ltr_inpactor2(self):
+        """Process LTRs using Inpactor2 (new method)."""
+        logger.info(f"Starting LTR processing with Inpactor2 using {self.threads} threads")
+        ltr_dir = os.path.join(self.output_dir, 'Inpactor2')
+        os.makedirs(ltr_dir, exist_ok=True)
         
-        self.create_checkpoint('ltr')
-        logger.info("LTR processing completed")
+        # Use the processed genome file from genome directory
+        genome_file = os.path.join(self.output_dir, 'genome', 'genome.fa')
+        if not os.path.exists(genome_file):
+            raise FileNotFoundError(f"Processed genome file not found: {genome_file}")
+        
+        # Check if Inpactor2 already completed
+        inpactor2_output = os.path.join(ltr_dir, 'Inpactor2_library.fasta')
+        if os.path.exists(inpactor2_output):
+            logger.info("Inpactor2 was already done!")
+        else:
+            # Run Inpactor2
+            inpactor2_cmd = (f"conda run -n Inpactor2 Inpactor2.py -f {genome_file} "
+                           f"-o {ltr_dir} -t {self.threads} -a no -n 100 -c no "
+                           f">inpactor2.log 2>>inpactor2.log")
+            self.run_cmd(inpactor2_cmd, ltr_dir)
+            
+            # Run refinement
+            refine_cmd = f"Refiner_for_LTR Inpactor2_library.fasta ./ --threads {self.threads}"
+            self.run_cmd(refine_cmd, ltr_dir)
+        
+        # Process output file
+        all_sequences = os.path.join(ltr_dir, 'all_sequences.fa')
+        ltr_fa = os.path.join(ltr_dir, 'LTR.fa')
+        
+        if os.path.exists(all_sequences):
+            self.run_cmd(f"sed 's:N::g' {all_sequences} > {ltr_fa}", ltr_dir)
+        else:
+            logger.warning(f"all_sequences.fa not found, checking for alternative outputs")
+        
+        # Run LTR_Boundary_Optimizer
+        optimizer_cmd = (f"LTR_Boundary_Optimizer.py {ltr_fa} {genome_file} output_dir "
+                        f"--threads {self.threads} --advanced-tsd --weighted-evidence "
+                        f"--kmer-boundary --orientation-aware --low-complexity-filter "
+                        f"--clustering --dynamic-threshold --orf-analysis")
+        self.run_cmd(optimizer_cmd, ltr_dir)
+        
+        # Copy final results
+        self.run_cmd("cp output_dir/optimized_consensus.fa consensi.fa", ltr_dir)
+        
+        logger.info("Inpactor2 LTR identification and refinement completed successfully")
 
     def process_repeatscout(self):
         """Process RepeatScout with allocated threads."""
@@ -329,7 +398,13 @@ class PanTEPipeline:
         logger.info("Starting RECON processing")
         recon_dir = os.path.join(self.output_dir, 'RECON')
         
-        self.run_cmd(f"cat ../RepeatScout/consensi.fa ../look4ltrs/consensi.fa > raw.fa", recon_dir)
+        # Adjust path based on LTR mode
+        if self.ltr_mode == 'look4ltrs':
+            ltr_consensi_path = '../look4ltrs/consensi.fa'
+        else:
+            ltr_consensi_path = '../Inpactor2/consensi.fa'
+        
+        self.run_cmd(f"cat ../RepeatScout/consensi.fa {ltr_consensi_path} > raw.fa", recon_dir)
         
         genome_size = os.path.getsize(self.processed_genome)
 
@@ -379,48 +454,6 @@ class PanTEPipeline:
         self.create_checkpoint('combine')
         logger.info("Results combination completed")
 
-    def process_single_genome(self, output_file: str):
-        """Process a single genome file."""
-        logger.info("Starting single genome processing")
-        
-        # Process genome file
-        tmp_fa = output_file + '.tmp'
-        self.run_cmd(f"tr 'a-z' 'A-Z' < {self.genome_file} > {tmp_fa}")
-        self.run_cmd(f"clean_seq {tmp_fa} {output_file}")
-        
-        # Index genome
-        self.run_cmd(f"samtools faidx {output_file}")
-        self.run_cmd(f"index {output_file}") 
-
-        os.remove(tmp_fa)
-        logger.info("Single genome processing completed")
-
-    def combine_genome_results(self, genome_dir: str, input_files: list):
-        """Combine and process all genome sequences into final genome.fa."""
-        logger.info("Combining genome results")
-        
-        # Combine all input files
-        combined_fa = os.path.join(genome_dir, 'combined.fa')
-        with open(combined_fa, 'w') as outfile:
-            for infile in input_files:
-                with open(infile) as indata:
-                    outfile.write(indata.read())
-        
-        # Process combined file
-        tmp_fa = os.path.join(genome_dir, 'tmp.fa')
-        self.run_cmd(f"tr 'a-z' 'A-Z' < {combined_fa} > {tmp_fa}")
-        self.run_cmd(f"clean_seq {tmp_fa} {os.path.join(genome_dir, 'genome.fa')}")
-        self.run_cmd(f"samtools faidx {os.path.join(genome_dir, 'genome.fa')}")
-        self.run_cmd(f"index {os.path.join(genome_dir, 'genome')}")
-        
-        # Cleanup
-        os.remove(tmp_fa)
-        os.remove(combined_fa)
-        for file in input_files:
-            os.remove(file)
-        
-        logger.info("Genome results combined successfully")
-
     def run(self):
         """Run complete pipeline."""
         try:
@@ -465,7 +498,8 @@ def main():
             output_dir=args.out,
             threads=args.threads,
             model_dir=args.model_dir,
-            vcf_dir=args.vcf_dir
+            vcf_dir=args.vcf_dir,
+            ltr_mode=args.ltr_mode
         )
 
         # Set memory limit if specified
@@ -480,6 +514,7 @@ def main():
             logger.info(f"Set fragment size to {args.fragment_size}")
 
         # Run pipeline
+        logger.info(f"Starting pipeline with LTR mode: {args.ltr_mode}")
         pipeline.run()
         logger.info("Pipeline completed successfully")
         
