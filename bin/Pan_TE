@@ -445,7 +445,7 @@ class PanTEPipeline:
         combine_dir = os.path.join(self.output_dir, 'Combine')
         
         # Combine results
-        self.run_cmd("cat ../RECON/round-1/lib.fa ../RECON/round-1/consensi.fa > raw_TEs.fa",
+        self.run_cmd("cat ../RECON/round-1/all_sequences.fa ../RECON/round-1/consensi.fa > raw_TEs.fa",
                     combine_dir)
         
         # Run classifier
