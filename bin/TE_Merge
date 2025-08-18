@@ -1,0 +1,1872 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import logging
+import subprocess
+import tempfile
+import argparse
+import json
+import time
+from collections import defaultdict, Counter
+from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
+from Bio.Seq import Seq
+import networkx as nx
+from concurrent.futures import ThreadPoolExecutor
+import shutil
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+from scipy import stats
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import warnings
+warnings.filterwarnings('ignore')
+
+# Add compatibility layer for np.bool deprecation
+if hasattr(np, 'bool'):
+    pass
+else:
+    np.bool = np.bool_
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class EnhancedTEClusteringPipeline:
+    def __init__(self, input_fasta, output_dir, 
+                 cluster_method="auto", threads=1,
+                 identity_threshold=0.8, coverage_threshold=0.8,
+                 cleanup_temp=True, max_iterations=3,
+                 convergence_threshold=0.05, max_cluster_size=50,
+                 keep_variants=True, store_iterations=True,
+                 use_iupac=True, adaptive_clustering=True,
+                 subfamily_detection=True, quality_weighting=True):
+        """
+        Enhanced TE sequence clustering pipeline with intelligent clustering and consensus building
+        
+        New parameters:
+            adaptive_clustering (bool): Enable adaptive clustering strategy based on sequence diversity
+            subfamily_detection (bool): Enable automatic subfamily variant detection
+            quality_weighting (bool): Use sequence quality for weighted consensus building
+        """
+        self.input_fasta = input_fasta
+        self.output_dir = output_dir
+        self.cluster_method = cluster_method
+        self.threads = threads
+        self.identity_threshold = identity_threshold
+        self.coverage_threshold = coverage_threshold
+        self.cleanup_temp = cleanup_temp
+        self.max_iterations = max_iterations
+        self.convergence_threshold = convergence_threshold
+        self.max_cluster_size = max_cluster_size
+        self.keep_variants = keep_variants
+        self.store_iterations = store_iterations
+        self.use_iupac = use_iupac
+        self.adaptive_clustering = adaptive_clustering
+        self.subfamily_detection = subfamily_detection
+        self.quality_weighting = quality_weighting
+        
+        # Create output directories
+        os.makedirs(output_dir, exist_ok=True)
+        self.temp_dir = os.path.join(output_dir, "temp")
+        os.makedirs(self.temp_dir, exist_ok=True)
+        
+        if self.store_iterations:
+            self.iterations_dir = os.path.join(output_dir, "iterations")
+            os.makedirs(self.iterations_dir, exist_ok=True)
+            
+        self.details_dir = os.path.join(output_dir, "cluster_details")
+        os.makedirs(self.details_dir, exist_ok=True)
+        
+        # Initialize clustering statistics
+        self.cluster_stats = []
+        self.diversity_metrics = {}
+        
+    def check_tools(self):
+        """Check if necessary tools are available"""
+        tools = ["Refiner_for_Graph"]
+        
+        # Check clustering tools based on method
+        if self.cluster_method == "auto":
+            # For auto mode, check all tools
+            clustering_tools = ["minimap2", "mmseqs", "vsearch", "cd-hit-est"]
+        elif self.cluster_method == "minimap2":
+            clustering_tools = ["minimap2"]
+        elif self.cluster_method == "mmseqs":
+            clustering_tools = ["mmseqs"]
+        elif self.cluster_method == "vsearch":
+            clustering_tools = ["vsearch"]
+        else:
+            clustering_tools = ["cd-hit-est"]
+            
+        tools.extend(clustering_tools)
+        
+        # Check helpful tools
+        helpful_tools = ["mafft", "fasttree", "mash"]
+            
+        missing_tools = []
+        optional_missing = []
+        available_clustering_tools = []
+        
+        for tool in tools:
+            if not shutil.which(tool):
+                if tool in clustering_tools:
+                    # Track which clustering tools are available
+                    continue
+                else:
+                    missing_tools.append(tool)
+            elif tool in clustering_tools:
+                available_clustering_tools.append(tool)
+                
+        for tool in helpful_tools:
+            if not shutil.which(tool):
+                optional_missing.append(tool)
+                
+        # For auto mode, ensure at least one clustering tool is available
+        if self.cluster_method == "auto" and not available_clustering_tools:
+            logger.error("No clustering tools available for auto mode")
+            return False
+            
+        if missing_tools:
+            logger.error(f"Missing necessary tools: {', '.join(missing_tools)}")
+            return False
+            
+        if optional_missing:
+            logger.warning(f"Optional tools missing: {', '.join(optional_missing)}")
+            
+        # Store available tools for auto mode
+        self.available_clustering_tools = available_clustering_tools
+        
+        return True
+        
+    def estimate_sequence_diversity(self, sequences, sample_size=1000):
+        """
+        Estimate sequence diversity using k-mer analysis and pairwise similarity
+        
+        Returns:
+            dict: Diversity metrics including mean_similarity, std_similarity, diversity_score
+        """
+        logger.info(f"Estimating sequence diversity from {len(sequences)} sequences...")
+        
+        # Sample sequences if dataset is large
+        if len(sequences) > sample_size:
+            import random
+            sampled_seqs = random.sample(sequences, sample_size)
+        else:
+            sampled_seqs = sequences
+            
+        # K-mer based diversity estimation
+        kmer_size = 7
+        all_kmers = set()
+        seq_kmers = []
+        
+        for seq in sampled_seqs:
+            seq_str = str(seq.seq).upper()
+            kmers = set()
+            for i in range(len(seq_str) - kmer_size + 1):
+                kmer = seq_str[i:i+kmer_size]
+                if 'N' not in kmer:  # Skip kmers with N
+                    kmers.add(kmer)
+                    all_kmers.add(kmer)
+            seq_kmers.append(kmers)
+            
+        # Calculate Jaccard similarity between sequences
+        similarities = []
+        for i in range(len(seq_kmers)):
+            for j in range(i+1, len(seq_kmers)):
+                if seq_kmers[i] and seq_kmers[j]:
+                    intersection = len(seq_kmers[i] & seq_kmers[j])
+                    union = len(seq_kmers[i] | seq_kmers[j])
+                    if union > 0:
+                        similarity = intersection / union
+                        similarities.append(similarity)
+                        
+        if similarities:
+            mean_sim = np.mean(similarities)
+            std_sim = np.std(similarities)
+            # Diversity score: higher value means more diverse
+            diversity_score = 1 - mean_sim + std_sim
+        else:
+            mean_sim = 0
+            std_sim = 0
+            diversity_score = 1
+            
+        # Length variation as additional diversity metric
+        lengths = [len(seq.seq) for seq in sampled_seqs]
+        length_cv = np.std(lengths) / np.mean(lengths) if np.mean(lengths) > 0 else 0
+        
+        metrics = {
+            'mean_similarity': mean_sim,
+            'std_similarity': std_sim,
+            'diversity_score': diversity_score,
+            'length_cv': length_cv,
+            'total_kmers': len(all_kmers),
+            'sample_size': len(sampled_seqs)
+        }
+        
+        logger.info(f"Diversity metrics: mean_sim={mean_sim:.3f}, diversity={diversity_score:.3f}, length_cv={length_cv:.3f}")
+        
+        return metrics
+        
+    def select_clustering_method(self, sequences):
+        """
+        Intelligently select clustering method based on sequence characteristics
+        
+        Returns:
+            str: Selected clustering method
+        """
+        if not self.adaptive_clustering or self.cluster_method != "auto":
+            return self.cluster_method
+            
+        # Estimate diversity
+        diversity = self.estimate_sequence_diversity(sequences)
+        self.diversity_metrics = diversity
+        
+        # Decision logic based on diversity and available tools
+        diversity_score = diversity['diversity_score']
+        
+        # Priority order based on diversity
+        if diversity_score < 0.2:  # Very similar sequences
+            method_priority = ["mmseqs", "vsearch", "cd-hit-est", "minimap2"]
+        elif diversity_score < 0.5:  # Moderate diversity
+            method_priority = ["minimap2", "vsearch", "mmseqs", "cd-hit-est"]
+        else:  # High diversity
+            method_priority = ["minimap2", "cd-hit-est", "vsearch", "mmseqs"]
+            
+        # Select first available method from priority list
+        for method in method_priority:
+            if method in self.available_clustering_tools:
+                logger.info(f"Selected {method} for clustering (diversity_score={diversity_score:.3f})")
+                return method
+                
+        # Fallback to first available tool
+        if self.available_clustering_tools:
+            method = self.available_clustering_tools[0]
+            logger.info(f"Using fallback method: {method}")
+            return method
+            
+        logger.error("No clustering tools available")
+        return None
+        
+    def hierarchical_clustering_strategy(self, sequences):
+        """
+        Implement hierarchical clustering for highly diverse sequences
+        
+        Returns:
+            list: Final clusters after hierarchical processing
+        """
+        logger.info("Using hierarchical clustering strategy for diverse sequences...")
+        
+        # Stage 1: Coarse clustering with relaxed parameters
+        logger.info("Stage 1: Coarse clustering")
+        coarse_identity = max(0.5, self.identity_threshold - 0.3)
+        coarse_coverage = max(0.4, self.coverage_threshold - 0.3)
+        
+        # Temporarily adjust parameters
+        orig_identity = self.identity_threshold
+        orig_coverage = self.coverage_threshold
+        
+        self.identity_threshold = coarse_identity
+        self.coverage_threshold = coarse_coverage
+        
+        # Write sequences to temp file
+        temp_input = os.path.join(self.temp_dir, "hierarchical_input.fa")
+        SeqIO.write(sequences, temp_input, "fasta")
+        
+        # Run coarse clustering
+        method = self.select_clustering_method(sequences)
+        if method == "minimap2":
+            coarse_clusters, _ = self.run_minimap2_clustering(temp_input)
+        elif method == "mmseqs":
+            coarse_clusters, _ = self.run_mmseqs_clustering(temp_input)
+        elif method == "vsearch":
+            coarse_clusters, _ = self.run_vsearch_clustering(temp_input)
+        else:
+            coarse_clusters, _ = self.run_cdhit_clustering(temp_input)
+            
+        # Restore original parameters
+        self.identity_threshold = orig_identity
+        self.coverage_threshold = orig_coverage
+        
+        logger.info(f"Coarse clustering produced {len(coarse_clusters)} clusters")
+        
+        # Stage 2: Fine clustering within each coarse cluster
+        logger.info("Stage 2: Fine clustering within coarse clusters")
+        final_clusters = []
+        
+        # Create sequence ID to sequence mapping
+        seq_dict = {seq.id: seq for seq in sequences}
+        
+        for i, coarse_cluster in enumerate(tqdm(coarse_clusters, desc="Fine clustering")):
+            if len(coarse_cluster) <= 5:
+                # Small clusters don't need further splitting
+                final_clusters.append(coarse_cluster)
+            else:
+                # Extract sequences for this cluster
+                cluster_seqs = [seq_dict[seq_id] for seq_id in coarse_cluster if seq_id in seq_dict]
+                
+                # Estimate diversity within cluster
+                cluster_diversity = self.estimate_sequence_diversity(cluster_seqs, sample_size=min(100, len(cluster_seqs)))
+                
+                if cluster_diversity['diversity_score'] < 0.3:
+                    # Low diversity within cluster, keep as is
+                    final_clusters.append(coarse_cluster)
+                else:
+                    # High diversity, perform fine clustering
+                    fine_temp = os.path.join(self.temp_dir, f"fine_cluster_{i}.fa")
+                    SeqIO.write(cluster_seqs, fine_temp, "fasta")
+                    
+                    # Use stricter parameters for fine clustering
+                    fine_identity = min(0.95, self.identity_threshold + 0.1)
+                    fine_coverage = self.coverage_threshold
+                    
+                    self.identity_threshold = fine_identity
+                    self.coverage_threshold = fine_coverage
+                    
+                    # Run fine clustering
+                    if method == "minimap2":
+                        fine_clusters, _ = self.run_minimap2_clustering(fine_temp)
+                    else:
+                        # Use CD-HIT for fine clustering as fallback
+                        fine_clusters, _ = self.run_cdhit_clustering(fine_temp)
+                        
+                    # Restore parameters
+                    self.identity_threshold = orig_identity
+                    self.coverage_threshold = orig_coverage
+                    
+                    # Add fine clusters to results
+                    final_clusters.extend(fine_clusters)
+                    
+                    if self.cleanup_temp:
+                        try:
+                            os.remove(fine_temp)
+                        except:
+                            pass
+                            
+        logger.info(f"Hierarchical clustering completed: {len(coarse_clusters)} coarse clusters → {len(final_clusters)} final clusters")
+        
+        return final_clusters
+        
+    def assess_sequence_quality(self, sequence):
+        """
+        Assess sequence quality based on multiple metrics
+        
+        Returns:
+            dict: Quality metrics and overall quality score (0-1)
+        """
+        seq_str = str(sequence.seq).upper()
+        seq_len = len(seq_str)
+        
+        if seq_len == 0:
+            return {'quality_score': 0, 'length': 0}
+            
+        # Calculate various quality metrics
+        metrics = {}
+        
+        # 1. N content
+        n_count = seq_str.count('N')
+        metrics['n_ratio'] = n_count / seq_len
+        
+        # 2. GC content
+        gc_count = seq_str.count('G') + seq_str.count('C')
+        metrics['gc_content'] = gc_count / seq_len
+        
+        # 3. Low complexity regions (simple repeat detection)
+        metrics['low_complexity_ratio'] = self.calculate_low_complexity(seq_str)
+        
+        # 4. Length relative to expected
+        metrics['length'] = seq_len
+        
+        # 5. Homopolymer runs
+        metrics['max_homopolymer'] = self.find_max_homopolymer(seq_str)
+        
+        # Calculate overall quality score (0-1, higher is better)
+        quality_score = 1.0
+        
+        # Penalize high N content
+        quality_score *= (1 - metrics['n_ratio'])
+        
+        # Penalize extreme GC content
+        gc_penalty = abs(metrics['gc_content'] - 0.5) * 2  # 0 at 50% GC, 1 at 0% or 100%
+        quality_score *= (1 - gc_penalty * 0.5)
+        
+        # Penalize low complexity
+        quality_score *= (1 - metrics['low_complexity_ratio'] * 0.5)
+        
+        # Penalize very long homopolymers
+        if metrics['max_homopolymer'] > 10:
+            quality_score *= 0.8
+            
+        metrics['quality_score'] = quality_score
+        
+        return metrics
+        
+    def calculate_low_complexity(self, seq_str, window_size=50):
+        """Calculate proportion of low complexity regions"""
+        if len(seq_str) < window_size:
+            return 0
+            
+        low_complexity_count = 0
+        
+        for i in range(0, len(seq_str) - window_size + 1, window_size // 2):
+            window = seq_str[i:i+window_size]
+            # Count unique k-mers in window
+            kmers = set()
+            for j in range(len(window) - 3):
+                kmers.add(window[j:j+4])
+                
+            # If too few unique 4-mers, consider low complexity
+            if len(kmers) < 10:
+                low_complexity_count += 1
+                
+        total_windows = (len(seq_str) - window_size) // (window_size // 2) + 1
+        return low_complexity_count / total_windows if total_windows > 0 else 0
+        
+    def find_max_homopolymer(self, seq_str):
+        """Find the longest homopolymer run"""
+        if not seq_str:
+            return 0
+            
+        max_run = 1
+        current_run = 1
+        
+        for i in range(1, len(seq_str)):
+            if seq_str[i] == seq_str[i-1]:
+                current_run += 1
+                max_run = max(max_run, current_run)
+            else:
+                current_run = 1
+                
+        return max_run
+        
+    def build_weighted_consensus(self, sequences, cluster_id):
+        """
+        Build weighted consensus sequence considering sequence quality
+        
+        Returns:
+            SeqRecord: Consensus sequence with quality-based weighting
+        """
+        if not sequences:
+            return None
+            
+        if len(sequences) == 1:
+            return sequences[0]
+            
+        logger.info(f"Building weighted consensus for cluster {cluster_id} ({len(sequences)} sequences)")
+        
+        # Assess quality for each sequence
+        seq_qualities = []
+        for seq in sequences:
+            quality = self.assess_sequence_quality(seq)
+            seq_qualities.append(quality)
+            
+        # Extract quality scores
+        quality_scores = [q['quality_score'] for q in seq_qualities]
+        
+        # Normalize quality scores to weights
+        if self.quality_weighting and max(quality_scores) > 0:
+            # Convert to weights (higher quality = higher weight)
+            weights = np.array(quality_scores)
+            weights = weights / weights.sum()
+        else:
+            # Equal weights if not using quality weighting
+            weights = np.ones(len(sequences)) / len(sequences)
+            
+        # Align sequences if necessary
+        if len(sequences) <= 100:  # Only align if reasonable number
+            aligned_seqs = self.align_sequences(sequences)
+        else:
+            aligned_seqs = sequences
+            
+        # Build position-specific scoring matrix (PSSM)
+        consensus_seq = self.build_consensus_from_weights(aligned_seqs, weights)
+        
+        # Create consensus record
+        consensus_record = SeqRecord(
+            Seq(consensus_seq),
+            id=f"cluster_{cluster_id}_consensus",
+            description=f"Weighted consensus from {len(sequences)} sequences (mean_quality={np.mean(quality_scores):.3f})"
+        )
+        
+        return consensus_record
+        
+    def align_sequences(self, sequences):
+        """Align sequences using MAFFT if available, otherwise simple alignment"""
+        if len(sequences) > 100:
+            logger.warning(f"Too many sequences ({len(sequences)}) for alignment, using unaligned")
+            return sequences
+            
+        if shutil.which("mafft"):
+            # Use MAFFT for alignment
+            temp_input = os.path.join(self.temp_dir, f"align_input_{time.time()}.fa")
+            temp_output = os.path.join(self.temp_dir, f"align_output_{time.time()}.fa")
+            
+            try:
+                SeqIO.write(sequences, temp_input, "fasta")
+                
+                cmd = ["mafft", "--auto", "--quiet", temp_input]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    with open(temp_output, "w") as f:
+                        f.write(result.stdout)
+                    aligned = list(SeqIO.parse(temp_output, "fasta"))
+                    return aligned
+            except Exception as e:
+                logger.warning(f"MAFFT alignment failed: {e}")
+            finally:
+                for f in [temp_input, temp_output]:
+                    if os.path.exists(f):
+                        try:
+                            os.remove(f)
+                        except:
+                            pass
+                            
+        # Fallback: return unaligned
+        return sequences
+        
+    def build_consensus_from_weights(self, sequences, weights):
+        """Build consensus sequence using weighted voting"""
+        if not sequences:
+            return ""
+            
+        # Find maximum sequence length
+        max_len = max(len(str(seq.seq)) for seq in sequences)
+        
+        consensus = []
+        
+        for pos in range(max_len):
+            # Collect bases at this position with weights
+            base_weights = defaultdict(float)
+            total_weight = 0
+            
+            for i, seq in enumerate(sequences):
+                seq_str = str(seq.seq).upper()
+                if pos < len(seq_str) and seq_str[pos] != '-':
+                    base = seq_str[pos]
+                    base_weights[base] += weights[i]
+                    total_weight += weights[i]
+                    
+            if total_weight == 0:
+                continue
+                
+            # Normalize weights
+            for base in base_weights:
+                base_weights[base] /= total_weight
+                
+            # Determine consensus base
+            if self.use_iupac:
+                consensus_base = self.determine_iupac_base(base_weights)
+            else:
+                # Use most common base
+                consensus_base = max(base_weights.items(), key=lambda x: x[1])[0]
+                
+            consensus.append(consensus_base)
+            
+        return ''.join(consensus)
+        
+    def determine_iupac_base(self, base_weights, min_freq=0.2):
+        """Determine IUPAC base from weighted base frequencies"""
+        # Filter bases above minimum frequency
+        significant_bases = {base for base, weight in base_weights.items() if weight >= min_freq}
+        
+        if not significant_bases:
+            return 'N'
+            
+        # IUPAC codes
+        iupac_codes = {
+            frozenset(['A']): 'A',
+            frozenset(['C']): 'C',
+            frozenset(['G']): 'G',
+            frozenset(['T']): 'T',
+            frozenset(['A', 'G']): 'R',
+            frozenset(['C', 'T']): 'Y',
+            frozenset(['G', 'C']): 'S',
+            frozenset(['A', 'T']): 'W',
+            frozenset(['G', 'T']): 'K',
+            frozenset(['A', 'C']): 'M',
+            frozenset(['C', 'G', 'T']): 'B',
+            frozenset(['A', 'G', 'T']): 'D',
+            frozenset(['A', 'C', 'T']): 'H',
+            frozenset(['A', 'C', 'G']): 'V',
+            frozenset(['A', 'C', 'G', 'T']): 'N',
+        }
+        
+        # Find matching IUPAC code
+        bases_set = frozenset(significant_bases)
+        if bases_set in iupac_codes:
+            return iupac_codes[bases_set]
+        else:
+            # If no exact match, use most frequent base
+            return max(base_weights.items(), key=lambda x: x[1])[0]
+            
+    def identify_subfamily_variants(self, cluster_sequences, cluster_id):
+        """
+        Identify potential subfamily variants within a cluster
+        
+        Returns:
+            list: List of subfamily representatives
+        """
+        if not self.subfamily_detection or len(cluster_sequences) < 5:
+            return []
+            
+        logger.info(f"Detecting subfamily variants in cluster {cluster_id}")
+        
+        # Extract sequences and create feature vectors
+        sequences = []
+        seq_features = []
+        
+        for seq in cluster_sequences:
+            seq_str = str(seq.seq).upper()
+            sequences.append(seq)
+            
+            # Create k-mer feature vector
+            features = self.extract_sequence_features(seq_str)
+            seq_features.append(features)
+            
+        # Calculate pairwise distances
+        n_seqs = len(sequences)
+        distance_matrix = np.zeros((n_seqs, n_seqs))
+        
+        for i in range(n_seqs):
+            for j in range(i+1, n_seqs):
+                dist = self.calculate_sequence_distance(seq_features[i], seq_features[j])
+                distance_matrix[i, j] = dist
+                distance_matrix[j, i] = dist
+                
+        # Identify subfamilies using clustering
+        subfamilies = self.cluster_by_distance(distance_matrix, min_clusters=2, max_clusters=5)
+        
+        # Select representatives for each subfamily
+        subfamily_reps = []
+        
+        for sf_id, sf_members in enumerate(subfamilies):
+            if len(sf_members) < 2:
+                continue
+                
+            # Select most central sequence as representative
+            sf_seqs = [sequences[i] for i in sf_members]
+            
+            # Build subfamily consensus
+            sf_consensus = self.build_weighted_consensus(sf_seqs, f"{cluster_id}_sf{sf_id}")
+            sf_consensus.id = f"cluster_{cluster_id}_subfamily_{sf_id}"
+            sf_consensus.description = f"Subfamily {sf_id} representative ({len(sf_members)} members)"
+            
+            subfamily_reps.append(sf_consensus)
+            
+        logger.info(f"Identified {len(subfamily_reps)} subfamily variants")
+        
+        return subfamily_reps
+        
+    def extract_sequence_features(self, seq_str, k=5):
+        """Extract k-mer features from sequence"""
+        features = Counter()
+        
+        for i in range(len(seq_str) - k + 1):
+            kmer = seq_str[i:i+k]
+            if 'N' not in kmer:
+                features[kmer] += 1
+                
+        # Normalize by sequence length
+        total = sum(features.values())
+        if total > 0:
+            for kmer in features:
+                features[kmer] /= total
+                
+        return features
+        
+    def calculate_sequence_distance(self, features1, features2):
+        """Calculate distance between two feature vectors"""
+        all_kmers = set(features1.keys()) | set(features2.keys())
+        
+        if not all_kmers:
+            return 1.0
+            
+        # Convert to vectors
+        vec1 = np.array([features1.get(kmer, 0) for kmer in all_kmers])
+        vec2 = np.array([features2.get(kmer, 0) for kmer in all_kmers])
+        
+        # Calculate cosine distance
+        if np.any(vec1) and np.any(vec2):
+            similarity = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+            return 1 - similarity
+        else:
+            return 1.0
+            
+    def cluster_by_distance(self, distance_matrix, min_clusters=2, max_clusters=5):
+        """Cluster sequences based on distance matrix"""
+        from sklearn.cluster import AgglomerativeClustering
+        
+        n_samples = distance_matrix.shape[0]
+        
+        if n_samples < min_clusters:
+            return [list(range(n_samples))]
+            
+        # Try different numbers of clusters and select best
+        best_score = -1
+        best_clusters = None
+        
+        for n_clusters in range(min_clusters, min(max_clusters + 1, n_samples)):
+            clustering = AgglomerativeClustering(
+                n_clusters=n_clusters,
+                affinity='precomputed',
+                linkage='average'
+            )
+            
+            labels = clustering.fit_predict(distance_matrix)
+            
+            # Calculate silhouette score
+            if n_clusters > 1 and n_clusters < n_samples:
+                from sklearn.metrics import silhouette_score
+                score = silhouette_score(distance_matrix, labels, metric='precomputed')
+                
+                if score > best_score:
+                    best_score = score
+                    best_clusters = labels
+                    
+        if best_clusters is None:
+            return [list(range(n_samples))]
+            
+        # Group by cluster label
+        clusters = defaultdict(list)
+        for i, label in enumerate(best_clusters):
+            clusters[label].append(i)
+            
+        return list(clusters.values())
+        
+    def refine_cluster_enhanced(self, cluster_seqs, cluster_id):
+        """
+        Enhanced cluster refinement with subfamily detection and weighted consensus
+        
+        Returns:
+            dict: Contains consensus, variants, subfamilies, and statistics
+        """
+        if len(cluster_seqs) == 1:
+            return {
+                'consensus': cluster_seqs[0],
+                'variants': [],
+                'subfamilies': [],
+                'alignment': None,
+                'statistics': {
+                    'size': 1,
+                    'is_single': True,
+                    'mean_identity': 1.0,
+                    'mean_quality': 1.0
+                }
+            }
+            
+        logger.info(f"Enhanced refinement of cluster {cluster_id} ({len(cluster_seqs)} sequences)")
+        
+        # Build weighted consensus
+        consensus = self.build_weighted_consensus(cluster_seqs, cluster_id)
+        
+        # Identify subfamily variants
+        subfamily_variants = []
+        if self.subfamily_detection:
+            subfamily_variants = self.identify_subfamily_variants(cluster_seqs, cluster_id)
+            
+        # Calculate statistics
+        qualities = [self.assess_sequence_quality(seq)['quality_score'] for seq in cluster_seqs]
+        
+        statistics = {
+            'size': len(cluster_seqs),
+            'is_single': False,
+            'mean_identity': self.calculate_cluster_identity(cluster_seqs),
+            'mean_quality': np.mean(qualities),
+            'quality_std': np.std(qualities),
+            'n_subfamilies': len(subfamily_variants)
+        }
+        
+        # Combine regular variants (if using Refiner_for_Graph) with subfamily variants
+        all_variants = []
+        
+        # Try to use Refiner_for_Graph if available
+        if shutil.which("Refiner_for_Graph") and self.keep_variants:
+            try:
+                graph_result = self.refine_with_graph_tool(cluster_seqs, cluster_id)
+                if graph_result and 'variants' in graph_result:
+                    all_variants.extend(graph_result['variants'])
+            except Exception as e:
+                logger.warning(f"Refiner_for_Graph failed: {e}")
+                
+        # Add subfamily variants
+        all_variants.extend(subfamily_variants)
+        
+        return {
+            'consensus': consensus,
+            'variants': all_variants,
+            'subfamilies': subfamily_variants,
+            'alignment': None,
+            'statistics': statistics
+        }
+        
+    def calculate_cluster_identity(self, sequences):
+        """Calculate average pairwise identity within cluster"""
+        if len(sequences) <= 1:
+            return 1.0
+            
+        # Sample if too many sequences
+        if len(sequences) > 50:
+            import random
+            sampled = random.sample(sequences, 50)
+        else:
+            sampled = sequences
+            
+        # Quick k-mer based similarity
+        similarities = []
+        for i in range(len(sampled)):
+            for j in range(i+1, len(sampled)):
+                sim = self.quick_similarity(sampled[i], sampled[j])
+                similarities.append(sim)
+                
+        return np.mean(similarities) if similarities else 1.0
+        
+    def quick_similarity(self, seq1, seq2, k=7):
+        """Quick k-mer based similarity calculation"""
+        kmers1 = set()
+        kmers2 = set()
+        
+        seq1_str = str(seq1.seq).upper()
+        seq2_str = str(seq2.seq).upper()
+        
+        for i in range(len(seq1_str) - k + 1):
+            kmer = seq1_str[i:i+k]
+            if 'N' not in kmer:
+                kmers1.add(kmer)
+                
+        for i in range(len(seq2_str) - k + 1):
+            kmer = seq2_str[i:i+k]
+            if 'N' not in kmer:
+                kmers2.add(kmer)
+                
+        if not kmers1 or not kmers2:
+            return 0.0
+            
+        intersection = len(kmers1 & kmers2)
+        union = len(kmers1 | kmers2)
+        
+        return intersection / union if union > 0 else 0.0
+        
+    def refine_with_graph_tool(self, cluster_seqs, cluster_id):
+        """Use original Refiner_for_Graph tool"""
+        # Similar to original implementation but called from enhanced method
+        cluster_fasta = os.path.join(self.temp_dir, f"cluster_{cluster_id}.fa")
+        output_fasta = os.path.join(self.temp_dir, f"refined_{cluster_id}.fa")
+        
+        SeqIO.write(cluster_seqs, cluster_fasta, "fasta")
+        
+        try:
+            distance_threshold = round(1 - self.identity_threshold, 2)
+            
+            cmd = [
+                "Refiner_for_Graph",
+                cluster_fasta,
+                output_fasta,
+                "--distance-threshold", str(distance_threshold),
+                "--entropy-threshold", "0.4",
+                "--min-conserved-block", "15",
+                "--max-cluster-size", str(self.max_cluster_size),
+                "-t", str(min(self.threads, 4))
+            ]
+            
+            if self.use_iupac:
+                cmd.append("--use-iupac")
+            if self.keep_variants:
+                cmd.append("--keep-variants")
+                
+            cmd.extend(["--details-dir", self.details_dir])
+            
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if process.returncode == 0 and os.path.exists(output_fasta):
+                refined_seqs = list(SeqIO.parse(output_fasta, "fasta"))
+                
+                consensus = None
+                variants = []
+                
+                for seq in refined_seqs:
+                    if "_variant_" in seq.id:
+                        variants.append(seq)
+                    else:
+                        consensus = seq
+                        
+                return {'consensus': consensus, 'variants': variants}
+                
+        except Exception as e:
+            logger.error(f"Refiner_for_Graph failed: {e}")
+            
+        finally:
+            if self.cleanup_temp:
+                for f in [cluster_fasta, output_fasta]:
+                    if os.path.exists(f):
+                        try:
+                            os.remove(f)
+                        except:
+                            pass
+                            
+        return None
+        
+    def run_clustering(self, input_file):
+        """Enhanced clustering with adaptive strategy"""
+        logger.info(f"Starting enhanced clustering...")
+        
+        # Read sequences for analysis
+        sequences = list(SeqIO.parse(input_file, "fasta"))
+        
+        # Select clustering method
+        if self.adaptive_clustering and self.cluster_method == "auto":
+            method = self.select_clustering_method(sequences)
+            
+            # Check if hierarchical clustering is needed
+            if self.diversity_metrics.get('diversity_score', 0) > 0.7:
+                logger.info("High diversity detected, using hierarchical clustering")
+                return self.hierarchical_clustering_strategy(sequences), input_file
+        else:
+            method = self.cluster_method
+            
+        # Run selected clustering method
+        if method == "minimap2":
+            return self.run_minimap2_clustering(input_file)
+        elif method == "mmseqs":
+            return self.run_mmseqs_clustering(input_file)
+        elif method == "vsearch":
+            return self.run_vsearch_clustering(input_file)
+        else:
+            return self.run_cdhit_clustering(input_file)
+            
+    def process_clusters(self, clusters, sequences_file):
+        """Enhanced cluster processing with new refinement methods"""
+        logger.info(f"Processing {len(clusters)} clusters with enhanced methods...")
+        
+        # Read all sequences
+        all_sequences = list(SeqIO.parse(sequences_file, "fasta"))
+        
+        # Handle duplicate IDs
+        seen_ids = set()
+        duplicate_ids = set()
+        for seq in all_sequences:
+            if seq.id in seen_ids:
+                duplicate_ids.add(seq.id)
+            seen_ids.add(seq.id)
+            
+        if duplicate_ids:
+            logger.warning(f"Found {len(duplicate_ids)} duplicate sequence IDs. Renaming them.")
+            for i, seq in enumerate(all_sequences):
+                if seq.id in duplicate_ids:
+                    original_id = seq.id
+                    seq.id = f"{seq.id}_unique_{i}"
+                    
+        sequences = {seq.id: seq for seq in all_sequences}
+        
+        # Process clusters
+        consensus_results = []
+        variant_results = []
+        subfamily_results = []
+        all_stats = []
+        
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            future_to_cluster = {}
+            
+            for i, cluster in enumerate(clusters):
+                cluster_seqs = [sequences[seq_id] for seq_id in cluster if seq_id in sequences]
+                
+                if not cluster_seqs:
+                    continue
+                    
+                future = executor.submit(self.refine_cluster_enhanced, cluster_seqs, i)
+                future_to_cluster[future] = i
+                
+            for future in tqdm(future_to_cluster, desc="Processing clusters"):
+                cluster_id = future_to_cluster[future]
+                try:
+                    result = future.result()
+                    if result:
+                        consensus = result['consensus']
+                        variants = result.get('variants', [])
+                        subfamilies = result.get('subfamilies', [])
+                        stats = result['statistics']
+                        
+                        if consensus:
+                            consensus_results.append(consensus)
+                            
+                        if variants:
+                            variant_results.extend(variants)
+                            
+                        if subfamilies:
+                            subfamily_results.extend(subfamilies)
+                            
+                        stats['cluster_id'] = cluster_id
+                        all_stats.append(stats)
+                        
+                except Exception as e:
+                    logger.error(f"Processing cluster {cluster_id} failed: {e}")
+                    
+        # Save enhanced statistics
+        self.save_enhanced_stats(all_stats)
+        
+        logger.info(f"Generated {len(consensus_results)} consensus sequences, "
+                   f"{len(variant_results)} variants, and {len(subfamily_results)} subfamily representatives")
+        
+        return consensus_results, variant_results, all_stats
+        
+    def save_enhanced_stats(self, stats):
+        """Save enhanced cluster statistics"""
+        stats_file = os.path.join(self.output_dir, "cluster_stats_enhanced.tsv")
+        
+        try:
+            df = pd.DataFrame(stats)
+            
+            if not df.empty:
+                # Add diversity metrics
+                df['global_diversity'] = self.diversity_metrics.get('diversity_score', np.nan)
+                
+                # Sort and save
+                df = df.sort_values(by='cluster_id')
+                df.to_csv(stats_file, sep='\t', index=False)
+                
+                # Generate summary statistics
+                summary_file = os.path.join(self.output_dir, "clustering_summary.txt")
+                with open(summary_file, 'w') as f:
+                    f.write("Enhanced Clustering Summary\n")
+                    f.write("=" * 50 + "\n\n")
+                    f.write(f"Total clusters: {len(stats)}\n")
+                    f.write(f"Mean cluster size: {df['size'].mean():.1f}\n")
+                    f.write(f"Mean identity: {df['mean_identity'].mean():.3f}\n")
+                    f.write(f"Mean quality: {df['mean_quality'].mean():.3f}\n")
+                    f.write(f"Clusters with subfamilies: {(df['n_subfamilies'] > 0).sum()}\n")
+                    f.write(f"Total subfamilies: {df['n_subfamilies'].sum()}\n")
+                    
+        except Exception as e:
+            logger.warning(f"Failed to save enhanced statistics: {e}")
+            
+    # Include all original methods that weren't modified
+    # (preprocess_sequences, run_minimap2_clustering, run_mmseqs_clustering, etc.)
+    # These remain the same as in the original script
+    
+    def preprocess_sequences(self, input_file):
+        """Preprocess sequences: length filtering, low complexity region filtering, etc."""
+        logger.info(f"Preprocessing sequences: {input_file}")
+        
+        min_length = 20  # Minimum length threshold
+        max_n_ratio = 0.1  # Maximum N ratio
+        
+        # Read all sequences
+        sequences = list(SeqIO.parse(input_file, "fasta"))
+        input_seq_count = len(sequences)
+        
+        # Filter sequences
+        filtered_sequences = []
+        for seq in sequences:
+            seq_len = len(seq.seq)
+            n_count = str(seq.seq).upper().count('N')
+            n_ratio = n_count / seq_len if seq_len > 0 else 1.0
+            
+            if seq_len >= min_length and n_ratio <= max_n_ratio:
+                filtered_sequences.append(seq)
+                
+        output_seq_count = len(filtered_sequences)
+        
+        # Write processed sequences
+        preprocessed_file = os.path.join(self.temp_dir, "preprocessed.fa")
+        SeqIO.write(filtered_sequences, preprocessed_file, "fasta")
+        
+        logger.info(f"Preprocessing complete: {input_seq_count} input sequences, {output_seq_count} sequences passed filtering")
+        return preprocessed_file
+        
+    def run_minimap2_clustering(self, input_file):
+        """Use minimap2 for fast clustering"""
+        paf_file = os.path.join(self.temp_dir, f"minimap2_{int(time.time())}.paf")
+        
+        cmd = [
+            "minimap2",
+            "-x", "asm20",
+            "-k", "15",
+            "-w", "10",
+            "-c",
+            "-p", "0.8",
+            "-N", "100",
+            "--cs",
+            "-D",
+            "-t", str(self.threads),
+            "-o", paf_file,
+            input_file, input_file
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info("minimap2 alignment complete")
+            
+            G = self.parse_minimap2_results(paf_file)
+            clusters = self.identify_clusters_from_graph(G)
+            
+            return clusters, input_file
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"minimap2 execution failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            raise
+            
+    def parse_minimap2_results(self, paf_file):
+        """Parse minimap2 PAF output, build sequence similarity graph"""
+        G = nx.Graph()
+        
+        min_identity = self.identity_threshold
+        min_coverage = self.coverage_threshold
+        
+        with open(paf_file) as f:
+            for line in f:
+                fields = line.strip().split("\t")
+                if len(fields) < 12:
+                    continue
+                    
+                query_name = fields[0]
+                target_name = fields[5]
+                
+                if query_name == target_name:
+                    continue
+                    
+                query_len = int(fields[1])
+                target_len = int(fields[6])
+                alignment_len = int(fields[10])
+                matches = int(fields[9])
+                
+                identity = matches / alignment_len if alignment_len > 0 else 0
+                q_coverage = alignment_len / query_len if query_len > 0 else 0
+                t_coverage = alignment_len / target_len if target_len > 0 else 0
+                coverage = min(q_coverage, t_coverage)
+                
+                if identity >= min_identity and coverage >= min_coverage:
+                    weight = identity * coverage
+                    
+                    edge_data = {
+                        'weight': weight,
+                        'identity': identity,
+                        'coverage': coverage,
+                        'alignment_length': alignment_len,
+                        'q_len': query_len,
+                        't_len': target_len
+                    }
+                    
+                    if G.has_edge(query_name, target_name):
+                        current_weight = G[query_name][target_name]['weight']
+                        if weight > current_weight:
+                            G[query_name][target_name].update(edge_data)
+                    else:
+                        G.add_edge(query_name, target_name, **edge_data)
+                        
+        for line in open(paf_file):
+            fields = line.strip().split("\t")
+            if len(fields) < 2:
+                continue
+            G.add_node(fields[0])
+            G.add_node(fields[5])
+            
+        logger.info(f"Graph built: {len(G.nodes())} nodes, {len(G.edges())} edges")
+        return G
+        
+    def identify_clusters_from_graph(self, G):
+        """Identify clusters from graph"""
+        basic_clusters = list(nx.connected_components(G))
+        logger.info(f"Basic clustering identified {len(basic_clusters)} clusters")
+        
+        final_clusters = []
+        for i, cluster in enumerate(basic_clusters):
+            if len(cluster) > self.max_cluster_size:
+                logger.info(f"Large cluster (ID {i+1}): {len(cluster)} sequences, splitting")
+                subclusters = self.split_large_cluster(G, cluster)
+                logger.info(f"Split into {len(subclusters)} subclusters")
+                final_clusters.extend(subclusters)
+            else:
+                final_clusters.append(cluster)
+                
+        logger.info(f"Final: {len(final_clusters)} clusters")
+        
+        self.record_cluster_stats(final_clusters)
+        
+        return final_clusters
+        
+    def split_large_cluster(self, G, cluster_nodes):
+        """Split large clusters using graph algorithms"""
+        subgraph = G.subgraph(cluster_nodes).copy()
+        
+        try:
+            from community import best_partition
+            partition = best_partition(subgraph)
+            
+            communities = defaultdict(set)
+            for node, community_id in partition.items():
+                communities[community_id].add(node)
+                
+            subclusters = list(communities.values())
+            
+            largest_subcluster = max(subclusters, key=len)
+            if len(largest_subcluster) < len(cluster_nodes) * 0.9:
+                logger.info(f"Community detection split: {len(subclusters)} subclusters")
+                return subclusters
+                
+        except ImportError:
+            pass
+            
+        try:
+            strict_subgraph = subgraph.copy()
+            edges = sorted(strict_subgraph.edges(data=True), key=lambda x: x[2]['weight'])
+            
+            for i in range(len(edges)):
+                u, v, data = edges[i]
+                strict_subgraph.remove_edge(u, v)
+                
+                components = list(nx.connected_components(strict_subgraph))
+                
+                largest_comp = max(components, key=len)
+                if len(largest_comp) <= self.max_cluster_size or len(components) >= len(cluster_nodes) // self.max_cluster_size:
+                    logger.info(f"Edge removal split: {len(components)} subclusters")
+                    return components
+                    
+            components = list(nx.connected_components(strict_subgraph))
+            if len(components) > 1:
+                return components
+                
+        except Exception as e:
+            logger.warning(f"Edge splitting failed: {e}")
+            
+        logger.warning(f"Simple division fallback")
+        nodes = list(cluster_nodes)
+        subclusters = []
+        
+        for i in range(0, len(nodes), self.max_cluster_size):
+            subclusters.append(set(nodes[i:i+self.max_cluster_size]))
+            
+        return subclusters
+        
+    def record_cluster_stats(self, clusters):
+        """Record clustering statistics"""
+        stats = {
+            'total_clusters': len(clusters),
+            'cluster_sizes': [len(c) for c in clusters],
+            'largest_cluster': max([len(c) for c in clusters]) if clusters else 0,
+            'smallest_cluster': min([len(c) for c in clusters]) if clusters else 0,
+            'avg_cluster_size': np.mean([len(c) for c in clusters]) if clusters else 0,
+            'singleton_clusters': sum(1 for c in clusters if len(c) == 1),
+        }
+        
+        self.cluster_stats.append(stats)
+        
+        logger.info(f"Stats: Total={stats['total_clusters']}, Largest={stats['largest_cluster']}, "
+                   f"Avg={stats['avg_cluster_size']:.1f}, Singletons={stats['singleton_clusters']}")
+    
+    def run_mmseqs_clustering(self, input_file):
+        """Use MMseqs2 for clustering"""
+        mmseqs_tmp = os.path.join(self.temp_dir, f"mmseqs_tmp_{int(time.time())}")
+        os.makedirs(mmseqs_tmp, exist_ok=True)
+        
+        prefix = os.path.join(self.temp_dir, f"mmseqs_{int(time.time())}")
+        db_file = f"{prefix}_DB"
+        cluster_file = f"{prefix}_cluster"
+        cluster_tsv = f"{prefix}_cluster.tsv"
+        
+        try:
+            cmd = ["mmseqs", "createdb", input_file, db_file]
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            cmd = [
+                "mmseqs", "cluster",
+                db_file, cluster_file, mmseqs_tmp,
+                "--min-seq-id", str(self.identity_threshold),
+                "-c", str(self.coverage_threshold),
+                "--cov-mode", "2",
+                "--cluster-mode", "0",
+                "--cluster-steps", "5",
+                "--max-seqs", "300",
+                "--threads", str(self.threads)
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            cmd = ["mmseqs", "createtsv", db_file, db_file, cluster_file, cluster_tsv]
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            clusters = self.parse_mmseqs_results(cluster_tsv)
+            self.record_cluster_stats(clusters)
+            
+            return clusters, input_file
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"MMseqs2 failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            logger.info("Falling back to minimap2")
+            return self.run_minimap2_clustering(input_file)
+        finally:
+            if self.cleanup_temp:
+                try:
+                    shutil.rmtree(mmseqs_tmp)
+                except:
+                    pass
+                    
+    def parse_mmseqs_results(self, cluster_tsv):
+        """Parse MMseqs2 results"""
+        cluster_dict = defaultdict(set)
+        
+        with open(cluster_tsv) as f:
+            for line in f:
+                fields = line.strip().split("\t")
+                if len(fields) >= 2:
+                    rep_id = fields[0]
+                    member_id = fields[1]
+                    cluster_dict[rep_id].add(member_id)
+                    cluster_dict[rep_id].add(rep_id)
+                    
+        basic_clusters = list(cluster_dict.values())
+        
+        final_clusters = []
+        for i, cluster in enumerate(basic_clusters):
+            if len(cluster) > self.max_cluster_size:
+                logger.info(f"Large cluster (ID {i+1}): {len(cluster)} sequences")
+                subclusters = self.split_large_cluster_cdhit(list(cluster), input_file)
+                logger.info(f"Split into {len(subclusters)} subclusters")
+                final_clusters.extend(subclusters)
+            else:
+                final_clusters.append(cluster)
+                
+        logger.info(f"MMseqs2: {len(final_clusters)} clusters")
+        return final_clusters
+        
+    def split_large_cluster_cdhit(self, seq_ids, input_file):
+        """Split large clusters using CD-HIT"""
+        sequences = {}
+        for record in SeqIO.parse(input_file, "fasta"):
+            if record.id in seq_ids:
+                sequences[record.id] = record
+                
+        if not sequences:
+            return [set(seq_ids)]
+            
+        temp_input = os.path.join(self.temp_dir, f"large_cluster_{int(time.time())}.fa")
+        temp_output = temp_input + ".out"
+        
+        with open(temp_input, "w") as f:
+            for record in sequences.values():
+                SeqIO.write(record, f, "fasta")
+                
+        stricter_identity = min(0.95, self.identity_threshold + 0.1)
+        stricter_coverage = max(0.5, self.coverage_threshold - 0.1)
+        
+        cmd = [
+            "cd-hit-est",
+            "-i", temp_input,
+            "-o", temp_output,
+            "-c", str(stricter_identity),
+            "-aS", str(stricter_coverage),
+            "-g", "1",
+            "-G", "0",
+            "-M", "8000",
+            "-T", str(min(self.threads, 4))
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            clusters_file = temp_output + ".clstr"
+            subclusters = self.parse_cdhit_clusters(clusters_file)
+            
+            if len(subclusters) <= 1:
+                logger.warning("CD-HIT failed to split, using simple division")
+                seq_list = list(seq_ids)
+                simple_subclusters = []
+                
+                for i in range(0, len(seq_list), self.max_cluster_size):
+                    simple_subclusters.append(set(seq_list[i:i+self.max_cluster_size]))
+                    
+                return simple_subclusters
+                
+            return subclusters
+            
+        except subprocess.CalledProcessError:
+            return [set(seq_ids)]
+        finally:
+            if self.cleanup_temp:
+                for f in [temp_input, temp_output, temp_output + ".clstr"]:
+                    if os.path.exists(f):
+                        try:
+                            os.remove(f)
+                        except:
+                            pass
+                            
+    def run_vsearch_clustering(self, input_file):
+        """Use vsearch for clustering"""
+        cluster_file = os.path.join(self.temp_dir, f"vsearch_{int(time.time())}.uc")
+        
+        try:
+            cmd = [
+                "vsearch",
+                "--cluster_fast", input_file,
+                "--id", str(self.identity_threshold),
+                "--strand", "both",
+                "--uc", cluster_file,
+                "--threads", str(self.threads),
+                "--qmask", "none",
+                "--minseqlength", "100",
+                "--query_cov", str(self.coverage_threshold),
+                "--target_cov", str(self.coverage_threshold)
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            clusters = self.parse_vsearch_results(cluster_file)
+            
+            final_clusters = []
+            for i, cluster in enumerate(clusters):
+                if len(cluster) > self.max_cluster_size:
+                    logger.info(f"Large cluster (ID {i+1}): {len(cluster)} sequences")
+                    subclusters = self.split_large_cluster_cdhit(list(cluster), input_file)
+                    final_clusters.extend(subclusters)
+                else:
+                    final_clusters.append(cluster)
+                    
+            self.record_cluster_stats(final_clusters)
+            
+            return final_clusters, input_file
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"vsearch failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            logger.info("Falling back to minimap2")
+            return self.run_minimap2_clustering(input_file)
+            
+    def parse_vsearch_results(self, cluster_file):
+        """Parse vsearch results"""
+        cluster_dict = defaultdict(set)
+        
+        with open(cluster_file) as f:
+            for line in f:
+                if line.startswith('C') or line.startswith('H'):
+                    fields = line.strip().split("\t")
+                    if len(fields) >= 9:
+                        cluster_id = fields[1]
+                        seq_id = fields[8]
+                        if seq_id == '*':
+                            seq_id = fields[9]
+                        cluster_dict[cluster_id].add(seq_id)
+                        
+        clusters = list(cluster_dict.values())
+        logger.info(f"vsearch: {len(clusters)} clusters")
+        return clusters
+        
+    def run_cdhit_clustering(self, input_file):
+        """Use CD-HIT for clustering"""
+        output_file = os.path.join(self.temp_dir, f"cdhit_{int(time.time())}.fa")
+        clusters_file = output_file + ".clstr"
+        
+        cmd = [
+            "cd-hit-est",
+            "-i", input_file,
+            "-o", output_file,
+            "-aS", str(self.coverage_threshold),
+            "-c", str(self.identity_threshold),
+            "-g", "1",
+            "-G", "0",
+            "-A", "80",
+            "-M", "10000",
+            "-T", str(self.threads)
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info("CD-HIT clustering complete")
+            
+            if os.path.exists(clusters_file):
+                clusters = self.parse_cdhit_clusters(clusters_file)
+                
+                final_clusters = []
+                for i, cluster in enumerate(clusters):
+                    if len(cluster) > self.max_cluster_size:
+                        logger.info(f"Large cluster (ID {i+1}): {len(cluster)} sequences")
+                        
+                        # Re-cluster with stricter parameters
+                        stricter_identity = min(0.95, self.identity_threshold + 0.1)
+                        
+                        temp_input = os.path.join(self.temp_dir, f"large_cluster_{i+1}.fa")
+                        temp_output = temp_input + ".refined"
+                        
+                        seqs_to_extract = {}
+                        for seq in SeqIO.parse(input_file, "fasta"):
+                            if seq.id in cluster:
+                                seqs_to_extract[seq.id] = seq
+                                
+                        with open(temp_input, "w") as f:
+                            SeqIO.write(seqs_to_extract.values(), f, "fasta")
+                            
+                        stricter_cmd = [
+                            "cd-hit-est",
+                            "-i", temp_input,
+                            "-o", temp_output,
+                            "-c", str(stricter_identity),
+                            "-aS", str(self.coverage_threshold),
+                            "-g", "1",
+                            "-G", "0",
+                            "-A", "80",
+                            "-M", "10000",
+                            "-T", str(min(self.threads, 4))
+                        ]
+                        
+                        try:
+                            subprocess.run(stricter_cmd, check=True, capture_output=True)
+                            strict_clusters = self.parse_cdhit_clusters(temp_output + ".clstr")
+                            
+                            if len(strict_clusters) > 1:
+                                logger.info(f"Split into {len(strict_clusters)} subclusters")
+                                final_clusters.extend(strict_clusters)
+                            else:
+                                logger.warning(f"Cannot split, using simple division")
+                                seq_list = list(cluster)
+                                for j in range(0, len(seq_list), self.max_cluster_size):
+                                    final_clusters.append(set(seq_list[j:j+self.max_cluster_size]))
+                        except:
+                            logger.warning(f"Splitting failed, using simple division")
+                            seq_list = list(cluster)
+                            for j in range(0, len(seq_list), self.max_cluster_size):
+                                final_clusters.append(set(seq_list[j:j+self.max_cluster_size]))
+                                
+                        if self.cleanup_temp:
+                            for f in [temp_input, temp_output, temp_output + ".clstr"]:
+                                if os.path.exists(f):
+                                    try:
+                                        os.remove(f)
+                                    except:
+                                        pass
+                    else:
+                        final_clusters.append(cluster)
+                        
+                self.record_cluster_stats(final_clusters)
+                
+                logger.info(f"CD-HIT: {len(final_clusters)} clusters")
+                return final_clusters, output_file
+            else:
+                logger.warning(f"Cluster file {clusters_file} not found")
+                return [], input_file
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"CD-HIT failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            return [], input_file
+            
+    def parse_cdhit_clusters(self, clusters_file):
+        """Parse CD-HIT cluster file"""
+        cluster_dict = defaultdict(set)
+        current_cluster = None
+        
+        with open(clusters_file) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(">Cluster"):
+                    current_cluster = line.split()[1]
+                elif line and current_cluster is not None:
+                    parts = line.split(">")
+                    if len(parts) > 1:
+                        seq_id = parts[1].split("...")[0]
+                        cluster_dict[current_cluster].add(seq_id)
+                        
+        return list(cluster_dict.values())
+            
+    def run_iteration(self, input_file, iteration):
+        """Run a single clustering iteration with enhanced methods"""
+        logger.info(f"Starting enhanced iteration {iteration}...")
+        
+        if self.store_iterations:
+            iter_dir = os.path.join(self.iterations_dir, f"iteration_{iteration}")
+            os.makedirs(iter_dir, exist_ok=True)
+        else:
+            iter_dir = self.temp_dir
+            
+        # Preprocess sequences
+        if iteration == 1:
+            preprocessed_file = self.preprocess_sequences(input_file)
+        else:
+            preprocessed_file = input_file
+            
+        # Run enhanced clustering
+        if iteration > 1:
+            # Adjust thresholds for subsequent iterations
+            adjusted_identity = max(0.6, self.identity_threshold - 0.1 * (iteration - 1))
+            adjusted_coverage = max(0.5, self.coverage_threshold - 0.1 * (iteration - 1))
+            
+            logger.info(f"Iteration {iteration} thresholds: identity={adjusted_identity:.2f}, coverage={adjusted_coverage:.2f}")
+            
+            original_identity = self.identity_threshold
+            original_coverage = self.coverage_threshold
+            
+            self.identity_threshold = adjusted_identity
+            self.coverage_threshold = adjusted_coverage
+            
+            clusters, seq_file = self.run_clustering(preprocessed_file)
+            
+            self.identity_threshold = original_identity
+            self.coverage_threshold = original_coverage
+        else:
+            clusters, seq_file = self.run_clustering(preprocessed_file)
+            
+        # Process clusters with enhanced methods
+        consensus_seqs, variant_seqs, stats = self.process_clusters(clusters, seq_file)
+        
+        # Save iteration results
+        if self.store_iterations:
+            iter_consensus_file = os.path.join(iter_dir, "consensus.fa")
+            iter_variants_file = os.path.join(iter_dir, "variants.fa")
+            iter_all_file = os.path.join(iter_dir, "all_sequences.fa")
+            
+            SeqIO.write(consensus_seqs, iter_consensus_file, "fasta")
+            
+            if variant_seqs:
+                SeqIO.write(variant_seqs, iter_variants_file, "fasta")
+                
+            SeqIO.write(consensus_seqs + variant_seqs, iter_all_file, "fasta")
+            
+            # Enhanced iteration report
+            with open(os.path.join(iter_dir, "report.txt"), "w") as f:
+                f.write(f"Enhanced Iteration {iteration} Report\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"Input sequences: {len(list(SeqIO.parse(preprocessed_file, 'fasta')))}\n")
+                f.write(f"Clusters identified: {len(clusters)}\n")
+                f.write(f"Consensus sequences: {len(consensus_seqs)}\n")
+                f.write(f"Variant sequences: {len(variant_seqs)}\n")
+                f.write(f"Diversity score: {self.diversity_metrics.get('diversity_score', 'N/A')}\n")
+                
+                if stats:
+                    mean_quality = np.mean([s.get('mean_quality', 0) for s in stats])
+                    subfamilies = sum(s.get('n_subfamilies', 0) for s in stats)
+                    f.write(f"Mean cluster quality: {mean_quality:.3f}\n")
+                    f.write(f"Total subfamilies detected: {subfamilies}\n")
+                    
+        # Prepare output for next iteration
+        output_file = os.path.join(self.temp_dir, f"iteration_{iteration}_output.fa")
+        
+        if self.keep_variants:
+            SeqIO.write(consensus_seqs + variant_seqs, output_file, "fasta")
+            return output_file, len(consensus_seqs) + len(variant_seqs)
+        else:
+            SeqIO.write(consensus_seqs, output_file, "fasta")
+            return output_file, len(consensus_seqs)
+            
+    def run(self):
+        """Run enhanced clustering pipeline"""
+        logger.info("Starting Enhanced TE Clustering Pipeline...")
+        
+        try:
+            if not self.check_tools():
+                return None
+                
+            # Iterative optimization
+            current_input = self.input_fasta
+            prev_seq_count = float('inf')
+            current_iteration = 1
+            
+            while current_iteration <= self.max_iterations:
+                new_input, seq_count = self.run_iteration(current_input, current_iteration)
+                
+                if prev_seq_count > 0:
+                    reduction_rate = (prev_seq_count - seq_count) / prev_seq_count
+                    logger.info(f"Iteration {current_iteration}: {prev_seq_count} → {seq_count} sequences ({reduction_rate:.2%} reduction)")
+                    
+                    if reduction_rate < self.convergence_threshold:
+                        logger.info(f"Converged! Reduction rate ({reduction_rate:.2%}) < threshold ({self.convergence_threshold:.2%})")
+                        break
+                else:
+                    logger.info(f"Iteration {current_iteration}: {seq_count} sequences")
+                    
+                current_input = new_input
+                prev_seq_count = seq_count
+                current_iteration += 1
+                
+                if current_iteration > self.max_iterations:
+                    logger.info(f"Maximum iterations ({self.max_iterations}) reached")
+                    break
+                    
+            # Generate final output
+            final_file = os.path.join(self.output_dir, "consensi.fa")
+            final_variants_file = os.path.join(self.output_dir, "variants.fa")
+            final_subfamilies_file = os.path.join(self.output_dir, "subfamilies.fa")
+            final_all_file = os.path.join(self.output_dir, "all_sequences.fa")
+            
+            # Read and categorize final results
+            final_seqs = list(SeqIO.parse(current_input, "fasta"))
+            
+            consensus_seqs = []
+            variant_seqs = []
+            subfamily_seqs = []
+            
+            for seq in final_seqs:
+                if "_subfamily_" in seq.id:
+                    subfamily_seqs.append(seq)
+                elif "_variant_" in seq.id:
+                    variant_seqs.append(seq)
+                else:
+                    consensus_seqs.append(seq)
+                    
+            # Save results
+            SeqIO.write(consensus_seqs, final_file, "fasta")
+            
+            if variant_seqs:
+                SeqIO.write(variant_seqs, final_variants_file, "fasta")
+                
+            if subfamily_seqs:
+                SeqIO.write(subfamily_seqs, final_subfamilies_file, "fasta")
+                
+            SeqIO.write(final_seqs, final_all_file, "fasta")
+            
+            # Generate enhanced final report
+            self.generate_enhanced_final_report(
+                input_file=self.input_fasta,
+                consensus_file=final_file,
+                variants_file=final_variants_file,
+                subfamilies_file=final_subfamilies_file,
+                iterations=current_iteration - 1
+            )
+            
+            logger.info(f"Processing complete! Results saved to: {final_file}")
+            logger.info(f"Summary: {len(consensus_seqs)} consensus, {len(variant_seqs)} variants, {len(subfamily_seqs)} subfamilies")
+            
+            return final_file
+            
+        except Exception as e:
+            logger.error(f"Error during processing: {e}")
+            import traceback
+            logger.error(f"Details: {traceback.format_exc()}")
+            return None
+        finally:
+            if self.cleanup_temp:
+                try:
+                    logger.info("Cleaning up temporary files...")
+                    shutil.rmtree(self.temp_dir)
+                except Exception as e:
+                    logger.warning(f"Failed to clean up: {e}")
+                    
+    def generate_enhanced_final_report(self, input_file, consensus_file, variants_file, subfamilies_file, iterations):
+        """Generate enhanced final report with additional metrics"""
+        report_file = os.path.join(self.output_dir, "final_report_enhanced.txt")
+        
+        try:
+            # Calculate statistics
+            input_seqs = list(SeqIO.parse(input_file, "fasta"))
+            consensus_seqs = list(SeqIO.parse(consensus_file, "fasta"))
+            
+            variant_count = 0
+            if os.path.exists(variants_file):
+                variant_seqs = list(SeqIO.parse(variants_file, "fasta"))
+                variant_count = len(variant_seqs)
+                
+            subfamily_count = 0
+            if os.path.exists(subfamilies_file):
+                subfamily_seqs = list(SeqIO.parse(subfamilies_file, "fasta"))
+                subfamily_count = len(subfamily_seqs)
+                
+            # Generate report
+            report = []
+            report.append("# Enhanced TE Clustering Pipeline - Final Report")
+            report.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            report.append("\n## Summary")
+            report.append(f"Input sequences: {len(input_seqs)}")
+            report.append(f"Consensus sequences: {len(consensus_seqs)}")
+            report.append(f"Variant sequences: {variant_count}")
+            report.append(f"Subfamily representatives: {subfamily_count}")
+            report.append(f"Iterations completed: {iterations}")
+            report.append(f"Reduction: {(len(input_seqs) - len(consensus_seqs)) / len(input_seqs):.2%}")
+            
+            report.append("\n## Parameters Used")
+            report.append(f"Clustering method: {self.cluster_method}")
+            report.append(f"Identity threshold: {self.identity_threshold}")
+            report.append(f"Coverage threshold: {self.coverage_threshold}")
+            report.append(f"Max cluster size: {self.max_cluster_size}")
+            report.append(f"Adaptive clustering: {self.adaptive_clustering}")
+            report.append(f"Subfamily detection: {self.subfamily_detection}")
+            report.append(f"Quality weighting: {self.quality_weighting}")
+            
+            if self.diversity_metrics:
+                report.append("\n## Sequence Diversity Analysis")
+                report.append(f"Diversity score: {self.diversity_metrics.get('diversity_score', 'N/A'):.3f}")
+                report.append(f"Mean similarity: {self.diversity_metrics.get('mean_similarity', 'N/A'):.3f}")
+                report.append(f"Length variation (CV): {self.diversity_metrics.get('length_cv', 'N/A'):.3f}")
+                
+            report.append("\n## Iteration Summary")
+            for i, stats in enumerate(self.cluster_stats, 1):
+                report.append(f"\n### Iteration {i}")
+                report.append(f"Clusters: {stats['total_clusters']}")
+                report.append(f"Largest cluster: {stats['largest_cluster']}")
+                report.append(f"Average size: {stats['avg_cluster_size']:.1f}")
+                report.append(f"Singletons: {stats['singleton_clusters']}")
+                
+            # Save report
+            with open(report_file, "w") as f:
+                f.write("\n".join(report))
+                
+            logger.info(f"Enhanced report saved to: {report_file}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to generate enhanced report: {e}")
+
+def main():
+    """Command line interface"""
+    parser = argparse.ArgumentParser(
+        description="Enhanced TE Clustering Pipeline - Intelligent clustering and consensus building"
+    )
+    
+    parser.add_argument("input_fasta", help="Input FASTA file")
+    parser.add_argument("output_dir", help="Output directory")
+    
+    parser.add_argument("--method", choices=["auto", "minimap2", "mmseqs", "vsearch", "cdhit"], 
+                       default="auto", help="Clustering method (default: auto - adaptive selection)")
+    parser.add_argument("--identity", type=float, default=0.8,
+                       help="Sequence identity threshold (0-1, default: 0.8)")
+    parser.add_argument("--coverage", type=float, default=0.8,
+                       help="Sequence coverage threshold (0-1, default: 0.8)")
+    parser.add_argument("--threads", type=int, default=1,
+                       help="Number of threads (default: 1)")
+    parser.add_argument("--keep-temp", action="store_false", dest="cleanup_temp",
+                       help="Keep temporary files")
+    parser.add_argument("--max-iterations", type=int, default=3,
+                        help="Maximum iterations (default: 3)")
+    parser.add_argument("--convergence", type=float, default=0.05,
+                        help="Convergence threshold (default: 0.05)")
+    parser.add_argument("--max-cluster-size", type=int, default=50,
+                        help="Maximum cluster size (default: 50)")
+    
+    # Enhanced features
+    parser.add_argument("--no-adaptive", action="store_false", dest="adaptive_clustering",
+                        help="Disable adaptive clustering strategy")
+    parser.add_argument("--no-subfamily", action="store_false", dest="subfamily_detection",
+                        help="Disable subfamily detection")
+    parser.add_argument("--no-quality-weight", action="store_false", dest="quality_weighting",
+                        help="Disable quality-based weighting")
+    
+    # Original features
+    parser.add_argument("--use-iupac", action="store_true", default=True,
+                        help="Use IUPAC codes (default: enabled)")
+    parser.add_argument("--no-iupac", action="store_false", dest="use_iupac",
+                        help="Don't use IUPAC codes")
+    parser.add_argument("--keep-variants", action="store_true", default=True,
+                        help="Keep variants (default: enabled)")
+    parser.add_argument("--no-variants", action="store_false", dest="keep_variants",
+                        help="Don't keep variants")
+    parser.add_argument("--store-iterations", action="store_true", default=True,
+                        help="Save iteration results (default: enabled)")
+    parser.add_argument("--no-store-iterations", action="store_false", dest="store_iterations",
+                        help="Don't save iteration results")
+    
+    args = parser.parse_args()
+    
+    pipeline = EnhancedTEClusteringPipeline(
+        args.input_fasta,
+        args.output_dir,
+        cluster_method=args.method,
+        threads=args.threads,
+        identity_threshold=args.identity,
+        coverage_threshold=args.coverage,
+        cleanup_temp=args.cleanup_temp,
+        max_iterations=args.max_iterations,
+        convergence_threshold=args.convergence,
+        max_cluster_size=args.max_cluster_size,
+        keep_variants=args.keep_variants,
+        store_iterations=args.store_iterations,
+        use_iupac=args.use_iupac,
+        adaptive_clustering=args.adaptive_clustering,
+        subfamily_detection=args.subfamily_detection,
+        quality_weighting=args.quality_weighting
+    )
+    
+    pipeline.run()
+    
+if __name__ == "__main__":
+    main()

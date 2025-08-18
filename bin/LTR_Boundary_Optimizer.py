@@ -65,7 +65,7 @@ class LTREnhancedOptimizer:
         Initialize the LTR enhanced optimizer.
         
         Args:
-            consensus_file: Path to consensus sequences from Refiner_for_LTR
+            consensus_file: Path to consensus sequences from TE_Merge
             genome_file: Path to reference genome
             output_dir: Directory for output files
             threads: Number of CPU threads to use
@@ -3056,7 +3056,7 @@ def main():
                    "and removing non-TE regions. Optimized for GB-scale genomes."
     )
     
-    parser.add_argument("consensus_file", help="Path to consensus sequences from Refiner_for_LTR")
+    parser.add_argument("consensus_file", help="Path to consensus sequences from TE_Merge")
     parser.add_argument("genome_file", help="Path to reference genome")
     parser.add_argument("output_dir", help="Directory for output files")
     

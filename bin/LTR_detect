@@ -1,0 +1,173 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Cwd qw(abs_path getcwd);
+use File::Basename qw(dirname basename);
+use File::Path qw(make_path);
+use List::Util qw(min);
+
+# Usage check
+my $fasta_file = abs_path($ARGV[0]);
+unless ($fasta_file && -e $fasta_file) {
+    die "Usage: $0 <fasta_file> <threads> <out_dir>\n";
+}
+
+my $threads = $ARGV[1] || 1;
+my $out_dir = abs_path($ARGV[2]);
+make_path($out_dir) unless -d $out_dir;
+chdir $out_dir or die "Cannot change to directory $out_dir: $!\n";
+
+# Check genome size and sample if necessary
+my $input_fasta = $fasta_file;
+my $genome_size = -s $fasta_file;
+my $size_threshold = 2 * 1024 * 1024 * 1024; # 2GB
+
+if ($genome_size > $size_threshold) {
+    print "Genome size ($genome_size bytes) exceeds 2GB threshold. Sampling 2GB data...\n";
+    $input_fasta = sample_genome($fasta_file, $out_dir);
+    print "Sampling completed. Using sampled file: $input_fasta\n";
+} else {
+    print "Genome size ($genome_size bytes) is within 2GB threshold. Using original genome.\n";
+}
+
+# Create inpactor2 directory
+make_path("Inpactor2") unless -d "Inpactor2";
+chdir "Inpactor2" or die "Cannot change to Inpactor2 directory: $!\n";
+
+# Run Inpactor2
+print "Running Inpactor2 on the entire genome...\n";
+my $current_dir = getcwd();
+
+# Execute Inpactor2
+if (-e "$current_dir/Inpactor2_library.fasta") {
+	print "Inpactor2 was done!\n";
+}else{
+	my $inpactor2_cmd = "conda run -n Inpactor2 Inpactor2.py -f $input_fasta -o $current_dir -t $threads -a no -n 100 -c no -g no >inpactor2.log  2>> inpactor2.log";
+	print "Executing: $inpactor2_cmd\n";
+	system($inpactor2_cmd) == 0 or die "Failed to execute Inpactor2: $!\n";
+}
+
+my $refine_cmd = "TE_Merge Inpactor2_library.fasta ./ --threads $threads";
+print "Executing: $refine_cmd\n";
+system($refine_cmd) == 0 or die "Failed to execute refinement: $!\n";
+
+# Check output file
+my $inpactor2_output = "$current_dir/all_sequences.fa";
+unless (-e $inpactor2_output) {
+    die "Inpactor2 output file not found: $inpactor2_output\n";
+}
+
+# Copy output file to expected location for downstream processing
+system("sed 's:N::g' $inpactor2_output > $current_dir/LTR.fa") == 0
+    or die "Failed to copy Inpactor2 output file\n";
+
+# Run filtering step to maintain compatibility with original workflow
+if (! -e "$current_dir/LTR.fa") {
+    die "LTR.fa file not found\n";
+}
+
+# Run LTR_Boundary_Optimizer
+my $optimizer_cmd = "LTR_Boundary_Optimizer.py LTR.fa ../genome/genome.fa output_dir --threads $threads --advanced-tsd --weighted-evidence --kmer-boundary --orientation-aware --low-complexity-filter --clustering --dynamic-threshold --orf-analysis";
+system($optimizer_cmd) == 0 or die "Failed to execute: $optimizer_cmd\n";
+
+# Copy final results
+system("cp output_dir/optimized_consensus.fa consensi.fa") == 0
+    or die "Failed to copy optimized consensus\n";
+
+print "LTR identification and refinement completed successfully\n";
+
+# Subroutine to sample genome for large genomes
+sub sample_genome {
+    my ($fasta_file, $out_dir) = @_;
+    my $sampled_file = "$out_dir/sampled_genome.fa";
+    
+    # Parameters for sampling
+    my $segment_size = 1024 * 1024; # 1MB per segment
+    my $total_target = 2 * 1024 * 1024 * 1024; # 2GB total
+    my $num_segments = $total_target / $segment_size; # 2000 segments
+    
+    print "Creating sampled genome: $num_segments segments of 1MB each\n";
+    
+    # Read sequence information first
+    my @sequences;
+    my $current_seq = "";
+    my $current_header = "";
+    
+    open(my $fh, '<', $fasta_file) or die "Cannot open $fasta_file: $!\n";
+    while (my $line = <$fh>) {
+        chomp $line;
+        if ($line =~ /^>/) {
+            if ($current_header && $current_seq) {
+                push @sequences, {header => $current_header, seq => $current_seq};
+            }
+            $current_header = $line;
+            $current_seq = "";
+        } else {
+            $current_seq .= $line;
+        }
+    }
+    # Don't forget the last sequence
+    if ($current_header && $current_seq) {
+        push @sequences, {header => $current_header, seq => $current_seq};
+    }
+    close($fh);
+    
+    # Calculate total sequence length
+    my $total_length = 0;
+    for my $seq (@sequences) {
+        $total_length += length($seq->{seq});
+    }
+    
+    print "Total genome length: $total_length bp\n";
+    
+    # Open output file
+    open(my $out_fh, '>', $sampled_file) or die "Cannot create $sampled_file: $!\n";
+    
+    my $segments_written = 0;
+    my $attempts = 0;
+    my $max_attempts = $num_segments * 10; # Prevent infinite loop
+    
+    while ($segments_written < $num_segments && $attempts < $max_attempts) {
+        $attempts++;
+        
+        # Randomly select a sequence
+        my $seq_idx = int(rand(scalar @sequences));
+        my $selected_seq = $sequences[$seq_idx];
+        my $seq_len = length($selected_seq->{seq});
+        
+        # Skip if sequence is too short
+        next if $seq_len < $segment_size;
+        
+        # Randomly select a starting position
+        my $max_start = $seq_len - $segment_size;
+        my $start_pos = int(rand($max_start));
+        
+        # Extract segment
+        my $segment = substr($selected_seq->{seq}, $start_pos, $segment_size);
+        
+        # Skip segments with too many Ns
+        my $n_count = ($segment =~ tr/Nn//);
+        next if $n_count > $segment_size * 0.5; # Skip if >50% Ns
+        
+        # Write segment
+        print $out_fh ">sampled_segment_${segments_written}_from_seq${seq_idx}_pos${start_pos}\n";
+        # Split sequence into lines of 80 characters
+        for (my $i = 0; $i < length($segment); $i += 80) {
+            print $out_fh substr($segment, $i, 80) . "\n";
+        }
+        
+        $segments_written++;
+        
+        if ($segments_written % 100 == 0) {
+            print "Sampled $segments_written / $num_segments segments\n";
+        }
+    }
+    
+    close($out_fh);
+    
+    if ($segments_written < $num_segments) {
+        print "Warning: Only sampled $segments_written segments (target: $num_segments)\n";
+    }
+    
+    return $sampled_file;
+}

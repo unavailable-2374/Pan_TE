@@ -139,27 +139,63 @@ sub process_single_family {
         my $seqName = $elementRef->{seqName};
         my $seqDesc = $batchDB->getDescription($seqName);
         
-        my ($genomicSeqID, $genomicStartPos, $genomicEndPos) = 
-            $seqDesc =~ /(\S+):(\d+)-(\d+)/ or next;
+        # Debug: print what we got
+        if ($DEBUG) {
+            print STDERR "DEBUG: seqName=$seqName, seqDesc=$seqDesc\n";
+        }
+        
+        # Parse both old format (chr:start-end) and new format (chr_start_end)
+        my ($genomicSeqID, $genomicStartPos, $genomicEndPos);
+        my $is_new_format = 0;
+        
+        # The description might include "gi|" prefix, remove it if present
+        $seqDesc =~ s/^gi\|//;
+        
+        if ($seqDesc =~ /(\S+):(\d+)-(\d+)/) {
+            # Old format: chr:start-end (0-based coordinates)
+            ($genomicSeqID, $genomicStartPos, $genomicEndPos) = ($1, $2, $3);
+        } elsif ($seqDesc =~ /^(\w+)_(\d+)_(\d+)/) {
+            # New format: chr_start_end (1-based genomic coordinates)
+            ($genomicSeqID, $genomicStartPos, $genomicEndPos) = ($1, $2, $3);
+            $is_new_format = 1;
+        } else {
+            print STDERR "WARNING: Cannot parse description for $seqName: $seqDesc\n" if $DEBUG;
+            next;  # Skip if format doesn't match
+        }
 
-        my $startOffset = $elementRef->{start};
-        my $endOffset = $elementRef->{end};
+        my $startOffset = $elementRef->{start};  # 1-based offset within the sequence
+        my $endOffset = $elementRef->{end};      # 1-based offset within the sequence
         
         next if $endOffset > $batchDB->getSeqLength($seqName);
         
         my $sequence = $batchDB->getSubstr($seqName, $startOffset, $endOffset - $startOffset);
+        
+        # Calculate actual genomic coordinates
+        my ($actualStart, $actualEnd);
+        if ($is_new_format) {
+            # For new format, genomicStartPos is already 1-based genomic coordinate
+            # startOffset is 1-based offset, so actual position is: genomicStartPos + startOffset - 1
+            $actualStart = $genomicStartPos + $startOffset - 1;
+            $actualEnd = $genomicStartPos + $endOffset - 1;
+        } else {
+            # For old format, keep original logic
+            $actualStart = $startOffset + $genomicStartPos;
+            $actualEnd = $endOffset + $genomicStartPos;
+        }
+        
         if ($elementRef->{orient} ne "1") {
             $sequence = reverse($sequence);
             $sequence =~ tr/ACGTYRMKHBVD/TGCARYKMDVBH/;
-            my $tmp = $startOffset;
-            $startOffset = $endOffset-1;
-            $endOffset = $tmp-1;
+            # Swap coordinates for reverse strand
+            my $tmp = $actualStart;
+            $actualStart = $actualEnd;
+            $actualEnd = $tmp;
         }
 
         $elementRef->{sequence} = $sequence;
         print $fh_fam ">gi|$giID $genomicSeqID:" 
-            . ($startOffset + $genomicStartPos) . "-"
-            . ($endOffset + $genomicStartPos)
+            . $actualStart . "-"
+            . $actualEnd
             . " element-" 
             . $elementRef->{elementID} . "\n$sequence\n";
         $giID++;
@@ -200,10 +236,17 @@ sub process_refined_families {
 
         open my $fh_in, '<', $refiner_cons or next;
         my ($cons, $maSize) = ('', 1);
+        my $in_sequence = 0;
         while (<$fh_in>) {
-            if (/Final Multiple Alignment Size = (\d+)/) {
+            # Check for consensus copy number in the description line
+            if (/^>.*consensus from (\d+) copies/) {
                 $maSize = $1;
-            } else {
+                $in_sequence = 1;
+            } elsif (/^>/) {
+                # Another sequence header, keep default maSize
+                $in_sequence = 1;
+            } elsif ($in_sequence) {
+                # Sequence data
                 $cons .= $_;
             }
         }

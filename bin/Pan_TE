@@ -147,7 +147,7 @@ class PanTEPipeline:
         directories = [
             self.output_dir,
             os.path.join(self.output_dir, 'genome'),
-            os.path.join(self.output_dir, 'look4ltrs'),
+            os.path.join(self.output_dir, 'Inpactor2'),
             os.path.join(self.output_dir, 'RepeatScout'),
             os.path.join(self.output_dir, 'RECON'),
             os.path.join(self.output_dir, 'Combine')
@@ -280,7 +280,7 @@ class PanTEPipeline:
             return
             
         logger.info(f"Starting LTR processing with {self.ltr_threads} threads")
-        ltr_dir = os.path.join(self.output_dir, 'look4ltrs')
+        ltr_dir = os.path.join(self.output_dir, 'Inpactor2')
         os.makedirs(ltr_dir, exist_ok=True)
         
         # Use the processed genome file from genome directory
@@ -292,8 +292,8 @@ class PanTEPipeline:
         if not os.path.exists(f"{genome_file}.fai"):
             self.run_cmd(f"samtools faidx {genome_file}")
         
-        # Run para_look4ltrs with the processed genome file
-        cmd = f"para_look4ltrs {self.processed_genome} {self.ltr_threads} {self.output_dir}"
+        # Run LTR_detect with the processed genome file
+        cmd = f"LTR_detect {self.processed_genome} {self.ltr_threads} {self.output_dir}"
         self.run_cmd(cmd, ltr_dir)
         
         self.create_checkpoint('ltr')
@@ -329,29 +329,24 @@ class PanTEPipeline:
         logger.info("Starting RECON processing")
         recon_dir = os.path.join(self.output_dir, 'RECON')
         
-        self.run_cmd(f"cat ../RepeatScout/consensi.fa ../look4ltrs/consensi.fa > raw.fa", recon_dir)
+        self.run_cmd(f"cat ../RepeatScout/consensi.fa ../Inpactor2/consensi.fa > raw.fa", recon_dir)
         
-        genome_size = os.path.getsize(self.processed_genome)
-
-        if genome_size > 10_000_000_000:  # HUGE_GENOME_SIZE
-            sample_percent = 30
-            batch_size = 200000
-        elif genome_size > 5_000_000_000:  # BIG_GENOME_SIZE
-            sample_percent = 60
-            batch_size = 200000
-        elif genome_size > 1_000_000_000:  # MEDIUM_GENOME_SIZE
-            sample_percent = 70
-            batch_size = 100000
-        elif genome_size > 500_000_000:  # SMALL_GENOME_SIZE
-            sample_percent = 80
-            batch_size = 80000
-        else:  # TINY_GENOME_SIZE
-            sample_percent = 90
-            batch_size = 40000
+        # Always use Refiner-generated masked genome (simplifies workflow)  
+        masked_genome = os.path.join(self.output_dir, 'RepeatScout', 'refiner_output', 'genome_final_masked.fa')
         
-        sample_size = min(int(genome_size * sample_percent / 100), 5_000_000_000)
+        if not os.path.exists(masked_genome):
+            raise FileNotFoundError(f"Expected masked genome not found: {masked_genome}")
+            
+        logger.info(f"Using Refiner-generated masked genome: {masked_genome}")
         
-        cmd = f"run_RECON 1 {self.threads} {self.processed_genome} {sample_size} {batch_size}"
+        # Use original genome size for batch size calculation
+        original_genome_size = os.path.getsize(self.processed_genome)
+        
+        # Use masked genome size as sample size (full masked genome)
+        sample_size = os.path.getsize(masked_genome)
+        logger.info(f"Using full masked genome (size: {sample_size:,} bp) for RECON")
+        
+        cmd = f"run_RECON 1 {self.threads} {masked_genome} {sample_size}"
         self.run_cmd(cmd, recon_dir)
         
         self.create_checkpoint('recon')
@@ -369,11 +364,50 @@ class PanTEPipeline:
         logger.info("Starting results combination and classification")
         combine_dir = os.path.join(self.output_dir, 'Combine')
         
-        # Combine results
-        self.run_cmd("cat ../RECON/round-1/lib.fa ../RECON/round-1/consensi.fa > raw_TEs.fa",
+        # Step 1: Combine raw results from all three sources
+        self.run_cmd("cat ../Inpactor2/consensi.fa ../RepeatScout/consensi.fa ../RECON/round-1/consensi.fa > raw_TEs_combined.fa",
                     combine_dir)
         
-        # Run classifier
+        # Step 2: TE-optimized deduplication using CD-HIT-EST
+        logger.info("Removing redundant TEs with TE-optimized parameters...")
+        
+        # CD-HIT parameters optimized for TE characteristics:
+        # -c 0.8: 80% identity - balance between removing redundancy and preserving TE diversity
+        # -aS 0.8: 80% shorter sequence coverage - important for TE fragments and deletions
+        # -aL 0.8: 80% longer sequence coverage - handles partial TEs
+        # -G 0: local alignment - better for TEs with divergent ends/TIRs
+        # -n 8: word size 8 for 80% identity (CD-HIT recommendation)
+        # -r 1: compare both strands - TEs can insert in both orientations
+        # -mask NX: mask low-complexity regions - common in TEs
+        # -M 0: no memory limit
+        # -d 0: full sequence names in output
+        
+        self.run_cmd(
+            f"cd-hit-est "
+            f"-i raw_TEs_combined.fa "
+            f"-o raw_TEs.fa "
+            f"-c 0.8 "           # 80% sequence identity threshold
+            f"-aS 0.8 "          # 80% coverage of shorter sequence
+            f"-aL 0.8 "          # 80% coverage of longer sequence  
+            f"-G 0 "             # local alignment mode
+            f"-n 8 "             # word size for 80% identity
+            f"-r 1 "             # compare both strands
+            f"-mask NX "         # mask low-complexity regions
+            f"-M 0 "             # no memory limit
+            f"-T {self.threads} " # use all available threads
+            f"-d 0",             # keep full sequence names
+            combine_dir
+        )
+        
+        # Log deduplication results
+        raw_count = int(subprocess.check_output(f"grep -c '^>' raw_TEs_combined.fa", 
+                                               shell=True, cwd=combine_dir).decode().strip())
+        final_count = int(subprocess.check_output(f"grep -c '^>' raw_TEs.fa", 
+                                                 shell=True, cwd=combine_dir).decode().strip())
+        logger.info(f"Deduplication: {raw_count} -> {final_count} sequences "
+                   f"({raw_count - final_count} duplicates removed)")
+        
+        # Step 3: Run classifier on deduplicated TEs
         self.run_cmd(f"run_Classifier {self.model_dir}", combine_dir)
         
         self.create_checkpoint('combine')

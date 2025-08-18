@@ -1,0 +1,961 @@
+"""
+Phase 2: 共识序列扩展和改进（优化并行版本）
+目标：提高每个候选序列的质量和代表性，使基因组注释更全面
+优化：使用动态工作队列，避免批处理等待
+"""
+
+import logging
+import gc
+import numpy as np
+from typing import Dict, List, Tuple, Any, Optional
+from pathlib import Path
+from collections import defaultdict, Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+import queue
+import threading
+import time
+import psutil
+import os
+
+from config import PipelineConfig
+from utils.robust_runner import RobustRunner
+
+logger = logging.getLogger(__name__)
+
+
+class ConsensusExpansionBuilder:
+    """Phase 2: 扩展和改进候选序列，提高代表性（优化并行版本）"""
+    
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.runner = RobustRunner(config)
+        
+        # 获取系统内存信息
+        try:
+            mem = psutil.virtual_memory()
+            available_memory_gb = mem.available / (1024**3)
+            total_memory_gb = mem.total / (1024**3)
+            logger.info(f"System memory: {available_memory_gb:.1f}GB available / {total_memory_gb:.1f}GB total")
+        except:
+            available_memory_gb = 16  # 默认假设16GB可用
+            total_memory_gb = 32
+            logger.warning("Could not detect system memory, assuming 16GB available")
+        
+        # 设置并行处理workers - 基于内存和CPU数量
+        cpu_count = mp.cpu_count()
+        
+        # 估算每个worker需要的内存（经验值：约1-2GB per worker）
+        memory_per_worker = 1.5  # GB
+        max_workers_by_memory = max(1, int(available_memory_gb / memory_per_worker))
+        
+        # 基于线程数的workers计算
+        if config.threads >= 32:
+            max_workers_by_cpu = min(config.threads, cpu_count * 2)
+        elif config.threads >= 16:
+            max_workers_by_cpu = min(config.threads, max(cpu_count, 16))
+        else:
+            max_workers_by_cpu = max(4, min(config.threads, cpu_count))
+        
+        # 取内存和CPU限制的较小值
+        self.max_workers = min(max_workers_by_memory, max_workers_by_cpu)
+        self.max_workers = max(1, min(self.max_workers, 128))  # 至少1个worker
+        
+        # 如果内存限制了workers数量，记录警告
+        if max_workers_by_memory < max_workers_by_cpu:
+            logger.warning(f"Memory constraints: reducing workers from {max_workers_by_cpu} to {self.max_workers}")
+        
+        # 计算每个子进程应该使用的线程数（避免线程爆炸）
+        # 总线程数 / 工作进程数 = 每个进程的线程数
+        self.threads_per_worker = max(1, config.threads // self.max_workers)
+        # 限制每个MAFFT最多使用4个线程（避免单个任务占用过多资源）
+        self.mafft_threads = min(self.threads_per_worker, 4)
+        
+        logger.info(f"Phase 2 Consensus Expansion initialized:")
+        logger.info(f"  - Workers: {self.max_workers} (memory-aware)")
+        logger.info(f"  - Threads per worker: {self.threads_per_worker}")
+        logger.info(f"  - MAFFT threads: {self.mafft_threads}")
+        logger.info(f"  - Available memory: {available_memory_gb:.1f}GB")
+    
+    def _sort_sequences_by_complexity(self, sequences: List[Dict]) -> List[Dict]:
+        """
+        按照预估处理复杂度排序序列
+        复杂度 = 序列长度 × 拷贝数
+        优先处理高复杂度序列以避免长尾效应
+        """
+        # 计算每个序列的复杂度分数
+        for seq in sequences:
+            # 序列长度
+            seq_length = len(seq.get('sequence', ''))
+            
+            # 估算拷贝数（从Phase 1的RepeatMasker结果）
+            rm_hits = seq.get('rm_hits', [])
+            estimated_copies = len(rm_hits) if rm_hits else 1
+            
+            # 复杂度分数：长度和拷贝数的乘积
+            # 使用对数缩放避免极端值主导
+            complexity_score = np.log1p(seq_length) * np.log1p(estimated_copies)
+            
+            # 添加质量权重：A类序列可能更重要
+            if seq.get('quality_class') == 'A':
+                complexity_score *= 1.2
+            
+            seq['_complexity_score'] = complexity_score
+        
+        # 按复杂度降序排序（最复杂的先处理）
+        sorted_sequences = sorted(sequences, key=lambda x: x.get('_complexity_score', 0), reverse=True)
+        
+        # 记录排序信息
+        if sequences:
+            top_5 = sorted_sequences[:5]
+            bottom_5 = sorted_sequences[-5:]
+            logger.info(f"Sequence complexity sorting:")
+            
+            # 格式化top 5信息
+            top_5_info = []
+            for s in top_5:
+                seq_len = len(s.get('sequence', ''))
+                num_copies = len(s.get('rm_hits', []))
+                top_5_info.append((s['id'], f"{seq_len}bp", f"{num_copies} copies"))
+            logger.info(f"  Top 5 complex: {top_5_info}")
+            
+            # 格式化bottom 5信息
+            bottom_5_info = []
+            for s in bottom_5:
+                seq_len = len(s.get('sequence', ''))
+                num_copies = len(s.get('rm_hits', []))
+                bottom_5_info.append((s['id'], f"{seq_len}bp", f"{num_copies} copies"))
+            logger.info(f"  Bottom 5 simple: {bottom_5_info}")
+        
+        return sorted_sequences
+    
+    def run(self, phase1_output: Dict) -> List[Dict]:
+        """执行Phase 2主流程 - 优化的动态并行处理"""
+        candidate_sequences = self._select_candidate_sequences(phase1_output)
+        logger.info(f"Processing {len(candidate_sequences)} candidate sequences for expansion")
+        
+        all_consensus = []
+        
+        # 统计信息
+        stats = {
+            'single_consensus': 0,
+            'multiple_consensus': 0,
+            'failed': 0,
+            'total_consensus': 0,
+            'processed': 0
+        }
+        
+        # 使用动态工作队列，不再按批次处理
+        all_consensus = self._process_sequences_dynamic(candidate_sequences, stats)
+        
+        logger.info(f"Phase 2 complete: Generated {len(all_consensus)} consensus sequences from {len(candidate_sequences)} inputs")
+        logger.info(f"Expansion ratio: {len(all_consensus)/len(candidate_sequences):.2f}x")
+        logger.info(f"Statistics - Single: {stats['single_consensus']}, Multiple: {stats['multiple_consensus']}, Failed: {stats['failed']}")
+        
+        return all_consensus
+    
+    def _select_candidate_sequences(self, phase1_output: Dict) -> List[Dict]:
+        """选择候选序列并附加Phase 1的信息"""
+        candidates = []
+        rm_results = phase1_output.get('rm_detailed_results', {})
+        scores = phase1_output.get('scores', {})
+        
+        # 处理所有A类序列
+        for seq in phase1_output['a_sequences']:
+            # 直接使用Phase 1的RepeatMasker结果
+            seq['rm_hits'] = rm_results.get(seq['id'], {}).get('hits', [])
+            seq['phase1_scores'] = scores.get(seq['id'], {})
+            seq['quality_class'] = 'A'
+            candidates.append(seq)
+        
+        # 处理高质量的B类序列
+        for seq in phase1_output['b_sequences']:
+            seq_id = seq['id']
+            final_score = scores.get(seq_id, {}).get('final', 0)
+            if final_score >= 0.50:  # B类上半部分
+                seq['rm_hits'] = rm_results.get(seq['id'], {}).get('hits', [])
+                seq['phase1_scores'] = scores.get(seq_id, {})
+                seq['quality_class'] = 'B'
+                candidates.append(seq)
+        
+        # 统计使用Phase 1结果的比例
+        with_hits = sum(1 for c in candidates if c.get('rm_hits'))
+        logger.info(f"Selected {len(candidates)} sequences: "
+                   f"{len(phase1_output['a_sequences'])} A-class, "
+                   f"{len([s for s in phase1_output['b_sequences'] if scores.get(s['id'], {}).get('final', 0) >= 0.50])} B-class")
+        logger.info(f"  {with_hits}/{len(candidates)} sequences have RepeatMasker results from Phase 1")
+        
+        return candidates
+    
+    def _process_sequences_dynamic(self, sequences: List[Dict], stats: Dict) -> List[Dict]:
+        """动态并行处理序列 - 内存优化版本"""
+        all_consensus = []
+        total_sequences = len(sequences)
+        
+        # 优化：按预估处理时间排序（长度×拷贝数），优先处理耗时任务
+        sorted_sequences = self._sort_sequences_by_complexity(sequences)
+        
+        # 进度追踪
+        progress_lock = threading.Lock()
+        last_report_time = time.time()
+        report_interval = 10  # 每10秒报告一次进度
+        
+        def update_progress(result: Dict, seq_id: str):
+            """更新进度和统计"""
+            nonlocal last_report_time
+            
+            with progress_lock:
+                stats['processed'] += 1
+                
+                if result['consensus_count'] == 0:
+                    stats['failed'] += 1
+                elif result['consensus_count'] == 1:
+                    stats['single_consensus'] += 1
+                else:
+                    stats['multiple_consensus'] += 1
+                stats['total_consensus'] += result['consensus_count']
+                
+                all_consensus.extend(result['consensus_list'])
+                
+                # 定期报告进度
+                current_time = time.time()
+                if current_time - last_report_time > report_interval or stats['processed'] == total_sequences:
+                    percent = (stats['processed'] / total_sequences) * 100
+                    logger.info(f"Progress: {stats['processed']}/{total_sequences} ({percent:.1f}%) sequences processed")
+                    logger.info(f"  Generated {stats['total_consensus']} consensus sequences")
+                    logger.info(f"  Single: {stats['single_consensus']}, Multiple: {stats['multiple_consensus']}, Failed: {stats['failed']}")
+                    
+                    # 估算剩余时间
+                    if stats['processed'] > 0 and stats['processed'] < total_sequences:
+                        elapsed = current_time - self.start_time
+                        rate = stats['processed'] / elapsed
+                        remaining = (total_sequences - stats['processed']) / rate
+                        logger.info(f"  Estimated time remaining: {remaining/60:.1f} minutes")
+                    
+                    # 显示内存使用情况
+                    try:
+                        mem = psutil.virtual_memory()
+                        logger.info(f"  Memory usage: {mem.percent:.1f}% ({mem.used/(1024**3):.1f}GB / {mem.total/(1024**3):.1f}GB)")
+                    except:
+                        pass
+                    
+                    last_report_time = current_time
+        
+        # 记录开始时间
+        self.start_time = time.time()
+        
+        # 检测是否在集群环境（通过环境变量判断）
+        is_cluster = os.environ.get('SLURM_JOB_ID') or os.environ.get('PBS_JOBID') or os.environ.get('LSB_JOBID')
+        
+        # 决定是否使用多进程
+        use_multiprocessing = self.max_workers > 1
+        
+        # 在内存受限的环境中，考虑使用串行处理
+        try:
+            mem = psutil.virtual_memory()
+            if mem.available < 4 * (1024**3):  # 少于4GB可用内存
+                logger.warning(f"Low memory detected ({mem.available/(1024**3):.1f}GB), using sequential processing")
+                use_multiprocessing = False
+        except:
+            pass
+        
+        if not use_multiprocessing:
+            # 串行处理 - 避免fork()内存问题
+            logger.info(f"Using sequential processing for {len(sorted_sequences)} sequences")
+            
+            for seq in sorted_sequences:
+                try:
+                    expansion_result = expand_and_improve_sequence(
+                        seq,
+                        self.config,
+                        self.mafft_threads
+                    )
+                    update_progress(expansion_result, seq['id'])
+                    
+                    if expansion_result['consensus_count'] > 1:
+                        logger.debug(f"{seq['id']}: generated {expansion_result['consensus_count']} consensus sequences")
+                    
+                except Exception as e:
+                    logger.error(f"Failed processing {seq['id']}: {e}")
+                    failed_result = {
+                        'source_id': seq['id'],
+                        'consensus_count': 0,
+                        'consensus_list': []
+                    }
+                    update_progress(failed_result, seq['id'])
+                
+                # 主动垃圾回收
+                if stats['processed'] % 10 == 0:
+                    gc.collect()
+        else:
+            # 并行处理 - 使用spawn方法避免fork内存复制
+            try:
+                # 设置multiprocessing使用spawn方法（避免fork的内存问题）
+                original_method = mp.get_start_method()
+                if original_method != 'spawn':
+                    logger.info(f"Switching multiprocessing from '{original_method}' to 'spawn' method for memory efficiency")
+                    mp.set_start_method('spawn', force=True)
+            except RuntimeError:
+                # 已经设置过start method，忽略
+                pass
+            except ValueError:
+                # 平台不支持spawn，继续使用默认方法
+                logger.warning("Platform does not support 'spawn' method, using default")
+            
+            # 使用ProcessPoolExecutor进行并行处理
+            with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                # 批量提交以减少内存压力
+                batch_size = min(self.max_workers * 2, 20)  # 每批最多20个任务
+                futures = []
+                
+                for i in range(0, len(sorted_sequences), batch_size):
+                    batch = sorted_sequences[i:i+batch_size]
+                    batch_futures = {}
+                    
+                    # 提交一批任务
+                    for seq in batch:
+                        future = executor.submit(
+                            expand_and_improve_sequence,
+                            seq,
+                            self.config,
+                            self.mafft_threads
+                        )
+                        batch_futures[future] = seq
+                    
+                    logger.info(f"Submitted batch {i//batch_size + 1}/{(len(sorted_sequences) + batch_size - 1)//batch_size} " +
+                              f"({len(batch)} sequences)")
+                    
+                    # 等待这批任务完成
+                    for future in as_completed(batch_futures):
+                        seq = batch_futures[future]
+                        try:
+                            expansion_result = future.result(timeout=300)
+                            update_progress(expansion_result, seq['id'])
+                            
+                            if expansion_result['consensus_count'] > 1:
+                                logger.debug(f"{seq['id']}: generated {expansion_result['consensus_count']} consensus sequences")
+                        
+                        except Exception as e:
+                            logger.error(f"Failed processing {seq['id']}: {e}")
+                            failed_result = {
+                                'source_id': seq['id'],
+                                'consensus_count': 0,
+                                'consensus_list': []
+                            }
+                            update_progress(failed_result, seq['id'])
+                    
+                    # 批次之间进行垃圾回收
+                    gc.collect()
+                    
+                    # 检查内存使用，如果过高则暂停
+                    try:
+                        mem = psutil.virtual_memory()
+                        if mem.percent > 90:
+                            logger.warning(f"High memory usage ({mem.percent}%), pausing for garbage collection")
+                            time.sleep(2)
+                            gc.collect()
+                    except:
+                        pass
+        
+        # 最终统计
+        total_time = time.time() - self.start_time
+        logger.info(f"Phase 2 processing completed in {total_time/60:.1f} minutes")
+        logger.info(f"Average processing rate: {total_sequences/(total_time+0.001):.1f} sequences/second")
+        
+        return all_consensus
+
+
+def expand_and_improve_sequence(seed_seq: Dict, config: PipelineConfig, mafft_threads: int = 1) -> Dict:
+    """
+    扩展和改进单个候选序列
+    目标：提高序列质量和代表性，不是减少数量
+    
+    Args:
+        seed_seq: 种子序列
+        config: 配置对象
+        mafft_threads: MAFFT使用的线程数（避免线程爆炸）
+    """
+    
+    result = {
+        'source_id': seed_seq['id'],
+        'consensus_count': 0,
+        'consensus_list': []
+    }
+    
+    try:
+        # 1. 获取基因组拷贝（优先使用Phase 1的结果）
+        copies = get_genome_copies(seed_seq, config)
+        
+        if not copies or len(copies) < 2:
+            # 拷贝太少，直接使用原始序列
+            if len(copies) == 1:
+                # 只有一个拷贝，使用该拷贝改进原始序列
+                improved = improve_with_single_copy(seed_seq, copies[0])
+            else:
+                # 没有拷贝，使用原始序列
+                improved = create_default_consensus(seed_seq)
+            
+            if improved:
+                result['consensus_list'].append(improved)
+                result['consensus_count'] = 1
+            return result
+        
+        logger.debug(f"{seed_seq['id']}: Found {len(copies)} copies")
+        
+        # 2. 分析拷贝特征
+        characteristics = analyze_copy_characteristics(copies)
+        
+        # 3. 根据特征决定是否需要分亚家族
+        if should_split_subfamilies(characteristics, len(copies)):
+            # 识别亚家族并分别构建共识
+            subfamilies = identify_subfamilies_for_expansion(copies, characteristics)
+            logger.debug(f"{seed_seq['id']}: Split into {len(subfamilies)} subfamilies")
+            
+            for sf_idx, subfamily in enumerate(subfamilies):
+                if len(subfamily) >= 2:  # 至少2个拷贝才构建共识
+                    consensus = build_expanded_consensus(
+                        subfamily,
+                        seed_seq,
+                        subfamily_id=sf_idx,
+                        characteristics=characteristics,
+                        config=config,
+                        mafft_threads=mafft_threads
+                    )
+                    if consensus:
+                        result['consensus_list'].append(consensus)
+        else:
+            # 不分亚家族，直接构建单一共识
+            consensus = build_expanded_consensus(
+                copies,
+                seed_seq,
+                subfamily_id=0,
+                characteristics=characteristics,
+                config=config,
+                mafft_threads=mafft_threads
+            )
+            if consensus:
+                result['consensus_list'].append(consensus)
+        
+        result['consensus_count'] = len(result['consensus_list'])
+        
+        # 如果没有生成任何共识，至少保留改进的原始序列
+        if result['consensus_count'] == 0:
+            improved = improve_original_sequence(seed_seq, copies)
+            if improved:
+                result['consensus_list'].append(improved)
+                result['consensus_count'] = 1
+        
+    except Exception as e:
+        logger.error(f"Error processing {seed_seq['id']}: {e}")
+        # 出错时至少保留原始序列
+        fallback = create_default_consensus(seed_seq)
+        if fallback:
+            result['consensus_list'].append(fallback)
+            result['consensus_count'] = 1
+    
+    return result
+
+
+def get_genome_copies(seed_seq: Dict, config: PipelineConfig) -> List[Dict]:
+    """
+    获取基因组拷贝，优先使用Phase 1的结果
+    """
+    from utils.sequence_utils import extract_sequence_from_genome, detect_tsd
+    
+    # 优先使用Phase 1提供的RepeatMasker结果
+    if 'rm_hits' in seed_seq and seed_seq['rm_hits']:
+        rm_hits = seed_seq['rm_hits']
+        logger.debug(f"{seed_seq['id']}: Using {len(rm_hits)} hits from Phase 1")
+    else:
+        # Phase 1没有结果，需要重新运行RepeatMasker
+        logger.debug(f"{seed_seq['id']}: Running RepeatMasker (no Phase 1 results)")
+        from utils.alignment_utils import run_repeatmasker_single
+        
+        rm_params = {
+            's': True,  # 敏感模式
+            'no_is': True,
+            'nolow': True,
+            'div': 25,  # 允许25%的分化
+            'cutoff': 200,
+            'pa': 1
+        }
+        rm_hits = run_repeatmasker_single(seed_seq, config.genome_file, params=rm_params, config=config)
+    
+    if not rm_hits:
+        return []
+    
+    # 应用优化的二轮采样策略：使用外部工具批量提取
+    # 这样避免了提取所有45,081个序列的巨大开销，并且大幅提升提取速度
+    try:
+        from two_stage_sampling_optimized import apply_optimized_two_stage_sampling
+        logger.info(f"Using optimized batch extraction for {len(rm_hits)} RM hits of {seed_seq['id']}")
+        copies = apply_optimized_two_stage_sampling(rm_hits, seed_seq, config)
+    except ImportError:
+        # 降级到原始版本
+        from two_stage_sampling import apply_two_stage_sampling
+        logger.info(f"Falling back to standard extraction for {len(rm_hits)} RM hits of {seed_seq['id']}")
+        copies = apply_two_stage_sampling(rm_hits, seed_seq, config)
+    
+    logger.info(f"Selected {len(copies)} representative copies after two-stage sampling")
+    
+    return copies
+
+
+def analyze_copy_characteristics(copies: List[Dict]) -> Dict:
+    """分析拷贝特征"""
+    if not copies:
+        return {}
+    
+    identities = [c.get('identity', 0) for c in copies]
+    lengths = [c['length'] for c in copies]
+    
+    characteristics = {
+        'copy_number': len(copies),
+        'avg_identity': np.mean(identities),
+        'std_identity': np.std(identities),
+        'min_identity': min(identities),
+        'max_identity': max(identities),
+        'identity_range': max(identities) - min(identities),
+        'avg_length': np.mean(lengths),
+        'std_length': np.std(lengths),
+        'length_cv': np.std(lengths) / np.mean(lengths) if np.mean(lengths) > 0 else 0,
+        'has_tsd_ratio': sum(1 for c in copies if c.get('has_tsd', False)) / len(copies)
+    }
+    
+    return characteristics
+
+
+def should_split_subfamilies(characteristics: Dict, copy_number: int) -> bool:
+    """
+    决定是否需要分割成亚家族
+    只在有明显差异时才分割，目的是提高注释的全面性
+    """
+    
+    # 拷贝数太少，不分割
+    if copy_number < 5:
+        return False
+    
+    # identity差异很大，说明可能有不同的亚家族
+    if characteristics['identity_range'] > 20:  # 20%的差异
+        return True
+    
+    # 长度变异很大，可能有不同的变体（完整vs截断）
+    if characteristics['length_cv'] > 0.3:  # 变异系数>30%
+        return True
+    
+    # 大家族更可能有亚家族结构
+    if copy_number > 20 and characteristics['std_identity'] > 5:
+        return True
+    
+    return False
+
+
+def identify_subfamilies_for_expansion(copies: List[Dict], characteristics: Dict) -> List[List[Dict]]:
+    """
+    识别亚家族，目的是发现不同的TE变体
+    """
+    from utils.sequence_utils import calculate_sequence_identity
+    
+    if len(copies) < 5:
+        return [copies]
+    
+    # 构建简化的距离矩阵（主要基于identity和长度）
+    n = len(copies)
+    distance_matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            # 序列相似度距离
+            identity = copies[i].get('identity', 100) / 100.0
+            identity_j = copies[j].get('identity', 100) / 100.0
+            avg_identity = (identity + identity_j) / 2
+            seq_distance = 1 - avg_identity
+            
+            # 长度差异距离
+            len_i, len_j = copies[i]['length'], copies[j]['length']
+            if max(len_i, len_j) > 0:
+                length_ratio = min(len_i, len_j) / max(len_i, len_j)
+                length_distance = 1 - length_ratio
+            else:
+                length_distance = 1.0
+            
+            # 综合距离（简单加权）
+            total_distance = 0.7 * seq_distance + 0.3 * length_distance
+            distance_matrix[i, j] = total_distance
+            distance_matrix[j, i] = total_distance
+    
+    # 层次聚类
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import squareform
+    
+    condensed_distances = squareform(distance_matrix)
+    linkage_matrix = linkage(condensed_distances, method='average')
+    
+    # 动态阈值：基于距离分布
+    distances = distance_matrix[np.triu_indices_from(distance_matrix, k=1)]
+    if len(distances) > 0:
+        # 使用距离的第75百分位作为阈值
+        threshold = np.percentile(distances, 75)
+        threshold = max(0.15, min(0.4, threshold))  # 限制在合理范围
+    else:
+        threshold = 0.25
+    
+    # 聚类
+    clusters = fcluster(linkage_matrix, threshold, criterion='distance')
+    
+    # 组织成亚家族
+    subfamilies = defaultdict(list)
+    for i, cluster_id in enumerate(clusters):
+        subfamilies[cluster_id].append(copies[i])
+    
+    # 过滤太小的亚家族（合并到最近的）
+    final_subfamilies = []
+    for subfamily in subfamilies.values():
+        if len(subfamily) >= 2:
+            final_subfamilies.append(subfamily)
+        else:
+            # 单个拷贝，尝试合并到最近的亚家族
+            if final_subfamilies:
+                final_subfamilies[0].extend(subfamily)
+            else:
+                final_subfamilies.append(subfamily)
+    
+    return final_subfamilies
+
+
+def build_expanded_consensus(copies: List[Dict],
+                            seed_seq: Dict,
+                            subfamily_id: int,
+                            characteristics: Dict,
+                            config: PipelineConfig,
+                            mafft_threads: int = 1) -> Optional[Dict]:
+    """
+    构建扩展的共识序列
+    目标：生成更完整、更准确的共识
+    """
+    from utils.alignment_utils import run_mafft
+    from utils.sequence_utils import build_consensus_from_msa, extend_consensus_boundaries
+    
+    try:
+        if len(copies) == 1:
+            # 单个拷贝，直接使用但尝试改进
+            consensus_seq = copies[0]['sequence']
+            # 尝试扩展边界
+            if copies[0].get('extended_sequence'):
+                consensus_seq = extend_consensus_boundaries(
+                    consensus_seq,
+                    copies[0]['extended_sequence']
+                )
+        else:
+            # 多序列比对 - 始终使用MAFFT获得高质量共识
+            sequences = [{'id': f"copy_{i}", 'sequence': copy['sequence']} for i, copy in enumerate(copies)]
+            
+            # 基于TE生物学特性选择MAFFT算法
+            avg_identity = characteristics.get('avg_identity', 70)
+            length_cv = characteristics.get('length_cv', 0)  # 长度变异系数
+            
+            if len(sequences) > 100:
+                # 大数据集使用最快算法
+                algorithm = 'auto'
+                logger.debug(f"Large dataset: using auto algorithm")
+            elif avg_identity > 85 and length_cv < 0.3:
+                # 高相似度且长度一致：年轻TE家族或同亚家族
+                algorithm = 'localpair'  # L-INS-i: 适合高度相似序列
+                logger.debug(f"Young TE family (id={avg_identity:.1f}%, cv={length_cv:.2f}): using localpair")
+            elif avg_identity > 65 and length_cv > 0.5:
+                # 中等相似度但长度变异大：典型的TE家族(如截断LINE)
+                algorithm = 'genafpair'  # E-INS-i: 处理大插入/缺失
+                logger.debug(f"TE with indels (id={avg_identity:.1f}%, cv={length_cv:.2f}): using genafpair")
+            elif avg_identity > 65:
+                # 中等相似度，长度相对一致：保守TE类型(如SINE)
+                algorithm = 'localpair'  # L-INS-i
+                logger.debug(f"Conservative TE (id={avg_identity:.1f}%, cv={length_cv:.2f}): using localpair")
+            else:
+                # 低相似度或高度分化：古老TE家族
+                algorithm = 'genafpair'  # E-INS-i: 处理高分化序列
+                logger.debug(f"Ancient TE (id={avg_identity:.1f}%, cv={length_cv:.2f}): using genafpair")
+            
+            # TE特异的预处理：处理极端情况
+            if avg_identity < 50:
+                logger.warning(f"Very low identity ({avg_identity:.1f}%) - may not be same TE family")
+                # 对于极低相似度，使用最宽松的参数
+                algorithm = 'genafpair'
+                
+            # 检查长度变异是否过大
+            if length_cv > 1.0:
+                logger.debug(f"Extreme length variation (cv={length_cv:.2f}) - filtering outliers")
+                # 过滤长度异常值 (保留中位数±2倍标准差范围内的序列)
+                lengths = [len(seq['sequence']) for seq in sequences]
+                median_len = np.median(lengths)
+                std_len = np.std(lengths)
+                filtered_sequences = []
+                for seq in sequences:
+                    if abs(len(seq['sequence']) - median_len) <= 2 * std_len:
+                        filtered_sequences.append(seq)
+                
+                if len(filtered_sequences) >= 2:
+                    sequences = filtered_sequences
+                    logger.debug(f"Filtered to {len(sequences)} sequences after outlier removal")
+                else:
+                    logger.warning("Too few sequences remain after filtering - using all sequences")
+            
+            logger.debug(f"Running MAFFT with {algorithm} algorithm on {len(sequences)} sequences using {mafft_threads} threads")
+            msa_result = run_mafft(sequences, algorithm=algorithm, thread=mafft_threads, config=config)
+            
+            if not msa_result:
+                # MSA失败，使用TE特异的后备策略
+                logger.warning(f"MAFFT failed for {seed_seq['id']}, using TE-aware fallback strategy")
+                
+                if avg_identity < 60:
+                    # 极低相似度：可能不是同一家族，选择最高质量的
+                    best_copy = max(copies, key=lambda x: x.get('quality_score', x.get('identity', 0)))
+                    consensus_seq = best_copy['sequence']
+                    logger.debug("Using best quality sequence for low-identity TE family")
+                elif length_cv > 0.8:
+                    # 长度变异极大：选择中位数长度附近的最好序列
+                    lengths = [len(c['sequence']) for c in copies]
+                    median_len = np.median(lengths)
+                    candidates = [c for c in copies if abs(len(c['sequence']) - median_len) < median_len * 0.3]
+                    if candidates:
+                        best_copy = max(candidates, key=lambda x: x.get('quality_score', x.get('identity', 0)))
+                        consensus_seq = best_copy['sequence']
+                        logger.debug("Using median-length sequence for variable-length TE family")
+                    else:
+                        longest_copy = max(copies, key=lambda x: x['length'])
+                        consensus_seq = longest_copy['sequence']
+                else:
+                    # 使用最长的序列作为默认后备
+                    longest_copy = max(copies, key=lambda x: x['length'])
+                    consensus_seq = longest_copy['sequence']
+            else:
+                # 构建高质量共识序列，根据TE特性调整参数
+                min_coverage = 0.4 if avg_identity > 75 else 0.3  # 高相似度要求更高覆盖
+                quality_threshold = 0.6 if avg_identity > 80 else 0.5  # 高相似度要求更高质量
+                
+                consensus_seq = build_consensus_from_msa(
+                    msa_result,
+                    min_coverage=min_coverage,
+                    use_iupac=True,   # 使用IUPAC模糊碱基表示变异位点
+                    quality_threshold=quality_threshold
+                )
+                
+                # TE特异的质量检查
+                if consensus_seq and len(consensus_seq) > 0:
+                    # 检查N含量
+                    n_content = consensus_seq.count('N') / len(consensus_seq)
+                    
+                    # 检查模糊碱基含量（IUPAC codes: R,Y,S,W,K,M,B,D,H,V,N）
+                    ambiguous_bases = set('RYSWKMBDHVN')
+                    ambiguity_count = sum(1 for base in consensus_seq.upper() if base in ambiguous_bases)
+                    ambiguity_ratio = ambiguity_count / len(consensus_seq)
+                    
+                    # 根据TE年龄/相似度动态设置模糊碱基阈值
+                    if avg_identity > 85:
+                        # 年轻TE：高相似度，应该有清晰的共识
+                        max_ambiguity_ratio = 0.05  # 最多5%模糊碱基
+                        logger.debug(f"Young TE family (identity={avg_identity:.1f}%): max ambiguity ratio = 5%")
+                    elif avg_identity > 70:
+                        # 中等年龄TE：适度变异
+                        max_ambiguity_ratio = 0.10  # 最多10%模糊碱基
+                        logger.debug(f"Middle-aged TE family (identity={avg_identity:.1f}%): max ambiguity ratio = 10%")
+                    else:
+                        # 古老TE：高度分化，但仍需保持特异性
+                        max_ambiguity_ratio = 0.15  # 最多15%模糊碱基
+                        logger.debug(f"Ancient TE family (identity={avg_identity:.1f}%): max ambiguity ratio = 15%")
+                    
+                    # 如果N含量过高或模糊碱基过多，需要处理
+                    if n_content > 0.5 or ambiguity_ratio > max_ambiguity_ratio:
+                        logger.warning(f"Poor consensus quality for {seed_seq['id']}_sf{subfamily_id}: "
+                                     f"N-content={n_content:.1%}, ambiguity={ambiguity_ratio:.1%} "
+                                     f"(threshold={max_ambiguity_ratio:.1%})")
+                        
+                        # 策略1：如果模糊碱基过多，尝试重建共识（不使用IUPAC）
+                        if ambiguity_ratio > max_ambiguity_ratio and len(sequences) > 1:
+                            logger.debug(f"Rebuilding consensus without IUPAC codes due to high ambiguity")
+                            # 重新运行MAFFT但不使用模糊碱基
+                            consensus_seq_strict = build_consensus_from_msa(
+                                msa_result,
+                                min_coverage=min_coverage,
+                                use_iupac=False,  # 不使用模糊碱基
+                                quality_threshold=quality_threshold
+                            )
+                            
+                            # 检查新共识是否更好
+                            if consensus_seq_strict and len(consensus_seq_strict) >= len(consensus_seq) * 0.9:
+                                consensus_seq = consensus_seq_strict
+                                logger.debug(f"Using strict consensus without ambiguous bases")
+                            else:
+                                # 策略2：使用最高质量的单个序列
+                                best_copy = max(copies, key=lambda x: x.get('quality_score', x.get('identity', 0)))
+                                consensus_seq = best_copy['sequence']
+                                logger.debug(f"Using best single sequence due to poor MSA quality")
+                        else:
+                            # N含量过高，直接使用最佳序列
+                            best_copy = max(copies, key=lambda x: x.get('quality_score', x.get('identity', 0)))
+                            consensus_seq = best_copy['sequence']
+                            logger.debug(f"Using best single sequence due to high N-content")
+        
+        if not consensus_seq or len(consensus_seq) < 50:
+            logger.debug(f"Filtered out consensus for {seed_seq['id']}_sf{subfamily_id}: sequence too short ({len(consensus_seq) if consensus_seq else 0}bp < 50bp)")
+            return None
+        
+        # 计算改进程度
+        original_length = len(seed_seq['sequence'])
+        improved_length = len(consensus_seq)
+        improvement_ratio = improved_length / original_length if original_length > 0 else 1.0
+        
+        # 创建共识记录
+        consensus_record = {
+            'id': f"{seed_seq['id']}_sf{subfamily_id}",
+            'sequence': consensus_seq,
+            'source_id': seed_seq['id'],
+            'quality_class': seed_seq.get('quality_class', 'A'),
+            'subfamily_id': subfamily_id,
+            'copy_number': len(copies),
+            'avg_identity': np.mean([c.get('identity', 0) for c in copies]),
+            'length': len(consensus_seq),
+            'original_length': original_length,
+            'improvement_ratio': improvement_ratio,
+            'characteristics': characteristics
+        }
+        
+        # 添加TSD信息
+        tsd_sequences = []
+        for c in copies:
+            if c.get('has_tsd', False) and c.get('tsd'):
+                tsd_info = c.get('tsd')
+                if isinstance(tsd_info, dict) and 'sequence' in tsd_info:
+                    tsd_sequences.append(tsd_info['sequence'])
+                elif isinstance(tsd_info, str):
+                    tsd_sequences.append(tsd_info)
+        
+        if tsd_sequences:
+            from collections import Counter
+            tsd_counter = Counter(tsd_sequences)
+            if tsd_counter:
+                most_common_tsd = tsd_counter.most_common(1)[0][0]
+                consensus_record['tsd'] = most_common_tsd
+                consensus_record['tsd_support'] = tsd_counter[most_common_tsd] / len(copies)
+        
+        # 添加质量评分
+        quality_score = calculate_consensus_quality(consensus_record, copies)
+        consensus_record['quality_score'] = quality_score
+        
+        return consensus_record
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"Error building consensus: {e}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return None
+
+
+def calculate_consensus_quality(consensus: Dict, copies: List[Dict]) -> float:
+    """计算共识序列质量"""
+    
+    quality_components = []
+    
+    # 1. 拷贝数支持度
+    copy_support = min(consensus['copy_number'] / 10, 1.0)
+    quality_components.append(copy_support * 0.3)
+    
+    # 2. 序列一致性
+    identity_score = consensus['avg_identity'] / 100.0
+    quality_components.append(identity_score * 0.3)
+    
+    # 3. 长度改进
+    if consensus['improvement_ratio'] > 1.0:
+        improvement_score = min((consensus['improvement_ratio'] - 1.0) / 0.5, 1.0)
+    else:
+        improvement_score = consensus['improvement_ratio']
+    quality_components.append(improvement_score * 0.2)
+    
+    # 4. TSD支持
+    tsd_score = consensus.get('tsd_support', 0)
+    quality_components.append(tsd_score * 0.1)
+    
+    # 5. 长度合理性
+    length = consensus['length']
+    if 100 <= length <= 5000:
+        length_score = 1.0
+    elif length < 100:
+        length_score = length / 100
+    else:
+        length_score = max(0.5, 1.0 - (length - 5000) / 10000)
+    quality_components.append(length_score * 0.1)
+    
+    return sum(quality_components)
+
+
+def improve_with_single_copy(seed_seq: Dict, copy: Dict) -> Dict:
+    """使用单个拷贝改进原始序列"""
+    # 如果拷贝质量更好，使用拷贝序列
+    if copy.get('identity', 0) > 80:
+        sequence = copy['sequence']
+    else:
+        sequence = seed_seq['sequence']
+    
+    # 检查序列长度阈值
+    if len(sequence) < 50:
+        logger.debug(f"Filtered out single-copy improved sequence for {seed_seq['id']}: too short ({len(sequence)}bp < 50bp)")
+        return None
+    
+    return {
+        'id': f"{seed_seq['id']}_improved",
+        'sequence': sequence,
+        'source_id': seed_seq['id'],
+        'quality_class': seed_seq.get('quality_class', 'A'),
+        'copy_number': 1,
+        'avg_identity': copy.get('identity', 0),
+        'quality_score': 0.3,  # 低质量分数因为只有一个拷贝
+        'note': 'single_copy_improvement'
+    }
+
+
+def improve_original_sequence(seed_seq: Dict, copies: List[Dict]) -> Dict:
+    """使用拷贝信息改进原始序列"""
+    # 选择最好的拷贝作为参考
+    if copies:
+        best_copy = max(copies, key=lambda x: x.get('identity', 0) * x['length'])
+        sequence = best_copy['sequence']
+        avg_identity = np.mean([c.get('identity', 0) for c in copies])
+    else:
+        sequence = seed_seq['sequence']
+        avg_identity = 0
+    
+    # 检查序列长度阈值
+    if len(sequence) < 50:
+        logger.debug(f"Filtered out original improved sequence for {seed_seq['id']}: too short ({len(sequence)}bp < 50bp)")
+        return None
+    
+    return {
+        'id': f"{seed_seq['id']}_improved",
+        'sequence': sequence,
+        'source_id': seed_seq['id'],
+        'quality_class': seed_seq.get('quality_class', 'A'),
+        'copy_number': len(copies),
+        'avg_identity': avg_identity,
+        'quality_score': 0.4,
+        'note': 'original_improved'
+    }
+
+
+def create_default_consensus(seed_seq: Dict) -> Dict:
+    """创建默认共识（原始序列）"""
+    # 检查序列长度阈值
+    if len(seed_seq['sequence']) < 50:
+        logger.debug(f"Filtered out default consensus for {seed_seq['id']}: too short ({len(seed_seq['sequence'])}bp < 50bp)")
+        return None
+    
+    return {
+        'id': f"{seed_seq['id']}_default",
+        'sequence': seed_seq['sequence'],
+        'source_id': seed_seq['id'],
+        'quality_class': seed_seq.get('quality_class', 'A'),
+        'copy_number': 0,
+        'avg_identity': 0,
+        'quality_score': 0.2,  # 最低质量
+        'note': 'no_copies_found'
+    }

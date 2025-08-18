@@ -151,20 +151,14 @@ sub run_pipeline {
     my $readable_size = sprintf("%.2f", $genome_size/1e9) . " Gb";
     $logger->info("Processing genome of size: $readable_size");
 
-    # Calculate sample size based on genome size
-    my $sample_size = $genome_size;
-    my $sample_times = 1;
-    my $batch_size = $genome_size;
+    # Calculate sampling strategy based on genome size thresholds
+    my ($sample_strategy, $sample_size, $batch_size, $sample_times) = 
+        determine_sampling_strategy($genome_size);
     
-    # If genome size > 500M, sample 400M
-    if ($genome_size > 500_000_000) {
-        $sample_size = 400_000_000;
-        $batch_size = 200_000;
-        $sample_times = int($sample_size / $batch_size);
-        $logger->info("Genome size > 500M, sampling 400M in $sample_times batches of $batch_size bp");
-    } else {
-        $logger->info("Genome size <= 500M, using full genome");
-    }
+    $logger->info("Sampling strategy: $sample_strategy");
+    $logger->info("Sample size: " . sprintf("%.2f", $sample_size/1e6) . " Mb");
+    $logger->info("Batch size: " . sprintf("%.2f", $batch_size/1e3) . " Kb");
+    $logger->info("Number of batches: $sample_times");
 
     my $lmer_size = calculate_lmer_size($genome_size);
     $logger->info("Calculated l-mer size: $lmer_size");
@@ -185,14 +179,8 @@ sub run_pipeline {
     else {
         # Run complete pipeline
         eval {
-            # Generate genome samples if needed
-            if ($genome_size > 500_000_000) {
-                $logger->info("Generating genome samples...");
-                run_cmd("sample_for_genome $config{genome_file}.fai $config{tmp_dir}/out.bed $sample_times $batch_size");
-                run_cmd("seqtk subseq $config{genome_file} $config{tmp_dir}/out.bed > $config{tmp_dir}/tmp.fa");
-            } else {
-                run_cmd("cp $config{genome_file} $config{tmp_dir}/tmp.fa");
-            }
+            # Process genome based on sampling strategy
+            process_genome_by_strategy($sample_strategy, $sample_times, $batch_size);
             
             run_build_lmer_table($lmer_size);
             run_repeat_scout($lmer_size);
@@ -271,33 +259,50 @@ sub refine_consensus {
     $logger->info("Refining consensus sequences...");
 
     my $input = "$config{tmp_dir}/repeats.filtered.fa";
-    my $output = "$config{work_dir}/consensi.fa";
-    my $families_file = "$config{tmp_dir}/families.txt";
+    my $output_dir = "$config{work_dir}/refiner_output";
+    my $final_output = "$config{work_dir}/consensi.fa";
 
     # Create required directories
     make_path($config{work_dir}) unless -d $config{work_dir};
+    make_path($output_dir) unless -d $output_dir;
     
     # Ensure all input files exist
     die "Input file missing: $input\n" unless -f $input;
-    my $tmp_fa="$config{tmp_dir}/tmp.fa";
+    my $tmp_fa = "$config{tmp_dir}/tmp.fa";
+    
+    # Use the new Refiner pipeline
     my $cmd = join(" ",
-        "$FindBin::RealBin/Refiner_for_RS",
-        $config{tmp_dir},               # work_dir
-        $output,                        # consensi_file 
-        $tmp_fa,	                # sample_file
-        $families_file,                 # families_file
-        $config{threads},               # threads
-        $config{rmblast_dir},           # rmblast_path
-        $config{work_dir}               # output_dir
+        "python3", "$FindBin::RealBin/Refiner/main.py",
+        '--repeatscout', $input,              # RepeatScout filtered output
+        '--genome', $tmp_fa,                  # Reference genome (sampled)
+        '--output', $output_dir,              # Output directory for Refiner
+        '--threads', $config{threads},        # Number of threads
+        '--keep-temp',                        # Keep temporary files for debugging
+        '2>', "$config{tmp_dir}/refiner.log"  # Log file
     );
 
+    $logger->info("Running advanced TE consensus building with command: $cmd");
     system($cmd) == 0 
         or do {
-            $logger->error("Consensus refinement failed with status: $?");
-            die "Consensus refinement failed\n";
+            $logger->error("Advanced consensus refinement failed with status: $?");
+            die "Advanced consensus refinement failed\n";
         };
     
-    $logger->info("Consensus refinement completed");
+    # Check for the main output file from Refiner and copy it to expected location
+    my $refiner_consensus = "$output_dir/consensus_masking.fa";
+    if (-f $refiner_consensus) {
+        $logger->info("Copying refined consensus from $refiner_consensus to $final_output");
+        system("cp '$refiner_consensus' '$final_output'") == 0
+            or do {
+                $logger->error("Failed to copy consensus file");
+                die "Failed to copy consensus file\n";
+            };
+    } else {
+        $logger->error("Refiner output file not found: $refiner_consensus");
+        die "Refiner output file not found\n";
+    }
+    
+    $logger->info("Advanced consensus refinement completed successfully");
 }
 
 sub which {
@@ -308,6 +313,217 @@ sub which {
     }
     $logger->error("Cannot find $program in PATH");
     die "Cannot find $program in PATH\n";
+}
+
+sub determine_sampling_strategy {
+    my ($genome_size) = @_;
+    
+    my $mb_400 = 400 * 1024 * 1024;    # 400MB
+    my $gb_1_4 = 1.4 * 1024 * 1024 * 1024;  # 1.4GB
+    my $gb_10 = 10 * 1024 * 1024 * 1024;    # 10GB
+    my $kb_200 = 200 * 1024;           # 200KB
+    
+    if ($genome_size < $mb_400) {
+        # Small genome: fragment all sequences into 200KB pieces
+        my $strategy = "fragment_all";
+        my $num_fragments = ceil($genome_size / $kb_200);
+        return ($strategy, $genome_size, $kb_200, $num_fragments);
+    }
+    elsif ($genome_size >= $mb_400 && $genome_size < $gb_1_4) {
+        # Medium genome: sample 600MB in 200KB chunks
+        my $strategy = "sample_600mb";
+        my $sample_size = 600 * 1024 * 1024;  # 600MB
+        my $num_samples = $sample_size / $kb_200;  # 3000 samples
+        return ($strategy, $sample_size, $kb_200, $num_samples);
+    }
+    elsif ($genome_size >= $gb_1_4 && $genome_size < $gb_10) {
+        # Large genome: sample 800MB in 200KB chunks
+        my $strategy = "sample_800mb";
+        my $sample_size = 800 * 1024 * 1024;  # 800MB
+        my $num_samples = $sample_size / $kb_200;  # 4000 samples
+        return ($strategy, $sample_size, $kb_200, $num_samples);
+    }
+    else {
+        # Very large genome (>10GB): sample 1GB in 200KB chunks
+        my $strategy = "sample_1gb";
+        my $sample_size = 1024 * 1024 * 1024;  # 1GB
+        my $num_samples = int($sample_size / $kb_200);  # 5120 samples
+        return ($strategy, $sample_size, $kb_200, $num_samples);
+    }
+}
+
+sub process_genome_by_strategy {
+    my ($strategy, $sample_times, $batch_size) = @_;
+    
+    $logger->info("Processing genome with strategy: $strategy");
+    
+    if ($strategy eq "fragment_all") {
+        fragment_entire_genome($batch_size);
+    }
+    elsif ($strategy eq "sample_600mb" || $strategy eq "sample_800mb" || $strategy eq "sample_1gb") {
+        sample_genome_chunks($sample_times, $batch_size);
+    }
+    else {
+        die "Unknown sampling strategy: $strategy\n";
+    }
+}
+
+sub fragment_entire_genome {
+    my ($fragment_size) = @_;
+    
+    $logger->info("Fragmenting entire genome into ${fragment_size}bp pieces...");
+    
+    # For small genomes, we should just copy the whole genome
+    # since fragmenting sequences shorter than fragment_size would result in empty output
+    my $genome_size = -s $config{genome_file};
+    
+    if ($genome_size < $fragment_size) {
+        # If genome is smaller than fragment size, just copy it as is
+        $logger->info("Genome smaller than fragment size, using entire genome");
+        my $cmd = "cp $config{genome_file} $config{tmp_dir}/tmp.fa";
+        run_cmd($cmd);
+    } else {
+        # Use seqkit sliding with step size = 1/10 of window to ensure coverage
+        # This creates overlapping fragments for better repeat detection
+        my $step_size = int($fragment_size / 10);
+        $step_size = $step_size > 0 ? $step_size : 1;
+        
+        my $cmd = join(" ",
+            "seqkit sliding",
+            "-s $step_size",           # Step size for overlap
+            "-W $fragment_size",       # Window size = fragment size
+            "-g",                      # Remove gap characters in sequences
+            "$config{genome_file}",
+            "> $config{tmp_dir}/tmp.fa"
+        );
+        
+        run_cmd($cmd);
+    }
+    
+    $logger->info("Genome fragmentation completed");
+}
+
+sub sample_genome_chunks {
+    my ($num_samples, $chunk_size) = @_;
+    
+    $logger->info("Sampling $num_samples chunks of ${chunk_size}bp from genome...");
+    
+    # First create an index if it doesn't exist
+    unless (-f "$config{genome_file}.fai") {
+        run_cmd("samtools faidx $config{genome_file}");
+    }
+    
+    # Use custom sampling function
+    sample_random_chunks($config{genome_file}, $num_samples, $chunk_size, "$config{tmp_dir}/tmp.fa");
+    
+    $logger->info("Random chunk sampling completed");
+}
+
+sub sample_random_chunks {
+    my ($genome_file, $num_samples, $chunk_size, $output_file) = @_;
+    
+    # Read genome index to get sequence information
+    my @sequences;
+    open(my $fai_fh, '<', "$genome_file.fai") or die "Cannot read fai file: $!\n";
+    while (my $line = <$fai_fh>) {
+        chomp $line;
+        my ($seq_name, $length) = split(/\t/, $line);
+        # Include all sequences, even those shorter than chunk size
+        push @sequences, {name => $seq_name, length => $length};
+    }
+    close($fai_fh);
+    
+    die "No sequences long enough for sampling\n" unless @sequences;
+    
+    # Calculate total available length
+    my $total_length = 0;
+    for my $seq (@sequences) {
+        if ($seq->{length} >= $chunk_size) {
+            $total_length += $seq->{length} - $chunk_size + 1;  # Available positions for sampling
+        } else {
+            $total_length += 1;  # Can use the whole sequence as one sample
+        }
+    }
+    
+    $logger->info("Total sequences: " . scalar(@sequences));
+    $logger->info("Total available positions: $total_length");
+    
+    # Generate random sampling positions
+    my @samples;
+    my $attempts = 0;
+    my $max_attempts = $num_samples * 10;
+    
+    while (@samples < $num_samples && $attempts < $max_attempts) {
+        $attempts++;
+        
+        # Randomly select a sequence weighted by length
+        my $rand_pos = int(rand($total_length));
+        my $cumulative = 0;
+        my $selected_seq;
+        
+        for my $seq (@sequences) {
+            my $available_positions;
+            if ($seq->{length} >= $chunk_size) {
+                $available_positions = $seq->{length} - $chunk_size + 1;
+            } else {
+                $available_positions = 1;  # Can only take the whole sequence
+            }
+            $cumulative += $available_positions;
+            if ($rand_pos < $cumulative) {
+                $selected_seq = $seq;
+                last;
+            }
+        }
+        
+        next unless $selected_seq;
+        
+        # Handle position selection based on sequence length
+        my ($start_pos, $end_pos);
+        if ($selected_seq->{length} >= $chunk_size) {
+            # Random position within selected sequence
+            my $max_start = $selected_seq->{length} - $chunk_size;
+            $start_pos = int(rand($max_start)) + 1;  # 1-based coordinates
+            $end_pos = $start_pos + $chunk_size - 1;
+        } else {
+            # For sequences shorter than chunk size, take the whole sequence
+            $start_pos = 1;
+            $end_pos = $selected_seq->{length};
+        }
+        
+        # Create sample entry
+        my $sample_id = sprintf("sample_%04d_%s_%d_%d", 
+                               scalar(@samples), $selected_seq->{name}, $start_pos, $end_pos);
+        
+        push @samples, {
+            id => $sample_id,
+            seq => $selected_seq->{name},
+            start => $start_pos,
+            end => $end_pos
+        };
+        
+        if (@samples % 500 == 0) {
+            $logger->info("Generated " . scalar(@samples) . " / $num_samples samples");
+        }
+    }
+    
+    $logger->info("Generated " . scalar(@samples) . " samples total");
+    
+    # Extract sequences using samtools faidx
+    open(my $out_fh, '>', $output_file) or die "Cannot create output file: $!\n";
+    
+    for my $sample (@samples) {
+        my $region = "$sample->{seq}:$sample->{start}-$sample->{end}";
+        my $seq_data = `samtools faidx $genome_file $region`;
+        
+        if ($seq_data) {
+            # Replace header with our sample ID
+            $seq_data =~ s/^>[^\n]+/>$sample->{id}/;
+            print $out_fh $seq_data;
+        }
+    }
+    
+    close($out_fh);
+    $logger->info("Sequence extraction completed");
 }
 
 sub run_cmd {

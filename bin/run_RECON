@@ -9,149 +9,69 @@ use constant {
     MIN_THREADS => 1,
     DEFAULT_EVALUE => '1e-5',
     BLAST_DB_TYPE => 'nucl',
-    MIN_PREDETECT_SIZE => 10000000,  # 10Mb
-    MAX_PREDETECT_SIZE => 40000000,  # 40Mb
-    TE_THRESHOLD => 30,              # 30% TE content threshold
-    MAX_REDUCED_SAMPLE => 256000000  # 256Mb cap for reduced sampling
 };
 
-die "Usage: $0 round_num threads genome_file genome_size batch_size\n"
-    unless @ARGV == 5;
+# Utility functions
+sub min { return $_[0] < $_[1] ? $_[0] : $_[1]; }
+sub max { return $_[0] > $_[1] ? $_[0] : $_[1]; }
 
-my ($round_num, $threads, $genome_file, $genome_size, $batch_size) = @ARGV;
+die "Usage: $0 round_num threads genome_file genome_size\n"
+    unless @ARGV == 4;
+
+my ($round_num, $threads, $genome_file, $genome_size) = @ARGV;
 
 die "Round number must be positive\n" unless $round_num > 0;
 die "Threads must be at least " . MIN_THREADS . "\n" unless $threads >= MIN_THREADS;
 die "Genome file $genome_file not found\n" unless -f $genome_file;
 die "Invalid genome size\n" unless $genome_size =~ /^\d+$/;
-die "Invalid batch size\n" unless $batch_size =~ /^\d+$/;
 
-# Create directory structure
+# Convert genome_file to absolute path before any operations
+my $abs_genome_file = File::Spec->rel2abs($genome_file);
+
+my $cpu_threads = int($threads/4);
+$cpu_threads = MIN_THREADS if $cpu_threads < MIN_THREADS;
+
+# Use Refiner-generated masked genome directly without splitting
+print "Using Refiner-generated masked genome directly without splitting\n";
+
+# Step 1: Extract unmasked regions first
+print "\nStep 1: Extracting unmasked regions from masked genome...\n";
+my $unmasked_file = extract_unmasked_regions($abs_genome_file);
+
+if (!-s $unmasked_file || -s $unmasked_file < 1000) {
+    die "ERROR: No significant unmasked regions found in $abs_genome_file\n";
+}
+
+# Step 2: Process unmasked regions directly without splitting
+my $unmasked_size = -s $unmasked_file;
+print "\nStep 2: Processing unmasked regions directly...\n";
+print "Unmasked regions file size: " . sprintf("%.1f MB\n", $unmasked_size / (1024 * 1024));
+
+# Always process as single file without splitting
 my $tmp_dir = "round-$round_num";
 make_path($tmp_dir) unless -d $tmp_dir;
 chdir $tmp_dir or die "Cannot change to directory $tmp_dir: $!\n";
 
-my $times = int($genome_size / $batch_size);
-my $cpu_threads = int($threads/4);
-$cpu_threads = MIN_THREADS if $cpu_threads < MIN_THREADS;
+run_single_file_recon($unmasked_file, $threads);
 
-# Run the pre-detection step and get TE percentage
-my $te_percentage = run_predetection($genome_file, $cpu_threads);
-print "Pre-detection TE percentage: $te_percentage%\n";
+chdir "..";
 
-# Adjust sampling based on pre-detection results
-my $adjusted_times = $times;
-if ($te_percentage < TE_THRESHOLD) {
-    # Calculate new times based on reduced sample size (max 256Mb)
-    my $reduced_sample_size = MAX_REDUCED_SAMPLE;
-    # If original sample is smaller than the cap, keep it
-    if ($genome_size < MAX_REDUCED_SAMPLE) {
-        $reduced_sample_size = $genome_size;
-    }
-    $adjusted_times = int($reduced_sample_size / $batch_size);
-    print "Low TE content detected ($te_percentage%). Reducing sample size to " . 
-          ($adjusted_times * $batch_size) . " bytes\n";
-} else {
-    print "Sufficient TE content detected ($te_percentage%). Using original sample size\n";
-}
-
-# Continue with regular processing using adjusted sample size
-process_repeat_masker($genome_file, $cpu_threads, $adjusted_times, $batch_size, $te_percentage);
-process_blast_db($threads, $genome_file);
-run_recon_pipeline();
-build_final_output($threads);
-
-my $ok_file = "../round-${round_num}.ok";
+my $ok_file = "round-${round_num}.ok";
 open(my $fh_ok, '>', $ok_file) or die "Cannot create $ok_file: $!\n";
 close $fh_ok;
 
-chdir "../";
-
 exit 0;
 
-# New function for pre-detection step
-sub run_predetection {
-    my ($genome_file, $cpu_threads) = @_;
-    
-    print "Starting pre-detection for TE content...\n";
-    
-    # Create predetect directory
-    make_path("predetect") unless -d "predetect";
-    
-    # Calculate 1% of genome size
-    my $total_size = `wc -c < $genome_file`;
-    chomp($total_size);
-    my $sample_size = int($total_size * 0.01);
-    
-    # Apply min/max constraints
-    if ($sample_size < MIN_PREDETECT_SIZE) {
-        $sample_size = MIN_PREDETECT_SIZE;
-    } elsif ($sample_size > MAX_PREDETECT_SIZE) {
-        $sample_size = MAX_PREDETECT_SIZE;
-    }
-    
-    print "Pre-detection sample size: $sample_size bytes\n";
-    
-    # Calculate number of regions to sample evenly
-    my $region_size = 10000; # 10kb regions
-    my $num_regions = int($sample_size / $region_size);
-    
-    # Create evenly distributed bed file for sampling
-    run_cmd("sample_for_genome $genome_file.fai predetect/sample.bed $num_regions $region_size");
-    
-    # Extract sequences
-    run_cmd("seqtk subseq $genome_file predetect/sample.bed > predetect/sample.fa");
-    
-    # Run RepeatMasker with -div 20
-    run_cmd("RepeatMasker -lib ../raw.fa -e rmblast -lcambig -dir predetect " . 
-            "-pa $cpu_threads -q predetect/sample.fa -div 20 > predetect/rm.log 2>&1");
-    
-    # Parse RepeatMasker output to get TE percentage
-    my $te_percentage = 0;
-    if (-e "predetect/sample.fa.tbl") {
-        # Extract total masked bases from tbl file
-        my $tbl_output = `grep "bases masked" predetect/sample.fa.tbl`;
-        print "RepeatMasker output: $tbl_output\n";
-        # Match the actual format: "bases masked: XXXX bp ( XX.XX %)"
-        if ($tbl_output =~ /\(\s*([0-9.]+)\s*%\s*\)/) {
-            $te_percentage = $1;
-            print "Successfully extracted TE percentage: $te_percentage%\n";
-        } else {
-            print "Warning: Could not parse TE percentage from: $tbl_output\n";
-        }
-    } else {
-        print "Warning: RepeatMasker tbl file not found. Using default TE percentage.\n";
-    }
-    
-    return $te_percentage;
-}
-
-sub process_repeat_masker {
-    my ($genome_file, $cpu_threads, $times, $batch_size, $te_percentage) = @_;
-    
-    return if -e "repeat/tmp.fa.tbl";
-    
-    run_cmd("sample_for_genome $genome_file.fai out.bed $times $batch_size");
-    run_cmd("seqtk subseq $genome_file out.bed > tmp.fa");
-    run_cmd("renameTE TE ../raw.fa ../re.fa");
-    
-    system("Refiner_for_LTR ../re.fa ./ --threads $threads > refine.log 2> refine.err") == 0 
-        or die "Failed to Combine LTR & RepeatScout\n";
-    
-    `mv consensi.fa lib.fa`;
-    
-    # Use -div 10 for the main RepeatMasker run (keeping original parameter)
-    run_cmd("RepeatMasker -lib lib.fa -e rmblast -lcambig -dir repeat " . 
-            "-pa $cpu_threads -q tmp.fa -div 15 > rm.log 2>&1");
-}
 
 sub process_blast_db {
     my ($threads,$genome_file) = @_;
     return if -e "msp.out";
     
-    my %id_mapping = load_translation_table($genome_file);
+    # No need for translation table as IDs already contain genomic coordinates
+    # The unmasked regions file already has proper IDs like chr4_164248806_164248906
     
-    process_masked_file(\%id_mapping);
+    print "Creating BLAST database from unmasked regions\n";
+    process_unmasked_file_for_blast("tmp.fa");
     
     run_cmd("makeblastdb -in DB.fa -dbtype " . BLAST_DB_TYPE . 
             " -parse_seqids -out DB");
@@ -213,50 +133,156 @@ sub process_edge_redefinition {
     create_symlinks('edge_redef_res', undef);
 }
 
-sub load_translation_table {
-    my ($genome_file) = @_;
-    my %id_mapping;
+# Translation table no longer needed as we embed genomic coordinates directly in sequence IDs
+
+
+sub extract_unmasked_regions {
+    my ($masked_file) = @_;
     
-    # Update the path to look in the genome directory for the translation file
-    my $translation_file = dirname($genome_file) . "/genome.fa.translation";
+    print "Extracting unmasked regions from: $masked_file\n";
     
-    open(my $fh_trans, '<', $translation_file) 
-        or die "Cannot open translation file: $translation_file: $!\n";
-        
-    while(<$fh_trans>) {
-        chomp;
-        my ($key, $value) = split(/\t/);
-        $id_mapping{$key} = $value;
+    my $output_file = "unmasked_regions.fa";
+    
+    open(my $fh_in, '<', $masked_file) 
+        or die "Cannot open $masked_file: $!\n";
+    open(my $fh_out, '>', $output_file) 
+        or die "Cannot open $output_file: $!\n";
+    
+    my $current_seq = "";
+    my $current_header = "";
+    my $total_seqs = 0;
+    my $total_regions = 0;
+    my $start_time = time();
+    
+    # Buffer for batch writing
+    my $output_buffer = "";
+    my $max_buffer_size = 1024 * 1024;  # 1MB buffer
+    
+    while (my $line = <$fh_in>) {
+        chomp $line;
+        if($line =~ /^>(.*)/) {
+            # Process previous sequence if exists
+            if ($current_header && $current_seq) {
+                my $regions_found = extract_and_map_regions(\$output_buffer, $current_header, $current_seq);
+                $total_regions += $regions_found;
+                $total_seqs++;
+                
+                # Flush buffer if it's getting large
+                if (length($output_buffer) > $max_buffer_size) {
+                    print $fh_out $output_buffer;
+                    $output_buffer = "";
+                }
+            }
+            
+            # Start new sequence
+            $current_header = $1;
+            $current_seq = "";
+        } else {
+            $current_seq .= $line;
+        }
     }
-    close $fh_trans;
-    return %id_mapping;
+    
+    # Process last sequence
+    if ($current_header && $current_seq) {
+        my $regions_found = extract_and_map_regions(\$output_buffer, $current_header, $current_seq);
+        $total_regions += $regions_found;
+        $total_seqs++;
+    }
+    
+    # Flush remaining buffer
+    print $fh_out $output_buffer if $output_buffer;
+    
+    close($fh_in);
+    close($fh_out);
+    
+    my $elapsed = time() - $start_time;
+    print "Processed $total_seqs sequences, extracted $total_regions unmasked regions (>=50bp) in ${elapsed}s\n";
+    
+    return $output_file;
 }
 
-sub process_masked_file {
-    my ($id_mapping_ref) = @_;
+sub process_unmasked_file_for_blast {
+    my ($unmasked_file) = @_;
     
-    open(my $fh_in, '<', "repeat/tmp.fa.masked") 
-        or die "Cannot open tmp.fa.masked: $!\n";
-    open(my $fh_out, '>', "DB.fa") 
-        or die "Cannot open DB.fa: $!\n";
+    print "Preparing BLAST database from: $unmasked_file\n";
+    
+    # Convert unmasked regions to BLAST format with gi numbers
+    open(my $fh_in, '<', $unmasked_file) or die "Cannot open $unmasked_file: $!\n";
+    open(my $fh_out, '>', "DB.fa") or die "Cannot open DB.fa: $!\n";
     
     my $counter = 1;
     while (my $line = <$fh_in>) {
-        chomp $line;
-        if($line =~ /^>/) {
-            $line =~ s/^>//;
-            my @arr = split(/:/, $line);
-            print $fh_out ">gi|${counter} gi|" . 
-                  $id_mapping_ref->{$arr[0]} . ":" . 
-                 $arr[1] . "\n";
+        if ($line =~ /^>(.*)/) {
+            my $header = $1;
+            # Convert chr4_164248806_164248906 format to BLAST format
+            print $fh_out ">gi|$counter gi|$header\n";
             $counter++;
         } else {
-            print $fh_out "$line\n";
+            print $fh_out $line;
         }
     }
-    close $fh_in;
-    close $fh_out;
+    
+    close($fh_in);
+    close($fh_out);
+    
+    my $seq_count = $counter - 1;
+    print "Created BLAST database with $seq_count unmasked region sequences\n";
 }
+
+sub extract_and_map_regions {
+    my ($buffer_ref, $header, $sequence) = @_;
+    
+    # Parse the header to extract genomic coordinates
+    # Expected format: sample_0000_chr4_164248806_164453605 preliminary masked
+    my ($chr, $start_pos, $end_pos);
+    if ($header =~ /sample_\d+_(chr\w+)_(\d+)_(\d+)/) {
+        $chr = $1;
+        $start_pos = $2;
+        $end_pos = $3;
+    } else {
+        # Fallback: use the whole header as chromosome name
+        $chr = $header;
+        $start_pos = 1;
+        $end_pos = length($sequence);
+    }
+    
+    # Split sequence into unmasked regions (uppercase ATCG only)
+    my @regions;
+    
+    # Match only uppercase ATCG regions (not N, not lowercase)
+    while ($sequence =~ /([ATCG]+)/g) {
+        my $match = $1;
+        my $relative_start = $-[0];  # 0-based position in the sequence
+        my $relative_end = $+[0];     # 0-based exclusive end
+        
+        if (length($match) >= 50) {  # Only keep regions >= 50bp
+            # Calculate actual genomic coordinates
+            my $actual_start = $start_pos + $relative_start;
+            my $actual_end = $start_pos + $relative_end - 1;  # Convert to inclusive end
+            
+            push @regions, {
+                chr => $chr,
+                start => $actual_start,
+                end => $actual_end,
+                seq => $match
+            };
+        }
+    }
+    
+    # Output each unmasked region with correct genomic coordinates
+    foreach my $region (@regions) {
+        # Create ID that reflects true genomic position
+        my $region_id = $region->{chr} . "_" . $region->{start} . "_" . $region->{end};
+        $$buffer_ref .= ">" . $region_id . "\n";
+        $$buffer_ref .= $region->{seq} . "\n";
+    }
+    
+    # Return number of regions found for statistics
+    return scalar(@regions);
+}
+
+# Functions removed: process_masked_sequence and convert_to_blast_format
+# No longer needed with the new unmasked region extraction approach
 
 sub create_seq_name_list {
     run_cmd("grep '>' DB.fa | wc -l > seq_name.list");
@@ -298,7 +324,40 @@ sub move_gmon {
 
 sub build_final_output {
     my ($threads) = @_;
-    run_cmd("build_for_RECON ./ ../../genome/genome.fa $threads");
+    # Get absolute path to the genome file
+    my $main_output_dir = File::Spec->rel2abs("../..");
+    my $genome_file = File::Spec->catfile($main_output_dir, "genome", "genome.fa");
+    run_cmd("build_for_RECON ./ $genome_file $threads");
+}
+
+# Removed functions for simplified direct processing:
+# - read_annotation_ratio_from_refiner: No sampling needed
+# - calculate_annotation_ratio: No sampling needed
+# - determine_split_count_for_unmasked: No longer splitting files
+# - split_unmasked_file: Processing entire unmasked_regions.fa directly
+# - run_multi_split_recon: No parallel split processing needed
+# - start_blast_phase/start_recon_phase: No forking required
+# - merge_recon_results: No merging of multiple rounds
+
+sub run_single_file_recon {
+    my ($genome_file, $threads) = @_;
+    
+    # Process single file in current directory
+    # genome_file is the unmasked regions file
+    my $abs_genome_file;
+    if (File::Spec->file_name_is_absolute($genome_file)) {
+        $abs_genome_file = $genome_file;
+    } else {
+        $abs_genome_file = File::Spec->rel2abs("../$genome_file");
+    }
+    
+    run_cmd("ln -sf $abs_genome_file tmp.fa");
+    
+    # Run complete BLAST and RECON pipeline
+    # Note: process_blast_db now expects pre-extracted unmasked regions
+    process_blast_db($threads, $abs_genome_file);
+    run_recon_pipeline();
+    build_final_output($threads);
 }
 
 sub run_cmd {
