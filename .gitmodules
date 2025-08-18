@@ -1,0 +1,6 @@
+[submodule "submodule/Inpactor2"]
+	path = submodule/Inpactor2
+	url = https://github.com/unavailable-2374/Inpactor2.git
+[submodule "submodule/ClassifyTE"]
+	path = submodule/ClassifyTE
+	url = https://github.com/manisa/ClassifyTE.git
