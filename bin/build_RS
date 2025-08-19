@@ -30,7 +30,8 @@ my %config = (
     threads => 4,
     sample_size => 'all',
     rmblast_dir => undef,
-    work_dir => undef
+    work_dir => undef,
+    force_overwrite => 0
 );
 
 # Parse and validate arguments
@@ -53,7 +54,8 @@ sub get_and_validate_args {
         'genome=s'      => \$config{genome_file},
         'threads=i'     => \$config{threads},
         'sample=s'      => \$config{sample_size},
-        'workdir=s'     => \$config{work_dir}
+        'workdir=s'     => \$config{work_dir},
+        'force|f'       => \$config{force_overwrite}
     ) or pod2usage(2);
 
     pod2usage(1) if $help;
@@ -95,6 +97,7 @@ sub get_and_validate_args {
     $logger->info("  Threads: $config{threads}");
     $logger->info("  Working directory: $config{work_dir}");
     $logger->info("  RMBlast directory: $config{rmblast_dir}");
+    $logger->info("  Force overwrite: " . ($config{force_overwrite} ? "Yes" : "No"));
 }
 
 sub locate_rmblastn {
@@ -144,8 +147,88 @@ sub setup_environment {
     $logger->info("Changed to working directory: " . getcwd());
 }
 
+sub should_skip_existing_file {
+    my ($filepath, $description) = @_;
+    
+    # Never skip if force overwrite is enabled
+    return 0 if $config{force_overwrite};
+    
+    # Check if file exists and is valid
+    if (-s $filepath) {
+        my $header_check = `head -1 "$filepath" 2>/dev/null`;
+        if ($header_check && $header_check =~ /^>/) {
+            my $size = -s $filepath;
+            $logger->info("Found existing $description: $filepath ($size bytes)");
+            return 1;
+        } else {
+            $logger->warn("Existing $description appears invalid, will regenerate: $filepath");
+            return 0;
+        }
+    }
+    return 0;
+}
+
+sub check_existing_outputs {
+    my ($final_consensus, $refiner_consensus, $refiner_masked_genome) = @_;
+    
+    # Skip check if force overwrite is enabled
+    if ($config{force_overwrite}) {
+        $logger->info("Force overwrite enabled, will regenerate all outputs");
+        return 0;
+    }
+    
+    # Check if all key output files exist and are valid
+    my @required_files = (
+        {path => $final_consensus, desc => "Final consensus sequences"},
+        {path => $refiner_consensus, desc => "Refiner consensus sequences"},
+        {path => $refiner_masked_genome, desc => "Refiner masked genome"}
+    );
+    
+    my $all_exist = 1;
+    my @missing_files;
+    
+    for my $file (@required_files) {
+        if (-s $file->{path}) {
+            # File exists and has content, check if it's a valid FASTA
+            my $header_check = `head -1 "$file->{path}" 2>/dev/null`;
+            if ($header_check && $header_check =~ /^>/) {
+                my $size = -s $file->{path};
+                $logger->info("Found existing $file->{desc}: $file->{path} (size: $size bytes)");
+            } else {
+                $logger->warn("$file->{desc} exists but appears invalid: $file->{path}");
+                push @missing_files, $file->{desc};
+                $all_exist = 0;
+            }
+        } else {
+            $logger->info("Missing $file->{desc}: $file->{path}");
+            push @missing_files, $file->{desc};
+            $all_exist = 0;
+        }
+    }
+    
+    if ($all_exist) {
+        $logger->info("All required output files are present and valid");
+        return 1;
+    } else {
+        $logger->info("Missing or invalid files: " . join(", ", @missing_files));
+        $logger->info("Will run pipeline to generate missing outputs");
+        return 0;
+    }
+}
+
 sub run_pipeline {
     $logger->info("Starting RepeatScout pipeline...");
+
+    # Check for existing final outputs first
+    my $final_consensus = "$config{work_dir}/consensi.fa";
+    my $refiner_output_dir = "$config{work_dir}/refiner_output";
+    my $refiner_consensus = "$refiner_output_dir/consensus_masking.fa";
+    my $refiner_masked_genome = "$refiner_output_dir/genome_final_masked.fa";
+    
+    if (check_existing_outputs($final_consensus, $refiner_consensus, $refiner_masked_genome)) {
+        $logger->info("All required output files already exist and are valid, pipeline completed");
+        return;
+    }
 
     # Get genome size and calculate parameters
     my $genome_size = -s $config{genome_file};
@@ -166,8 +249,11 @@ sub run_pipeline {
     $logger->info("Chunk size: " . sprintf("%.2f", $chunk_size/1e3) . " Kb");
     $logger->info("Number of parallel chunks: $num_chunks");
 
-    my $lmer_size = calculate_lmer_size($genome_size);
-    $logger->info("Calculated l-mer size: $lmer_size");
+    # Calculate lmer size based on actual data being processed, not full genome
+    my $effective_size = determine_effective_processing_size($sample_strategy, $sample_size, $num_chunks, $genome_size);
+    my $lmer_size = calculate_lmer_size($effective_size);
+    $logger->info("Calculated l-mer size: $lmer_size (based on effective processing size: " . 
+                  sprintf("%.2f", $effective_size/1e6) . " Mb)");
 
     # Check for RepeatScout results
     my $rs_consensus = "$config{tmp_dir}/repeats.fa";
@@ -206,14 +292,56 @@ sub run_pipeline {
     $logger->info("Pipeline completed successfully");
 }
 
+sub determine_effective_processing_size {
+    my ($strategy, $sample_size, $num_chunks, $genome_size) = @_;
+    
+    if ($strategy eq "fragment_all") {
+        # Processing entire genome
+        return $genome_size;
+    } elsif ($strategy eq "sample_single") {
+        # Processing single sample
+        return $sample_size;
+    } elsif ($strategy eq "sample_parallel") {
+        # Processing multiple samples in parallel - each chunk processed independently
+        # Use single chunk size for lmer calculation since each chunk is processed separately
+        return $sample_size;
+    } else {
+        # Fallback to genome size
+        return $genome_size;
+    }
+}
+
 sub calculate_lmer_size {
-    my ($genome_size) = @_;
-    return ceil(log($genome_size)/log(4) + 1);
+    my ($data_size) = @_;
+    
+    # Original formula: ceil(log4(data_size) + 1)
+    my $calculated_lmer = ceil(log($data_size)/log(4) + 1);
+    
+    # Apply bounds based on RepeatScout best practices:
+    # - Minimum: 14 (for very small data)
+    # - Maximum: 16 (for optimal performance and memory usage)
+    # - Sweet spot: 14-16 provides good balance of sensitivity and specificity
+    
+    if ($calculated_lmer < 14) {
+        return 14;  # Minimum for adequate specificity
+    } elsif ($calculated_lmer > 16) {
+        return 16;  # Maximum for reasonable memory usage and performance
+    } else {
+        return $calculated_lmer;
+    }
 }
 
 sub run_build_lmer_table {
     my ($lmer_size) = @_;
     my $freq_file = "$config{tmp_dir}/lmer.freq";
+
+    # Check if lmer frequency table already exists
+    if (!$config{force_overwrite} && -s $freq_file) {
+        my $size = -s $freq_file;
+        $logger->info("Found existing l-mer frequency table: $freq_file ($size bytes)");
+        $logger->info("Skipping l-mer table building");
+        return;
+    }
 
     $logger->info("Building l-mer frequency table (l=$lmer_size)...");
     
@@ -233,6 +361,12 @@ sub run_repeat_scout {
     my ($lmer_size) = @_;
     my $freq_file = "$config{tmp_dir}/lmer.freq";
     my $output = "$config{tmp_dir}/repeats.fa";
+
+    # Check if RepeatScout output already exists and is valid
+    if (should_skip_existing_file($output, "RepeatScout output")) {
+        $logger->info("Skipping RepeatScout");
+        return;
+    }
 
     $logger->info("Running RepeatScout...");
 
@@ -257,6 +391,12 @@ sub filter_repeats {
     my $input = "$config{tmp_dir}/repeats.fa";
     my $output = "$config{tmp_dir}/repeats.filtered.fa";
 
+    # Check if filtered output already exists and is valid
+    if (should_skip_existing_file($output, "filtered repeats")) {
+        $logger->info("Skipping repeat filtering");
+        return;
+    }
+
     $ENV{TRF_COMMAND} = which('trf');
     $ENV{RMBLAST_DIR} = $config{rmblast_dir};
 
@@ -271,6 +411,18 @@ sub refine_consensus {
     my $input = "$config{tmp_dir}/repeats.filtered.fa";
     my $output_dir = "$config{work_dir}/refiner_output";
     my $final_output = "$config{work_dir}/consensi.fa";
+
+    # Check if refinement outputs already exist and are valid
+    my $refiner_consensus = "$output_dir/consensus_masking.fa";
+    my $refiner_masked_genome = "$output_dir/genome_final_masked.fa";
+    
+    if (!$config{force_overwrite} && 
+        should_skip_existing_file($final_output, "final consensus") && 
+        should_skip_existing_file($refiner_consensus, "refiner consensus") && 
+        should_skip_existing_file($refiner_masked_genome, "masked genome")) {
+        $logger->info("All refinement outputs exist and are valid, skipping consensus refinement");
+        return;
+    }
 
     # Create required directories
     make_path($config{work_dir}) unless -d $config{work_dir};
@@ -301,7 +453,6 @@ sub refine_consensus {
         };
     
     # Check for the main output file from Refiner and copy it to expected location
-    my $refiner_consensus = "$output_dir/consensus_masking.fa";
     if (-f $refiner_consensus) {
         $logger->info("Copying refined consensus from $refiner_consensus to $final_output");
         system("cp '$refiner_consensus' '$final_output'") == 0
@@ -321,6 +472,14 @@ sub determine_refiner_genome_input {
     my $genome_size = -s $config{genome_file};
     my $gb_1_2 = 1.2 * 1024 * 1024 * 1024;  # 1.2GB
     
+    # First try to reuse existing RepeatScout chunk.fa files
+    my $reused_genome = reuse_existing_chunks($genome_size < $gb_1_2 ? 1 : 2);
+    if ($reused_genome) {
+        $logger->info("Successfully reused existing RepeatScout chunks for Refiner input");
+        return $reused_genome;
+    }
+    
+    # Fallback to original sampling strategy if chunks not available
     if ($genome_size < $gb_1_2) {
         # Small genome (<1.2Gb): use single sample
         $logger->info("Using single sample for Refiner input (genome < 1.2Gb)");
@@ -369,6 +528,61 @@ sub create_refiner_sample {
     
     $logger->info("Created Refiner genome input: $refiner_genome");
     return $refiner_genome;
+}
+
+sub reuse_existing_chunks {
+    my ($needed_chunks) = @_;
+    
+    my $refiner_genome = "$config{tmp_dir}/refiner_genome.fa";
+    
+    # Check if RepeatScout chunk.fa files exist and are valid
+    my @available_chunks;
+    for my $i (1..4) {  # Check up to 4 chunks (max number from parallel strategy)
+        my $chunk_file = "$config{tmp_dir}/chunk_$i/chunk.fa";
+        if (-s $chunk_file) {
+            # Verify it's a valid FASTA file
+            my $header_check = `head -1 "$chunk_file" 2>/dev/null`;
+            if ($header_check && $header_check =~ /^>/) {
+                push @available_chunks, $chunk_file;
+                $logger->info("Found valid RepeatScout chunk: $chunk_file");
+            }
+        }
+    }
+    
+    # Check if we have enough chunks for reuse
+    if (scalar(@available_chunks) >= $needed_chunks) {
+        $logger->info("Reusing " . scalar(@available_chunks) . " existing RepeatScout chunks (need $needed_chunks)");
+        
+        # Select the first N chunks we need
+        my @chunks_to_use = @available_chunks[0..($needed_chunks-1)];
+        
+        if ($needed_chunks == 1) {
+            # Single chunk: just copy it
+            my $cmd = "cp '$chunks_to_use[0]' '$refiner_genome'";
+            run_cmd($cmd);
+        } else {
+            # Multiple chunks: merge them
+            my @quoted_files = map { "'$_'" } @chunks_to_use;
+            my $cat_cmd = "cat " . join(" ", @quoted_files) . " > '$refiner_genome'";
+            system($cat_cmd) == 0 or do {
+                $logger->error("Failed to merge RepeatScout chunks for reuse");
+                return undef;
+            };
+        }
+        
+        # Verify the output file was created successfully
+        if (-s $refiner_genome) {
+            my $size = -s $refiner_genome;
+            $logger->info("Successfully created Refiner genome input from existing chunks: $refiner_genome ($size bytes)");
+            return $refiner_genome;
+        } else {
+            $logger->warn("Failed to create Refiner genome from existing chunks");
+            return undef;
+        }
+    } else {
+        $logger->info("Insufficient RepeatScout chunks for reuse (found: " . scalar(@available_chunks) . ", need: $needed_chunks)");
+        return undef;
+    }
 }
 
 sub which {
@@ -518,11 +732,36 @@ sub run_parallel_repeatscout {
         push @chunk_dirs, $chunk_dir;
     }
     
-    # Generate sampling for each chunk
+    # Generate sampling for each chunk (skip if existing and valid)
     my $num_samples_per_chunk = int($sample_size_per_chunk / $chunk_size);
     for my $i (1..$num_chunks) {
         my $chunk_dir = $chunk_dirs[$i-1];
         my $chunk_fa = "$chunk_dir/chunk.fa";
+        my $filtered_file = "$chunk_dir/repeats.filtered.fa";
+        
+        # Skip chunk generation if we already have a valid filtered result
+        if (!$config{force_overwrite} && -s $filtered_file) {
+            my $header_check = `head -1 "$filtered_file" 2>/dev/null`;
+            if ($header_check && $header_check =~ /^>/) {
+                my $size = -s $filtered_file;
+                $logger->info("Chunk $i: Found existing filtered results ($size bytes), skipping chunk generation");
+                next;
+            } else {
+                $logger->warn("Chunk $i: Existing filtered file appears invalid, will regenerate");
+            }
+        }
+        
+        # Skip chunk generation if we already have a valid chunk.fa
+        if (!$config{force_overwrite} && -s $chunk_fa) {
+            my $header_check = `head -1 "$chunk_fa" 2>/dev/null`;
+            if ($header_check && $header_check =~ /^>/) {
+                my $size = -s $chunk_fa;
+                $logger->info("Chunk $i: Found existing chunk file ($size bytes), skipping generation");
+                next;
+            } else {
+                $logger->warn("Chunk $i: Existing chunk file appears invalid, will regenerate");
+            }
+        }
         
         $logger->info("Generating chunk $i: $num_samples_per_chunk samples of ${chunk_size}bp");
         sample_random_chunks($config{genome_file}, $num_samples_per_chunk, $chunk_size, $chunk_fa);
@@ -543,6 +782,19 @@ sub run_parallel_repeatscout {
     # Fork and run RepeatScout for each chunk
     for my $i (1..$num_chunks) {
         my $chunk_dir = $chunk_dirs[$i-1];
+        my $filtered_file = "$chunk_dir/repeats.filtered.fa";
+        
+        # Check if this chunk already has valid results before forking
+        if (!$config{force_overwrite} && -s $filtered_file) {
+            my $header_check = `head -1 "$filtered_file" 2>/dev/null`;
+            if ($header_check && $header_check =~ /^>/) {
+                my $size = -s $filtered_file;
+                $logger->info("Chunk $i: Found existing filtered results ($size bytes), skipping processing");
+                next;
+            } else {
+                $logger->warn("Chunk $i: Existing filtered file appears invalid, will regenerate");
+            }
+        }
         
         $pm->start and next;  # Fork
         
@@ -553,22 +805,51 @@ sub run_parallel_repeatscout {
             my $repeats_file = "$chunk_dir/repeats.fa";
             my $filtered_file = "$chunk_dir/repeats.filtered.fa";
             
-            # Build lmer table for this chunk
-            $logger->info("Building lmer table for chunk $i...");
-            my $cmd = "build_lmer_table -l $lmer_size -sequence $chunk_fa -freq $freq_file 2> $chunk_dir/build_lmer.log";
-            system($cmd) == 0 or die "Failed to build lmer table for chunk $i: $?\n";
+            # Check if chunk.fa exists (should have been checked above, but safety check)
+            die "Chunk file missing: $chunk_fa\n" unless -s $chunk_fa;
             
-            # Run RepeatScout for this chunk
-            $logger->info("Running RepeatScout for chunk $i...");
-            $cmd = "RepeatScout -sequence $chunk_fa -output $repeats_file -freq $freq_file -l $lmer_size -tandemdist 50 -minthresh 3 2> $chunk_dir/repeatscout.log";
-            system($cmd) == 0 or die "Failed to run RepeatScout for chunk $i: $?\n";
+            # Build lmer table for this chunk (skip if exists and valid)
+            if (!$config{force_overwrite} && -s $freq_file) {
+                $logger->info("Found existing lmer table for chunk $i, skipping build_lmer_table");
+            } else {
+                $logger->info("Building lmer table for chunk $i...");
+                my $cmd = "build_lmer_table -l $lmer_size -sequence $chunk_fa -freq $freq_file 2> $chunk_dir/build_lmer.log";
+                system($cmd) == 0 or die "Failed to build lmer table for chunk $i: $?\n";
+            }
             
-            # Filter results for this chunk
-            $logger->info("Filtering repeats for chunk $i...");
-            $ENV{TRF_COMMAND} = which('trf');
-            $ENV{RMBLAST_DIR} = $config{rmblast_dir};
-            system("filter-stage-1.prl $repeats_file > $filtered_file 2> $chunk_dir/filter.log") == 0
-                or die "Failed to filter repeats for chunk $i: $?\n";
+            # Run RepeatScout for this chunk (skip if exists and valid)
+            if (!$config{force_overwrite} && -s $repeats_file) {
+                my $header_check = `head -1 "$repeats_file" 2>/dev/null`;
+                if ($header_check && $header_check =~ /^>/) {
+                    $logger->info("Found existing RepeatScout results for chunk $i, skipping RepeatScout");
+                } else {
+                    $logger->warn("Existing RepeatScout file appears invalid for chunk $i, will regenerate");
+                    goto run_repeatscout;
+                }
+            } else {
+                run_repeatscout:
+                $logger->info("Running RepeatScout for chunk $i...");
+                my $cmd = "RepeatScout -sequence $chunk_fa -output $repeats_file -freq $freq_file -l $lmer_size -tandemdist 50 -minthresh 3 2> $chunk_dir/repeatscout.log";
+                system($cmd) == 0 or die "Failed to run RepeatScout for chunk $i: $?\n";
+            }
+            
+            # Filter results for this chunk (skip if exists and valid)
+            if (!$config{force_overwrite} && -s $filtered_file) {
+                my $header_check = `head -1 "$filtered_file" 2>/dev/null`;
+                if ($header_check && $header_check =~ /^>/) {
+                    $logger->info("Found existing filtered results for chunk $i, skipping filtering");
+                } else {
+                    $logger->warn("Existing filtered file appears invalid for chunk $i, will regenerate");
+                    goto run_filter;
+                }
+            } else {
+                run_filter:
+                $logger->info("Filtering repeats for chunk $i...");
+                $ENV{TRF_COMMAND} = which('trf');
+                $ENV{RMBLAST_DIR} = $config{rmblast_dir};
+                system("filter-stage-1.prl $repeats_file > $filtered_file 2> $chunk_dir/filter.log") == 0
+                    or die "Failed to filter repeats for chunk $i: $?\n";
+            }
             
             $logger->info("Chunk $i completed successfully");
         };
@@ -594,14 +875,20 @@ sub merge_parallel_results {
     my ($chunk_dirs) = @_;
     
     my $merged_file = "$config{tmp_dir}/repeats.filtered.fa";
-    my $temp_merge = "$config{tmp_dir}/temp_merged.fa";
     
     # Collect all filtered results
     my @filtered_files;
     for my $chunk_dir (@$chunk_dirs) {
         my $filtered_file = "$chunk_dir/repeats.filtered.fa";
         if (-s $filtered_file) {
-            push @filtered_files, $filtered_file;
+            # Verify file contains sequences by checking for FASTA headers
+            my $header_check = `head -1 "$filtered_file" 2>/dev/null`;
+            if ($header_check && $header_check =~ /^>/) {
+                push @filtered_files, $filtered_file;
+                $logger->info("Found valid filtered results in $chunk_dir");
+            } else {
+                $logger->warn("Filtered file in $chunk_dir exists but appears empty or invalid");
+            }
         } else {
             $logger->warn("No filtered results found in $chunk_dir");
         }
@@ -609,82 +896,31 @@ sub merge_parallel_results {
     
     die "No filtered results found from any chunk\n" unless @filtered_files;
     
-    # Simple concatenation first
+    # Direct concatenation with proper file quoting
     $logger->info("Concatenating results from " . scalar(@filtered_files) . " chunks...");
-    my $cat_cmd = "cat " . join(" ", @filtered_files) . " > $temp_merge";
-    run_cmd($cat_cmd);
     
-    # Apply simple validation: keep sequences that appear in multiple chunks or are >2kb
-    $logger->info("Applying cross-validation and length filtering...");
-    validate_and_merge_sequences($temp_merge, $merged_file);
+    # Quote all filenames to handle spaces and special characters
+    my @quoted_files = map { "'$_'" } @filtered_files;
+    my $cat_cmd = "cat " . join(" ", @quoted_files) . " > '$merged_file'";
     
-    # Clean up temp file
-    unlink $temp_merge;
+    # Use system call instead of run_cmd to avoid string escaping issues
+    $logger->info("Executing merge command: $cat_cmd");
+    my $result = system($cat_cmd);
+    if ($result != 0) {
+        $logger->error("Failed to merge chunk results: exit code " . ($result >> 8));
+        die "Failed to merge chunk results\n";
+    }
     
-    $logger->info("Results merging completed");
+    # Verify the merged file was created successfully
+    if (-s $merged_file) {
+        my $merged_size = -s $merged_file;
+        $logger->info("Results merging completed successfully - merged file size: $merged_size bytes");
+    } else {
+        $logger->error("Merged file is empty or was not created");
+        die "Merged file is empty or was not created\n";
+    }
 }
 
-sub validate_and_merge_sequences {
-    my ($input_file, $output_file) = @_;
-    
-    # Read all sequences and count occurrences
-    my %seq_count;
-    my %seq_data;
-    
-    open(my $in_fh, '<', $input_file) or die "Cannot read $input_file: $!\n";
-    my $current_id;
-    my $current_seq = "";
-    
-    while (my $line = <$in_fh>) {
-        chomp $line;
-        if ($line =~ /^>(.+)/) {
-            # Process previous sequence
-            if ($current_id && $current_seq) {
-                my $seq_key = uc($current_seq);
-                $seq_count{$seq_key}++;
-                $seq_data{$seq_key} = {id => $current_id, seq => $current_seq};
-            }
-            # Start new sequence
-            $current_id = $1;
-            $current_seq = "";
-        } else {
-            $current_seq .= $line;
-        }
-    }
-    
-    # Process last sequence
-    if ($current_id && $current_seq) {
-        my $seq_key = uc($current_seq);
-        $seq_count{$seq_key}++;
-        $seq_data{$seq_key} = {id => $current_id, seq => $current_seq};
-    }
-    close($in_fh);
-    
-    # Write validated sequences
-    open(my $out_fh, '>', $output_file) or die "Cannot create $output_file: $!\n";
-    
-    my $kept_count = 0;
-    my $total_count = scalar(keys %seq_data);
-    
-    for my $seq_key (keys %seq_data) {
-        my $count = $seq_count{$seq_key};
-        my $length = length($seq_key);
-        
-        # Keep sequence if:
-        # 1. Found in multiple chunks (count > 1), OR
-        # 2. Length > 2000bp (likely real repeat)
-        if ($count > 1 || $length > 2000) {
-            my $data = $seq_data{$seq_key};
-            print $out_fh ">$data->{id}_validated_c${count}_l${length}\n";
-            print $out_fh "$data->{seq}\n";
-            $kept_count++;
-        }
-    }
-    
-    close($out_fh);
-    
-    $logger->info("Validation complete: kept $kept_count / $total_count sequences");
-}
 
 sub sample_random_chunks {
     my ($genome_file, $num_samples, $chunk_size, $output_file) = @_;
