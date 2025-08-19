@@ -922,7 +922,7 @@ sub merge_parallel_results {
 }
 
 
-sub sample_random_chunks {
+sub sample_random_chunks_legacy {
     my ($genome_file, $num_samples, $chunk_size, $output_file) = @_;
     
     # Read genome index to get sequence information
@@ -1027,6 +1027,125 @@ sub sample_random_chunks {
     
     close($out_fh);
     $logger->info("Sequence extraction completed");
+}
+
+sub sample_random_chunks {
+    my ($genome_file, $num_samples, $chunk_size, $output_file) = @_;
+    
+    $logger->info("Using optimized seqkit-based parallel chunk generation...");
+    
+    # Check if seqkit is available, fallback to legacy method if not
+    unless (check_seqkit_available()) {
+        $logger->warn("seqkit not available, falling back to legacy sampling method");
+        return sample_random_chunks_legacy($genome_file, $num_samples, $chunk_size, $output_file);
+    }
+    
+    # Calculate sampling ratio based on genome size and required samples
+    my $genome_size = -s $genome_file;
+    my $total_needed = $num_samples * $chunk_size;
+    my $sample_ratio = sprintf("%.6f", ($total_needed * 1.5) / $genome_size);  # 1.5x buffer for better coverage
+    $sample_ratio = 1.0 if $sample_ratio > 1.0;
+    
+    $logger->info("Genome size: " . sprintf("%.2f", $genome_size/1e6) . " Mb");
+    $logger->info("Target samples: $num_samples, chunk size: $chunk_size bp");
+    $logger->info("Sample ratio: $sample_ratio");
+    
+    # Create temporary file for intermediate results
+    my $temp_sampled = "$config{tmp_dir}/temp_sampled_$$.fa";
+    
+    eval {
+        # Stage 1: Random sampling from genome
+        $logger->info("Stage 1: Random genome sampling...");
+        my $sample_cmd = join(" ",
+            "seqkit sample",
+            "--threads $config{threads}",
+            "-p $sample_ratio",
+            "-s 42",  # Fixed random seed for reproducibility
+            "\"$genome_file\"",
+            "> \"$temp_sampled\""
+        );
+        
+        run_cmd($sample_cmd);
+        
+        # Check if we have enough data from sampling
+        my $sampled_size = -s $temp_sampled;
+        if ($sampled_size < ($total_needed * 0.8)) {
+            $logger->warn("Initial sampling yielded less data than expected, using sliding window approach");
+            
+            # Stage 2a: Sliding window on sampled sequences
+            my $temp_windowed = "$config{tmp_dir}/temp_windowed_$$.fa";
+            my $step_size = int($chunk_size / 4);  # 25% step size for good coverage
+            $step_size = 1000 if $step_size < 1000;  # Minimum step size
+            
+            my $sliding_cmd = join(" ",
+                "seqkit sliding",
+                "-s $step_size",
+                "-W $chunk_size",
+                "--threads $config{threads}",
+                "\"$temp_sampled\"",
+                "> \"$temp_windowed\""
+            );
+            
+            run_cmd($sliding_cmd);
+            unlink $temp_sampled;
+            $temp_sampled = $temp_windowed;
+        }
+        
+        # Stage 3: Final random selection to get exact number of samples
+        $logger->info("Stage 2: Final sample selection...");
+        my $final_cmd = join(" ",
+            "seqkit sample",
+            "--threads $config{threads}",
+            "-n $num_samples",
+            "-s 43",  # Different seed for final selection
+            "\"$temp_sampled\"",
+            "> \"$output_file\""
+        );
+        
+        run_cmd($final_cmd);
+        
+        # Verify output
+        my $output_size = -s $output_file;
+        if ($output_size > 0) {
+            my $seq_count = `seqkit stat -T "$output_file" | tail -n 1 | cut -f 4`;
+            chomp $seq_count;
+            $logger->info("Successfully generated $seq_count sequences (target: $num_samples)");
+            $logger->info("Output file size: " . sprintf("%.2f", $output_size/1e6) . " Mb");
+        } else {
+            die "Output file is empty or was not created properly\n";
+        }
+        
+    };
+    
+    my $error = $@;
+    
+    # Cleanup temporary files
+    unlink $temp_sampled if -f $temp_sampled;
+    
+    if ($error) {
+        $logger->error("Optimized chunk generation failed: $error");
+        $logger->info("Falling back to legacy sampling method");
+        return sample_random_chunks_legacy($genome_file, $num_samples, $chunk_size, $output_file);
+    }
+    
+    $logger->info("Optimized chunk generation completed successfully");
+}
+
+sub check_seqkit_available {
+    my $seqkit_path = `which seqkit 2>/dev/null`;
+    chomp $seqkit_path;
+    
+    if ($seqkit_path && -x $seqkit_path) {
+        my $version = `seqkit version 2>/dev/null`;
+        if ($version) {
+            chomp $version;
+            $logger->info("Found seqkit: $seqkit_path ($version)");
+            return 1;
+        }
+    }
+    
+    $logger->warn("seqkit not found in PATH or not executable");
+    return 0;
 }
 
 sub run_cmd {
