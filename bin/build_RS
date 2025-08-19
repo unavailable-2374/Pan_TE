@@ -400,7 +400,9 @@ sub filter_repeats {
     $ENV{TRF_COMMAND} = which('trf');
     $ENV{RMBLAST_DIR} = $config{rmblast_dir};
 
-    system("filter-stage-1.prl $input > $output 2> $config{tmp_dir}/filter.log") == 0
+    my $filter_threads = $config{threads} || 4;
+    my $filter_script = File::Spec->catfile($FindBin::RealBin, 'filter-stage-1.prl');
+    system("$filter_script -t $filter_threads $input > $output 2> $config{tmp_dir}/filter.log") == 0
     	or die "Failed to run filter-stage-1.prl: $?\n";
     $logger->info("Repeat filtering completed");
 }
@@ -847,7 +849,9 @@ sub run_parallel_repeatscout {
                 $logger->info("Filtering repeats for chunk $i...");
                 $ENV{TRF_COMMAND} = which('trf');
                 $ENV{RMBLAST_DIR} = $config{rmblast_dir};
-                system("filter-stage-1.prl $repeats_file > $filtered_file 2> $chunk_dir/filter.log") == 0
+                my $filter_threads = int($config{threads} / $config{parallel_chunks}) || 1;
+                my $filter_script = File::Spec->catfile($FindBin::RealBin, 'filter-stage-1.prl');
+                system("$filter_script -t $filter_threads $repeats_file > $filtered_file 2> $chunk_dir/filter.log") == 0
                     or die "Failed to filter repeats for chunk $i: $?\n";
             }
             

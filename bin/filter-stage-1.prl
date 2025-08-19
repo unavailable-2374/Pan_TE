@@ -1,0 +1,283 @@
+#!/usr/bin/env perl
+#
+# A first-stage fasta filter for RepeatScout libraries: removes anything under 50 
+# nt.  Removes anything that is over 50% low-complexity vis a vis TRF or dustmasker.
+#
+# Status is printed to STDERR, the resulting "good" repeats to STDOUT.
+#
+# Enhanced with multithreading support for parallel sequence processing.
+#
+# Created: 20050416
+# Author: Neil Jones
+# Modified: Enhanced with multithreading
+#-----------------------------------------------------------------------------------
+
+use File::Temp;
+use File::Which qw(which where);
+use Parallel::ForkManager;
+use IO::Handle;
+
+if( grep /^--?h$/, @ARGV ) {
+	exec("perldoc $0");
+}
+
+# Parse command line arguments for thread control
+my $num_threads = 4;  # Default thread count
+for my $i (0..$#ARGV) {
+    if ($ARGV[$i] eq '-t' || $ARGV[$i] eq '--threads') {
+        $num_threads = $ARGV[$i+1] if defined $ARGV[$i+1] && $ARGV[$i+1] =~ /^\d+$/;
+        splice @ARGV, $i, 2;
+        last;
+    }
+}
+
+#
+# Same parameters as Alkes' earlier version
+#
+my $DUST_THRESHOLD = .5;
+my $TRF_THRESHOLD  = .5;
+my $MIN_LENGTH     = 50;
+
+my $TRF_COMMAND          = $ENV{'TRF_COMMAND'}  || "trf";
+unless( -e $TRF_COMMAND || which($TRF_COMMAND) )
+{
+  die "ERROR: RepeatScout script filter-stage-1.prl cannot find 'trf' in the user's path!\n";
+}
+
+my $DUSTMASKER_COMMAND   = $ENV{'DUSTMASKER_COMMAND'} || "dustmasker";
+# deprecated ... this is only maintained for backwards compatibility
+my $NSEG_COMMAND         = $ENV{'NSEG_COMMAND'} || 'nseg';
+
+unless ( -e $DUSTMASKER_COMMAND || which($DUSTMASKER_COMMAND) || -e $NSEG_COMMAND || which($NSEG_COMMAND) )
+{
+  die "ERROR: RepeatScout script filter-stage-1.prl cannot find either 'nseg' or 'dustmasker' programs in the user's path!\n";
+}
+
+my $useNseg = 0;
+$useNseg = 1 if ( ! ( -e $DUSTMASKER_COMMAND || which($DUSTMASKER_COMMAND) ) );
+
+# Initialize variables for sequence collection
+my @sequences = ();
+my ($head, $body);
+my $line = 0;
+
+# Read all sequences into memory first
+while(<>) {
+	++$line;
+	chomp;
+	next if /^#/;  # Allow embedded comments.
+
+	if( /^>/ || eof() ) {
+                $body .= $_ if eof();
+		if (defined $head && length($body) > 0) {
+			push @sequences, {header => $head, sequence => $body};
+		}
+		$head = $_;
+		$body = '';
+	} else {
+		die("Improperly formatted file: offensive line #$line was\n$_\n") if /[^ATGC]/;
+		$body .= $_;
+	}
+}
+
+# Add the last sequence if it exists
+if (defined $head && length($body) > 0) {
+	push @sequences, {header => $head, sequence => $body};
+}
+
+# Process sequences in parallel
+my $pm = Parallel::ForkManager->new($num_threads);
+
+# Shared variables for collecting results
+my @results = ();
+my $num_deleted = 0;
+my $num_skipped = 0;
+my $repeat_num = 1;
+
+# Setup result collection
+$pm->run_on_finish(
+    sub {
+        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_structure_reference) = @_;
+        if (defined $data_structure_reference) {
+            push @results, $data_structure_reference;
+        }
+    }
+);
+
+# Process each sequence in parallel
+foreach my $seq_data (@sequences) {
+    $pm->start and next;  # Start child process
+    
+    my $result = process_sequence($seq_data, $repeat_num++);
+    
+    $pm->finish(0, $result);  # End child process and pass result
+}
+
+$pm->wait_all_children;
+
+# Sort results by repeat number and output
+@results = sort { $a->{repeat_num} <=> $b->{repeat_num} } @results;
+
+foreach my $result (@results) {
+    if ($result->{output}) {
+        print $result->{output};
+    }
+    if ($result->{deleted}) {
+        print STDERR $result->{stderr_msg};
+        $num_deleted++;
+    }
+    if ($result->{skipped}) {
+        $num_skipped++;
+    }
+}
+
+print STDERR "$num_deleted deleted.  " . scalar(@results) . " saved. $num_skipped skipped for length.\n";
+
+# Process a single sequence (moved to subroutine for parallel execution)
+sub process_sequence {
+    my ($seq_data, $repeat_num) = @_;
+    my $head = $seq_data->{header};
+    my $body = $seq_data->{sequence};
+    my $prefix = $useNseg ? "NSEG" : "DUST";
+    
+    my $result = {
+        repeat_num => $repeat_num,
+        output => "",
+        deleted => 0,
+        skipped => 0,
+        stderr_msg => ""
+    };
+    
+    if (length($body) <= $MIN_LENGTH) {
+        $result->{skipped} = 1;
+        return $result;
+    }
+    
+    my $tmp = new File::Temp( DIR => '.');
+    print $tmp "$head (RR=$repeat_num)\n";
+    print $tmp "$body\n";
+    
+    my $trf = trf($tmp, $body);
+    my $lowcomplex;
+    
+    if ($useNseg) {
+        $lowcomplex = nseg($tmp, $body); 
+    } else {
+        $lowcomplex = dust($tmp, $body);
+    }
+    
+    $tmp->close();
+    $tmp = undef;
+    
+    if ($lowcomplex <= $DUST_THRESHOLD && $trf <= $TRF_THRESHOLD) {
+        $result->{output} = sprintf("$head (RR=$repeat_num.  TRF=%.3f $prefix=%.3f)\n", $trf, $lowcomplex);
+        for (my $ii = 0; $ii < length($body); $ii += 80) {
+            $result->{output} .= substr($body, $ii, 80) . "\n";
+        }
+    } else {
+        $result->{deleted} = 1;
+        $result->{stderr_msg} = "deleting $head: $trf / $lowcomplex\n";
+    }
+    
+    return $result;
+}
+
+sub trf {
+	my ($file, $text) = @_;
+	local *TRF;
+	my $trf = $TRF_COMMAND;
+
+	system("$trf $file 2 7 7 80 10 50 500 -f -d -m > /dev/null");
+	open(TRF, "<$file.2.7.7.80.10.50.500.mask") or die($!);
+	my $len = 0;
+
+	while(<TRF>) {
+		chomp;
+		next if /^>/;
+		s/n//g;
+		s/N//g;
+		$len += 1*length($_);
+	}
+	close(TRF);
+
+	# TRF produces many output files.
+	unlink "$file.2.7.7.80.10.50.500.mask";
+	unlink "$file.2.7.7.80.10.50.500.dat";
+	unlink "$file.2.7.7.80.10.50.500.1.txt.html";
+	unlink "$file.2.7.7.80.10.50.500.1.html";
+
+	return (length($text)-$len) / length($text);
+}
+
+sub dust {
+	my ($file, $text) = @_;
+	local *DUST;
+	my $dust = $DUSTMASKER_COMMAND;
+
+	open(DUST, "$dust -in $file -outfmt fasta |");
+	my $len = 0;
+
+	while(<DUST>) {
+		chomp;
+		next if /^>/;
+		s/[actgnN]//g;
+		$len += 1*length($_);
+	}
+	close(DUST);
+
+	return (length($text)-$len) / length($text);
+}
+
+sub nseg {
+	my ($file, $text) = @_;
+	local *NSEG;
+	my $nseg = $NSEG_COMMAND;
+	open(NSEG, "$nseg $file -x -c 100 |");
+	my $len = 0;
+	while(<NSEG>) {
+		chomp;
+		next if /^>/;
+
+		s/n//g;
+		s/N//g;
+		
+		$len += 1*length($_);
+	}
+	close(NSEG);
+	return (length($text)-$len) / length($text);
+}
+
+__END__
+
+=head1 NAME  
+
+filter-stage-1.prl -- a first stage post-processing tool for RepeatScout output.
+
+=head1 SYNOPSIS
+
+cat repeats.fa | filter-stage-1.prl [-t threads] > repeats-filtered.prl
+
+=head1 OPTIONS
+
+-t, --threads  Number of parallel threads to use (default: 4)
+-h             Show this help message
+
+You will either want trf and dustmasker in your PATH, or you will want
+to set the environment variables TRF_COMMAND and DUSTMASKER_COMMAND to provide
+the executable.
+
+=head1 DESCRIPTION
+
+This tool takes a repeat library, which is a Fasta-formatted sequence file, and
+filters out any sequence that is deemed to be more than 50% low-complexity by either
+TRF or dustmasker or both.  Note that one algorithm needs to make the determination; we don't
+check the total number of unique bases masked out by TRF and dustmasker individually.
+
+=head1  ENVIRONMENT VARIABLES
+
+In order for this program to find TRF and dustmasker, you need to either place said programs
+in your PATH, or you need to add the environment variables TRF_COMMAND and DUSTMASKER_COMMAND.
+The value of those variables should be the path at which the respective program can be
+found.
+
+=cut
