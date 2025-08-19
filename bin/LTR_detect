@@ -4,7 +4,6 @@ use warnings;
 use Cwd qw(abs_path getcwd);
 use File::Basename qw(dirname basename);
 use File::Path qw(make_path);
-use List::Util qw(min);
 
 # Usage check
 my $fasta_file = abs_path($ARGV[0]);
@@ -45,12 +44,10 @@ if (-e "$current_dir/Inpactor2_library.fasta") {
 	my $inpactor2_cmd = "conda run -n Inpactor2 Inpactor2.py -f $input_fasta -o $current_dir -t $threads -a no -n 100 -c no -g no >inpactor2.log  2>> inpactor2.log";
 	print "Executing: $inpactor2_cmd\n";
 	system($inpactor2_cmd) == 0 or die "Failed to execute Inpactor2: $!\n";
+	my $refine_cmd = "TE_Merge Inpactor2_library.fasta ./ --threads $threads";
+	print "Executing: $inpactor2_cmd\n";
+	system($refine_cmd) == 0 or die "Failed to execute refinement: $!\n";
 }
-
-my $refine_cmd = "TE_Merge Inpactor2_library.fasta ./ --threads $threads";
-print "Executing: $refine_cmd\n";
-system($refine_cmd) == 0 or die "Failed to execute refinement: $!\n";
-
 # Check output file
 my $inpactor2_output = "$current_dir/all_sequences.fa";
 unless (-e $inpactor2_output) {

@@ -11,6 +11,7 @@ use Pod::Usage;
 use POSIX qw(:sys_wait_h ceil floor);
 use File::Basename;
 use Log::Log4perl qw(:easy);
+use Parallel::ForkManager;
 
 # Configure logging
 Log::Log4perl->easy_init({
@@ -152,13 +153,18 @@ sub run_pipeline {
     $logger->info("Processing genome of size: $readable_size");
 
     # Calculate sampling strategy based on genome size thresholds
-    my ($sample_strategy, $sample_size, $batch_size, $sample_times) = 
+    my ($sample_strategy, $sample_size, $chunk_size, $num_chunks) = 
         determine_sampling_strategy($genome_size);
     
     $logger->info("Sampling strategy: $sample_strategy");
-    $logger->info("Sample size: " . sprintf("%.2f", $sample_size/1e6) . " Mb");
-    $logger->info("Batch size: " . sprintf("%.2f", $batch_size/1e3) . " Kb");
-    $logger->info("Number of batches: $sample_times");
+    if ($sample_strategy eq "sample_parallel") {
+        $logger->info("Sample size per chunk: " . sprintf("%.2f", $sample_size/1e6) . " Mb");
+        $logger->info("Total sampling: " . sprintf("%.2f", ($sample_size * $num_chunks)/1e6) . " Mb");
+    } else {
+        $logger->info("Sample size: " . sprintf("%.2f", $sample_size/1e6) . " Mb");
+    }
+    $logger->info("Chunk size: " . sprintf("%.2f", $chunk_size/1e3) . " Kb");
+    $logger->info("Number of parallel chunks: $num_chunks");
 
     my $lmer_size = calculate_lmer_size($genome_size);
     $logger->info("Calculated l-mer size: $lmer_size");
@@ -180,10 +186,14 @@ sub run_pipeline {
         # Run complete pipeline
         eval {
             # Process genome based on sampling strategy
-            process_genome_by_strategy($sample_strategy, $sample_times, $batch_size);
-            
-            run_build_lmer_table($lmer_size);
-            run_repeat_scout($lmer_size);
+            if ($sample_strategy eq "sample_parallel" && $num_chunks > 1) {
+                run_parallel_repeatscout($sample_strategy, $sample_size, $chunk_size, $num_chunks, $lmer_size);
+            } else {
+                # Single run processing
+                process_genome_by_strategy($sample_strategy, $num_chunks, $chunk_size);
+                run_build_lmer_table($lmer_size);
+                run_repeat_scout($lmer_size);
+            }
             filter_repeats();
             refine_consensus();
         };
@@ -268,13 +278,15 @@ sub refine_consensus {
     
     # Ensure all input files exist
     die "Input file missing: $input\n" unless -f $input;
-    my $tmp_fa = "$config{tmp_dir}/tmp.fa";
+    
+    # Determine genome input for Refiner based on sampling strategy
+    my $refiner_genome = determine_refiner_genome_input();
     
     # Use the new Refiner pipeline
     my $cmd = join(" ",
         "python3", "$FindBin::RealBin/Refiner/main.py",
         '--repeatscout', $input,              # RepeatScout filtered output
-        '--genome', $tmp_fa,                  # Reference genome (sampled)
+        '--genome', $refiner_genome,          # Reference genome for Refiner
         '--output', $output_dir,              # Output directory for Refiner
         '--threads', $config{threads},        # Number of threads
         '--keep-temp',                        # Keep temporary files for debugging
@@ -305,6 +317,60 @@ sub refine_consensus {
     $logger->info("Advanced consensus refinement completed successfully");
 }
 
+sub determine_refiner_genome_input {
+    my $genome_size = -s $config{genome_file};
+    my $gb_1_2 = 1.2 * 1024 * 1024 * 1024;  # 1.2GB
+    
+    if ($genome_size < $gb_1_2) {
+        # Small genome (<1.2Gb): use single sample
+        $logger->info("Using single sample for Refiner input (genome < 1.2Gb)");
+        return create_refiner_sample(500 * 1024 * 1024, 1);
+    } else {
+        # Large genome (>=1.2Gb): merge 2 samples
+        $logger->info("Using merged samples for Refiner input (genome >= 1.2Gb)");
+        return create_refiner_sample(500 * 1024 * 1024, 2);
+    }
+}
+
+sub create_refiner_sample {
+    my ($sample_size, $num_samples) = @_;
+    
+    my $refiner_genome = "$config{tmp_dir}/refiner_genome.fa";
+    
+    # Create index if needed
+    unless (-f "$config{genome_file}.fai") {
+        run_cmd("samtools faidx $config{genome_file}");
+    }
+    
+    if ($num_samples == 1) {
+        # Single sample
+        my $chunk_size = 40 * 1024;  # 40KB chunks for better representation
+        my $num_chunks = int($sample_size / $chunk_size);
+        sample_random_chunks($config{genome_file}, $num_chunks, $chunk_size, $refiner_genome);
+    } else {
+        # Multiple samples - merge them
+        my @temp_files;
+        my $chunk_size = 40 * 1024;  # 40KB chunks
+        my $num_chunks_per_sample = int($sample_size / $chunk_size);
+        
+        for my $i (1..$num_samples) {
+            my $temp_file = "$config{tmp_dir}/refiner_sample_$i.fa";
+            sample_random_chunks($config{genome_file}, $num_chunks_per_sample, $chunk_size, $temp_file);
+            push @temp_files, $temp_file;
+        }
+        
+        # Merge all samples
+        my $cat_cmd = "cat " . join(" ", @temp_files) . " > $refiner_genome";
+        run_cmd($cat_cmd);
+        
+        # Clean up temp files
+        unlink @temp_files;
+    }
+    
+    $logger->info("Created Refiner genome input: $refiner_genome");
+    return $refiner_genome;
+}
+
 sub which {
     my ($program) = @_;
     for my $path (split /:/, $ENV{PATH}) {
@@ -318,53 +384,68 @@ sub which {
 sub determine_sampling_strategy {
     my ($genome_size) = @_;
     
-    my $mb_400 = 400 * 1024 * 1024;    # 400MB
-    my $gb_1_4 = 1.4 * 1024 * 1024 * 1024;  # 1.4GB
-    my $gb_10 = 10 * 1024 * 1024 * 1024;    # 10GB
-    my $kb_200 = 200 * 1024;           # 200KB
+    my $mb_500 = 500 * 1024 * 1024;    # 500MB
+    my $gb_1 = 1024 * 1024 * 1024;     # 1GB
+    my $gb_3 = 3 * 1024 * 1024 * 1024; # 3GB
+    my $gb_5 = 5 * 1024 * 1024 * 1024; # 5GB
     
-    if ($genome_size < $mb_400) {
-        # Small genome: fragment all sequences into 200KB pieces
+    if ($genome_size < $mb_500) {
+        # Small genome (<500Mb): fragment into 30Kb pieces
         my $strategy = "fragment_all";
-        my $num_fragments = ceil($genome_size / $kb_200);
-        return ($strategy, $genome_size, $kb_200, $num_fragments);
+        my $chunk_size = 30 * 1024;  # 30KB
+        my $num_chunks = 1;  # Single run
+        return ($strategy, $genome_size, $chunk_size, $num_chunks);
     }
-    elsif ($genome_size >= $mb_400 && $genome_size < $gb_1_4) {
-        # Medium genome: sample 600MB in 200KB chunks
-        my $strategy = "sample_600mb";
-        my $sample_size = 600 * 1024 * 1024;  # 600MB
-        my $num_samples = $sample_size / $kb_200;  # 3000 samples
-        return ($strategy, $sample_size, $kb_200, $num_samples);
+    elsif ($genome_size >= $mb_500 && $genome_size < $gb_1) {
+        # Medium genome (500Mb-1Gb): sample 500Mb in 30Kb chunks
+        my $strategy = "sample_single";
+        my $sample_size = 500 * 1024 * 1024;  # 500MB
+        my $chunk_size = 30 * 1024;  # 30KB
+        my $num_chunks = 1;  # Single run
+        return ($strategy, $sample_size, $chunk_size, $num_chunks);
     }
-    elsif ($genome_size >= $gb_1_4 && $genome_size < $gb_10) {
-        # Large genome: sample 800MB in 200KB chunks
-        my $strategy = "sample_800mb";
-        my $sample_size = 800 * 1024 * 1024;  # 800MB
-        my $num_samples = $sample_size / $kb_200;  # 4000 samples
-        return ($strategy, $sample_size, $kb_200, $num_samples);
+    elsif ($genome_size >= $gb_1 && $genome_size < $gb_3) {
+        # Large genome (1Gb-3Gb): sample 2×500Mb in 40Kb chunks
+        my $strategy = "sample_parallel";
+        my $sample_size = 500 * 1024 * 1024;  # 500MB per chunk
+        my $chunk_size = 40 * 1024;  # 40KB
+        my $num_chunks = 2;  # Two parallel runs
+        return ($strategy, $sample_size, $chunk_size, $num_chunks);
+    }
+    elsif ($genome_size >= $gb_3 && $genome_size < $gb_5) {
+        # Very large genome (3Gb-5Gb): sample 3×500Mb in 50Kb chunks
+        my $strategy = "sample_parallel";
+        my $sample_size = 500 * 1024 * 1024;  # 500MB per chunk
+        my $chunk_size = 50 * 1024;  # 50KB
+        my $num_chunks = 3;  # Three parallel runs
+        return ($strategy, $sample_size, $chunk_size, $num_chunks);
     }
     else {
-        # Very large genome (>10GB): sample 1GB in 200KB chunks
-        my $strategy = "sample_1gb";
-        my $sample_size = 1024 * 1024 * 1024;  # 1GB
-        my $num_samples = int($sample_size / $kb_200);  # 5120 samples
-        return ($strategy, $sample_size, $kb_200, $num_samples);
+        # Massive genome (>5Gb): sample 4×500Mb in 50Kb chunks
+        my $strategy = "sample_parallel";
+        my $sample_size = 500 * 1024 * 1024;  # 500MB per chunk
+        my $chunk_size = 50 * 1024;  # 50KB
+        my $num_chunks = 4;  # Four parallel runs
+        return ($strategy, $sample_size, $chunk_size, $num_chunks);
     }
 }
 
 sub process_genome_by_strategy {
-    my ($strategy, $sample_times, $batch_size) = @_;
+    my ($strategy, $num_chunks, $chunk_size) = @_;
     
     $logger->info("Processing genome with strategy: $strategy");
     
     if ($strategy eq "fragment_all") {
-        fragment_entire_genome($batch_size);
+        fragment_entire_genome($chunk_size);
     }
-    elsif ($strategy eq "sample_600mb" || $strategy eq "sample_800mb" || $strategy eq "sample_1gb") {
-        sample_genome_chunks($sample_times, $batch_size);
+    elsif ($strategy eq "sample_single") {
+        # Single sampling run
+        my $sample_size = 500 * 1024 * 1024;  # 500MB
+        my $num_samples = $sample_size / $chunk_size;
+        sample_genome_chunks($num_samples, $chunk_size);
     }
     else {
-        die "Unknown sampling strategy: $strategy\n";
+        die "Unknown single sampling strategy: $strategy\n";
     }
 }
 
@@ -417,6 +498,192 @@ sub sample_genome_chunks {
     sample_random_chunks($config{genome_file}, $num_samples, $chunk_size, "$config{tmp_dir}/tmp.fa");
     
     $logger->info("Random chunk sampling completed");
+}
+
+sub run_parallel_repeatscout {
+    my ($strategy, $sample_size_per_chunk, $chunk_size, $num_chunks, $lmer_size) = @_;
+    
+    $logger->info("Running parallel RepeatScout with $num_chunks chunks...");
+    
+    # Create index if needed
+    unless (-f "$config{genome_file}.fai") {
+        run_cmd("samtools faidx $config{genome_file}");
+    }
+    
+    # Create parallel work directories
+    my @chunk_dirs;
+    for my $i (1..$num_chunks) {
+        my $chunk_dir = "$config{tmp_dir}/chunk_$i";
+        make_path($chunk_dir) unless -d $chunk_dir;
+        push @chunk_dirs, $chunk_dir;
+    }
+    
+    # Generate sampling for each chunk
+    my $num_samples_per_chunk = int($sample_size_per_chunk / $chunk_size);
+    for my $i (1..$num_chunks) {
+        my $chunk_dir = $chunk_dirs[$i-1];
+        my $chunk_fa = "$chunk_dir/chunk.fa";
+        
+        $logger->info("Generating chunk $i: $num_samples_per_chunk samples of ${chunk_size}bp");
+        sample_random_chunks($config{genome_file}, $num_samples_per_chunk, $chunk_size, $chunk_fa);
+    }
+    
+    # Run RepeatScout in parallel using fork
+    use Parallel::ForkManager;
+    my $pm = Parallel::ForkManager->new($num_chunks);
+    
+    my @results;
+    $pm->run_on_finish(sub {
+        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_ref) = @_;
+        if ($data_ref) {
+            push @results, $data_ref;
+        }
+    });
+    
+    # Fork and run RepeatScout for each chunk
+    for my $i (1..$num_chunks) {
+        my $chunk_dir = $chunk_dirs[$i-1];
+        
+        $pm->start and next;  # Fork
+        
+        # Child process
+        eval {
+            my $chunk_fa = "$chunk_dir/chunk.fa";
+            my $freq_file = "$chunk_dir/lmer.freq";
+            my $repeats_file = "$chunk_dir/repeats.fa";
+            my $filtered_file = "$chunk_dir/repeats.filtered.fa";
+            
+            # Build lmer table for this chunk
+            $logger->info("Building lmer table for chunk $i...");
+            my $cmd = "build_lmer_table -l $lmer_size -sequence $chunk_fa -freq $freq_file 2> $chunk_dir/build_lmer.log";
+            system($cmd) == 0 or die "Failed to build lmer table for chunk $i: $?\n";
+            
+            # Run RepeatScout for this chunk
+            $logger->info("Running RepeatScout for chunk $i...");
+            $cmd = "RepeatScout -sequence $chunk_fa -output $repeats_file -freq $freq_file -l $lmer_size -tandemdist 50 -minthresh 3 2> $chunk_dir/repeatscout.log";
+            system($cmd) == 0 or die "Failed to run RepeatScout for chunk $i: $?\n";
+            
+            # Filter results for this chunk
+            $logger->info("Filtering repeats for chunk $i...");
+            $ENV{TRF_COMMAND} = which('trf');
+            $ENV{RMBLAST_DIR} = $config{rmblast_dir};
+            system("filter-stage-1.prl $repeats_file > $filtered_file 2> $chunk_dir/filter.log") == 0
+                or die "Failed to filter repeats for chunk $i: $?\n";
+            
+            $logger->info("Chunk $i completed successfully");
+        };
+        
+        if ($@) {
+            $logger->error("Chunk $i failed: $@");
+            $pm->finish(1);  # Exit child with error
+        } else {
+            $pm->finish(0);  # Exit child successfully
+        }
+    }
+    
+    $pm->wait_all_children;
+    
+    # Merge results from all chunks
+    $logger->info("Merging results from $num_chunks chunks...");
+    merge_parallel_results(\@chunk_dirs);
+    
+    $logger->info("Parallel RepeatScout processing completed");
+}
+
+sub merge_parallel_results {
+    my ($chunk_dirs) = @_;
+    
+    my $merged_file = "$config{tmp_dir}/repeats.filtered.fa";
+    my $temp_merge = "$config{tmp_dir}/temp_merged.fa";
+    
+    # Collect all filtered results
+    my @filtered_files;
+    for my $chunk_dir (@$chunk_dirs) {
+        my $filtered_file = "$chunk_dir/repeats.filtered.fa";
+        if (-s $filtered_file) {
+            push @filtered_files, $filtered_file;
+        } else {
+            $logger->warn("No filtered results found in $chunk_dir");
+        }
+    }
+    
+    die "No filtered results found from any chunk\n" unless @filtered_files;
+    
+    # Simple concatenation first
+    $logger->info("Concatenating results from " . scalar(@filtered_files) . " chunks...");
+    my $cat_cmd = "cat " . join(" ", @filtered_files) . " > $temp_merge";
+    run_cmd($cat_cmd);
+    
+    # Apply simple validation: keep sequences that appear in multiple chunks or are >2kb
+    $logger->info("Applying cross-validation and length filtering...");
+    validate_and_merge_sequences($temp_merge, $merged_file);
+    
+    # Clean up temp file
+    unlink $temp_merge;
+    
+    $logger->info("Results merging completed");
+}
+
+sub validate_and_merge_sequences {
+    my ($input_file, $output_file) = @_;
+    
+    # Read all sequences and count occurrences
+    my %seq_count;
+    my %seq_data;
+    
+    open(my $in_fh, '<', $input_file) or die "Cannot read $input_file: $!\n";
+    my $current_id;
+    my $current_seq = "";
+    
+    while (my $line = <$in_fh>) {
+        chomp $line;
+        if ($line =~ /^>(.+)/) {
+            # Process previous sequence
+            if ($current_id && $current_seq) {
+                my $seq_key = uc($current_seq);
+                $seq_count{$seq_key}++;
+                $seq_data{$seq_key} = {id => $current_id, seq => $current_seq};
+            }
+            # Start new sequence
+            $current_id = $1;
+            $current_seq = "";
+        } else {
+            $current_seq .= $line;
+        }
+    }
+    
+    # Process last sequence
+    if ($current_id && $current_seq) {
+        my $seq_key = uc($current_seq);
+        $seq_count{$seq_key}++;
+        $seq_data{$seq_key} = {id => $current_id, seq => $current_seq};
+    }
+    close($in_fh);
+    
+    # Write validated sequences
+    open(my $out_fh, '>', $output_file) or die "Cannot create $output_file: $!\n";
+    
+    my $kept_count = 0;
+    my $total_count = scalar(keys %seq_data);
+    
+    for my $seq_key (keys %seq_data) {
+        my $count = $seq_count{$seq_key};
+        my $length = length($seq_key);
+        
+        # Keep sequence if:
+        # 1. Found in multiple chunks (count > 1), OR
+        # 2. Length > 2000bp (likely real repeat)
+        if ($count > 1 || $length > 2000) {
+            my $data = $seq_data{$seq_key};
+            print $out_fh ">$data->{id}_validated_c${count}_l${length}\n";
+            print $out_fh "$data->{seq}\n";
+            $kept_count++;
+        }
+    }
+    
+    close($out_fh);
+    
+    $logger->info("Validation complete: kept $kept_count / $total_count sequences");
 }
 
 sub sample_random_chunks {
