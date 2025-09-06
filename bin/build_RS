@@ -1,9 +1,15 @@
 #!/usr/bin/env perl
+
 use strict;
 use warnings;
 use Cwd qw(getcwd);
 use FindBin;
 use lib $FindBin::RealBin;
+use lib qw(/home/shuoc/tool/Pan_TE/bin 
+           /home/shuoc/tool/Pan_TE/share 
+           /home/shuoc/tool/miniconda3/envs/PGTA/share/RepeatMasker 
+           /home/shuoc/tool/miniconda3/envs/PGTA/lib/perl5/site_perl);
+
 use File::Path qw(make_path);
 use File::Spec;
 use Getopt::Long;
@@ -12,6 +18,7 @@ use POSIX qw(:sys_wait_h ceil floor);
 use File::Basename;
 use Log::Log4perl qw(:easy);
 use Parallel::ForkManager;
+use List::Util qw(min max);
 
 # Configure logging
 Log::Log4perl->easy_init({
@@ -21,14 +28,14 @@ Log::Log4perl->easy_init({
 });
 my $logger = Log::Log4perl->get_logger();
 
-our $VERSION = '1.0.0';
+our $VERSION = '2.0.0';
 
 # Program Configuration
 my %config = (
     tmp_dir => undef,
     genome_file => undef,
     threads => 4,
-    sample_size => 'all',
+    sample_size => 'auto',
     rmblast_dir => undef,
     work_dir => undef,
     force_overwrite => 0
@@ -97,7 +104,6 @@ sub get_and_validate_args {
     $logger->info("  Threads: $config{threads}");
     $logger->info("  Working directory: $config{work_dir}");
     $logger->info("  RMBlast directory: $config{rmblast_dir}");
-    $logger->info("  Force overwrite: " . ($config{force_overwrite} ? "Yes" : "No"));
 }
 
 sub locate_rmblastn {
@@ -147,1014 +153,1913 @@ sub setup_environment {
     $logger->info("Changed to working directory: " . getcwd());
 }
 
-sub should_skip_existing_file {
-    my ($filepath, $description) = @_;
-    
-    # Never skip if force overwrite is enabled
-    return 0 if $config{force_overwrite};
-    
-    # Check if file exists and is valid
-    if (-s $filepath) {
-        my $header_check = `head -1 "$filepath" 2>/dev/null`;
-        if ($header_check && $header_check =~ /^>/) {
-            my $size = -s $filepath;
-            $logger->info("Found existing $description: $filepath ($size bytes)");
-            return 1;
-        } else {
-            $logger->warn("Existing $description appears invalid, will regenerate: $filepath");
-            return 0;
-        }
-    }
-    return 0;
-}
-
-sub check_existing_outputs {
-    my ($final_consensus, $refiner_consensus, $refiner_masked_genome) = @_;
-    
-    # Skip check if force overwrite is enabled
-    if ($config{force_overwrite}) {
-        $logger->info("Force overwrite enabled, will regenerate all outputs");
-        return 0;
-    }
-    
-    # Check if all key output files exist and are valid
-    my @required_files = (
-        {path => $final_consensus, desc => "Final consensus sequences"},
-        {path => $refiner_consensus, desc => "Refiner consensus sequences"},
-        {path => $refiner_masked_genome, desc => "Refiner masked genome"}
-    );
-    
-    my $all_exist = 1;
-    my @missing_files;
-    
-    for my $file (@required_files) {
-        if (-s $file->{path}) {
-            # File exists and has content, check if it's a valid FASTA
-            my $header_check = `head -1 "$file->{path}" 2>/dev/null`;
-            if ($header_check && $header_check =~ /^>/) {
-                my $size = -s $file->{path};
-                $logger->info("Found existing $file->{desc}: $file->{path} (size: $size bytes)");
-            } else {
-                $logger->warn("$file->{desc} exists but appears invalid: $file->{path}");
-                push @missing_files, $file->{desc};
-                $all_exist = 0;
-            }
-        } else {
-            $logger->info("Missing $file->{desc}: $file->{path}");
-            push @missing_files, $file->{desc};
-            $all_exist = 0;
-        }
-    }
-    
-    if ($all_exist) {
-        $logger->info("All required output files are present and valid");
-        return 1;
-    } else {
-        $logger->info("Missing or invalid files: " . join(", ", @missing_files));
-        $logger->info("Will run pipeline to generate missing outputs");
-        return 0;
-    }
-}
-
 sub run_pipeline {
-    $logger->info("Starting RepeatScout pipeline...");
+    $logger->info("Starting multi-parameter RepeatScout pipeline...");
 
-    # Check for existing final outputs first
-    my $final_consensus = "$config{work_dir}/consensi.fa";
-    my $refiner_output_dir = "$config{work_dir}/refiner_output";
-    my $refiner_consensus = "$refiner_output_dir/consensus_masking.fa";
-    my $refiner_masked_genome = "$refiner_output_dir/genome_final_masked.fa";
-    
-    if (check_existing_outputs($final_consensus, $refiner_consensus, $refiner_masked_genome)) {
-        $logger->info("All required output files already exist and are valid, pipeline completed");
-        return;
-    }
-
-    # Get genome size and calculate parameters
+    # Get genome size and determine strategy
     my $genome_size = -s $config{genome_file};
-    my $readable_size = sprintf("%.2f", $genome_size/1e9) . " Gb";
+    my $readable_size = sprintf("%.2f", $genome_size/1e9) . " GB";
     $logger->info("Processing genome of size: $readable_size");
 
-    # Calculate sampling strategy based on genome size thresholds
-    my ($sample_strategy, $sample_size, $chunk_size, $num_chunks) = 
-        determine_sampling_strategy($genome_size);
+    # Determine multi-parameter strategy based on genome size
+    my ($strategy, $data_size, $lmer_sizes_ref, $copy_thresholds_ref, $num_samples) = determine_strategy($genome_size);
     
-    $logger->info("Sampling strategy: $sample_strategy");
-    if ($sample_strategy eq "sample_parallel") {
-        $logger->info("Sample size per chunk: " . sprintf("%.2f", $sample_size/1e6) . " Mb");
-        $logger->info("Total sampling: " . sprintf("%.2f", ($sample_size * $num_chunks)/1e6) . " Mb");
+    $logger->info("Strategy: $strategy");
+    $logger->info("Data size per sample: " . sprintf("%.2f", $data_size/1e6) . " MB");
+    $logger->info("Number of samples: $num_samples");
+    $logger->info("L-mer sizes: " . join(", ", @$lmer_sizes_ref));
+    $logger->info("Copy thresholds: " . join(", ", @$copy_thresholds_ref));
+    
+    my $total_jobs = $num_samples * scalar(@$lmer_sizes_ref);
+    $logger->info("Total RepeatScout jobs: $total_jobs");
+
+    # Check for existing RepeatScout checkpoint
+    my $rs_output = "$config{tmp_dir}/repeats.fa";
+    my $repeatscout_checkpoint = "repeatscout_complete";
+    
+    if (check_checkpoint($repeatscout_checkpoint) && -s $rs_output && !$config{force_overwrite}) {
+        $logger->info("Found existing RepeatScout checkpoint and results, skipping to refinement...");
+    } elsif (-s $rs_output && !$config{force_overwrite}) {
+        $logger->info("Found existing RepeatScout results without checkpoint, creating checkpoint...");
+        create_checkpoint($repeatscout_checkpoint);
     } else {
-        $logger->info("Sample size: " . sprintf("%.2f", $sample_size/1e6) . " Mb");
-    }
-    $logger->info("Chunk size: " . sprintf("%.2f", $chunk_size/1e3) . " Kb");
-    $logger->info("Number of parallel chunks: $num_chunks");
-
-    # Calculate lmer size based on actual data being processed, not full genome
-    my $effective_size = determine_effective_processing_size($sample_strategy, $sample_size, $num_chunks, $genome_size);
-    my $lmer_size = calculate_lmer_size($effective_size);
-    $logger->info("Calculated l-mer size: $lmer_size (based on effective processing size: " . 
-                  sprintf("%.2f", $effective_size/1e6) . " Mb)");
-
-    # Check for RepeatScout results
-    my $rs_consensus = "$config{tmp_dir}/repeats.fa";
-    my $filtered_consensus = "$config{tmp_dir}/repeats.filtered.fa";
-
-    if (-s $filtered_consensus) {
-        $logger->info("Found existing filtered consensus sequences, skipping to refinement...");
-        refine_consensus();
-    }
-    elsif (-s $rs_consensus) {
-        $logger->info("Found existing RepeatScout results, skipping to filtering...");
-        filter_repeats();
-        refine_consensus();
-    }
-    else {
-        # Run complete pipeline
-        eval {
-            # Process genome based on sampling strategy
-            if ($sample_strategy eq "sample_parallel" && $num_chunks > 1) {
-                run_parallel_repeatscout($sample_strategy, $sample_size, $chunk_size, $num_chunks, $lmer_size);
-            } else {
-                # Single run processing
-                process_genome_by_strategy($sample_strategy, $num_chunks, $chunk_size);
-                run_build_lmer_table($lmer_size);
-                run_repeat_scout($lmer_size);
-            }
-            filter_repeats();
-            refine_consensus();
-        };
-        if ($@) {
-            $logger->error("Pipeline failed: $@");
-            die "Pipeline execution failed\n";
+        # Run multi-parameter RepeatScout
+        run_multi_parameter_repeatscout($strategy, $data_size, $lmer_sizes_ref, $copy_thresholds_ref, $num_samples);
+        
+        # Create checkpoint after successful RepeatScout completion
+        if (-s $rs_output) {
+            create_checkpoint($repeatscout_checkpoint);
+            $logger->info("RepeatScout completion checkpoint created successfully");
+        } else {
+            $logger->error("RepeatScout did not produce output file: $rs_output");
+            die "RepeatScout pipeline failed\n";
         }
     }
+    
+    # Run Refiner pipeline
+    refine_consensus();
+    
+    # Final cleanup of tmp directory - remove all HTML and remaining part files
+    cleanup_tmp_directory();
 
     $logger->info("Pipeline completed successfully");
 }
 
-sub determine_effective_processing_size {
-    my ($strategy, $sample_size, $num_chunks, $genome_size) = @_;
-    
-    if ($strategy eq "fragment_all") {
-        # Processing entire genome
-        return $genome_size;
-    } elsif ($strategy eq "sample_single") {
-        # Processing single sample
-        return $sample_size;
-    } elsif ($strategy eq "sample_parallel") {
-        # Processing multiple samples in parallel - each chunk processed independently
-        # Use single chunk size for lmer calculation since each chunk is processed separately
-        return $sample_size;
-    } else {
-        # Fallback to genome size
-        return $genome_size;
-    }
-}
-
-sub calculate_lmer_size {
-    my ($data_size) = @_;
-    
-    # Original formula: ceil(log4(data_size) + 1)
-    my $calculated_lmer = ceil(log($data_size)/log(4) + 1);
-    
-    # Apply bounds based on RepeatScout best practices:
-    # - Minimum: 14 (for very small data)
-    # - Maximum: 16 (for optimal performance and memory usage)
-    # - Sweet spot: 14-16 provides good balance of sensitivity and specificity
-    
-    if ($calculated_lmer < 14) {
-        return 14;  # Minimum for adequate specificity
-    } elsif ($calculated_lmer > 16) {
-        return 16;  # Maximum for reasonable memory usage and performance
-    } else {
-        return $calculated_lmer;
-    }
-}
-
-sub run_build_lmer_table {
-    my ($lmer_size) = @_;
-    my $freq_file = "$config{tmp_dir}/lmer.freq";
-
-    # Check if lmer frequency table already exists
-    if (!$config{force_overwrite} && -s $freq_file) {
-        my $size = -s $freq_file;
-        $logger->info("Found existing l-mer frequency table: $freq_file ($size bytes)");
-        $logger->info("Skipping l-mer table building");
-        return;
-    }
-
-    $logger->info("Building l-mer frequency table (l=$lmer_size)...");
-    
-    my $cmd = join(" ",
-        "build_lmer_table",
-        "-l $lmer_size",
-        "-sequence $config{tmp_dir}/tmp.fa",
-        "-freq $freq_file",
-        "2> $config{tmp_dir}/build_lmer.log"
-    );
-
-    run_cmd($cmd);
-    $logger->info("L-mer table building completed");
-}
-
-sub run_repeat_scout {
-    my ($lmer_size) = @_;
-    my $freq_file = "$config{tmp_dir}/lmer.freq";
-    my $output = "$config{tmp_dir}/repeats.fa";
-
-    # Check if RepeatScout output already exists and is valid
-    if (should_skip_existing_file($output, "RepeatScout output")) {
-        $logger->info("Skipping RepeatScout");
-        return;
-    }
-
-    $logger->info("Running RepeatScout...");
-
-    my $cmd = join(" ",
-        "RepeatScout",
-        "-sequence $config{tmp_dir}/tmp.fa",
-        "-output $output",
-        "-freq $freq_file",
-        "-l $lmer_size",
-        "-tandemdist 50",
-        "-minthresh 3",
-        "2>> $config{tmp_dir}/repeatscout.log"
-    );
-
-    run_cmd($cmd);
-    $logger->info("RepeatScout processing completed");
-}
-
-sub filter_repeats {
-    $logger->info("Filtering repeat sequences...");
-
-    my $input = "$config{tmp_dir}/repeats.fa";
-    my $output = "$config{tmp_dir}/repeats.filtered.fa";
-
-    # Check if filtered output already exists and is valid
-    if (should_skip_existing_file($output, "filtered repeats")) {
-        $logger->info("Skipping repeat filtering");
-        return;
-    }
-
-    $ENV{TRF_COMMAND} = which('trf');
-    $ENV{RMBLAST_DIR} = $config{rmblast_dir};
-
-    my $filter_threads = $config{threads} || 4;
-    my $filter_script = File::Spec->catfile($FindBin::RealBin, 'filter-stage-1.prl');
-    system("$filter_script -t $filter_threads $input > $output 2> $config{tmp_dir}/filter.log") == 0
-    	or die "Failed to run filter-stage-1.prl: $?\n";
-    $logger->info("Repeat filtering completed");
-}
-
-sub refine_consensus {
-    $logger->info("Refining consensus sequences...");
-
-    my $input = "$config{tmp_dir}/repeats.filtered.fa";
-    my $output_dir = "$config{work_dir}/refiner_output";
-    my $final_output = "$config{work_dir}/consensi.fa";
-
-    # Check if refinement outputs already exist and are valid
-    my $refiner_consensus = "$output_dir/consensus_masking.fa";
-    my $refiner_masked_genome = "$output_dir/genome_final_masked.fa";
-    
-    if (!$config{force_overwrite} && 
-        should_skip_existing_file($final_output, "final consensus") && 
-        should_skip_existing_file($refiner_consensus, "refiner consensus") && 
-        should_skip_existing_file($refiner_masked_genome, "masked genome")) {
-        $logger->info("All refinement outputs exist and are valid, skipping consensus refinement");
-        return;
-    }
-
-    # Create required directories
-    make_path($config{work_dir}) unless -d $config{work_dir};
-    make_path($output_dir) unless -d $output_dir;
-    
-    # Ensure all input files exist
-    die "Input file missing: $input\n" unless -f $input;
-    
-    # Determine genome input for Refiner based on sampling strategy
-    my $refiner_genome = determine_refiner_genome_input();
-    
-    # Use the new Refiner pipeline
-    my $cmd = join(" ",
-        "python3", "$FindBin::RealBin/Refiner/main.py",
-        '--repeatscout', $input,              # RepeatScout filtered output
-        '--genome', $refiner_genome,          # Reference genome for Refiner
-        '--output', $output_dir,              # Output directory for Refiner
-        '--threads', $config{threads},        # Number of threads
-        '--keep-temp',                        # Keep temporary files for debugging
-        '2>', "$config{tmp_dir}/refiner.log"  # Log file
-    );
-
-    $logger->info("Running advanced TE consensus building with command: $cmd");
-    system($cmd) == 0 
-        or do {
-            $logger->error("Advanced consensus refinement failed with status: $?");
-            die "Advanced consensus refinement failed\n";
-        };
-    
-    # Check for the main output file from Refiner and copy it to expected location
-    if (-f $refiner_consensus) {
-        $logger->info("Copying refined consensus from $refiner_consensus to $final_output");
-        system("cp '$refiner_consensus' '$final_output'") == 0
-            or do {
-                $logger->error("Failed to copy consensus file");
-                die "Failed to copy consensus file\n";
-            };
-    } else {
-        $logger->error("Refiner output file not found: $refiner_consensus");
-        die "Refiner output file not found\n";
-    }
-    
-    $logger->info("Advanced consensus refinement completed successfully");
-}
-
-sub determine_refiner_genome_input {
-    my $genome_size = -s $config{genome_file};
-    my $gb_1_2 = 1.2 * 1024 * 1024 * 1024;  # 1.2GB
-    
-    # First try to reuse existing RepeatScout chunk.fa files
-    my $reused_genome = reuse_existing_chunks($genome_size < $gb_1_2 ? 1 : 2);
-    if ($reused_genome) {
-        $logger->info("Successfully reused existing RepeatScout chunks for Refiner input");
-        return $reused_genome;
-    }
-    
-    # Fallback to original sampling strategy if chunks not available
-    if ($genome_size < $gb_1_2) {
-        # Small genome (<1.2Gb): use single sample
-        $logger->info("Using single sample for Refiner input (genome < 1.2Gb)");
-        return create_refiner_sample(500 * 1024 * 1024, 1);
-    } else {
-        # Large genome (>=1.2Gb): merge 2 samples
-        $logger->info("Using merged samples for Refiner input (genome >= 1.2Gb)");
-        return create_refiner_sample(500 * 1024 * 1024, 2);
-    }
-}
-
-sub create_refiner_sample {
-    my ($sample_size, $num_samples) = @_;
-    
-    my $refiner_genome = "$config{tmp_dir}/refiner_genome.fa";
-    
-    # Create index if needed
-    unless (-f "$config{genome_file}.fai") {
-        run_cmd("samtools faidx $config{genome_file}");
-    }
-    
-    if ($num_samples == 1) {
-        # Single sample
-        my $chunk_size = 40 * 1024;  # 40KB chunks for better representation
-        my $num_chunks = int($sample_size / $chunk_size);
-        sample_random_chunks($config{genome_file}, $num_chunks, $chunk_size, $refiner_genome);
-    } else {
-        # Multiple samples - merge them
-        my @temp_files;
-        my $chunk_size = 40 * 1024;  # 40KB chunks
-        my $num_chunks_per_sample = int($sample_size / $chunk_size);
-        
-        for my $i (1..$num_samples) {
-            my $temp_file = "$config{tmp_dir}/refiner_sample_$i.fa";
-            sample_random_chunks($config{genome_file}, $num_chunks_per_sample, $chunk_size, $temp_file);
-            push @temp_files, $temp_file;
-        }
-        
-        # Merge all samples
-        my $cat_cmd = "cat " . join(" ", @temp_files) . " > $refiner_genome";
-        run_cmd($cat_cmd);
-        
-        # Clean up temp files
-        unlink @temp_files;
-    }
-    
-    $logger->info("Created Refiner genome input: $refiner_genome");
-    return $refiner_genome;
-}
-
-sub reuse_existing_chunks {
-    my ($needed_chunks) = @_;
-    
-    my $refiner_genome = "$config{tmp_dir}/refiner_genome.fa";
-    
-    # Check if RepeatScout chunk.fa files exist and are valid
-    my @available_chunks;
-    for my $i (1..4) {  # Check up to 4 chunks (max number from parallel strategy)
-        my $chunk_file = "$config{tmp_dir}/chunk_$i/chunk.fa";
-        if (-s $chunk_file) {
-            # Verify it's a valid FASTA file
-            my $header_check = `head -1 "$chunk_file" 2>/dev/null`;
-            if ($header_check && $header_check =~ /^>/) {
-                push @available_chunks, $chunk_file;
-                $logger->info("Found valid RepeatScout chunk: $chunk_file");
-            }
-        }
-    }
-    
-    # Check if we have enough chunks for reuse
-    if (scalar(@available_chunks) >= $needed_chunks) {
-        $logger->info("Reusing " . scalar(@available_chunks) . " existing RepeatScout chunks (need $needed_chunks)");
-        
-        # Select the first N chunks we need
-        my @chunks_to_use = @available_chunks[0..($needed_chunks-1)];
-        
-        if ($needed_chunks == 1) {
-            # Single chunk: just copy it
-            my $cmd = "cp '$chunks_to_use[0]' '$refiner_genome'";
-            run_cmd($cmd);
-        } else {
-            # Multiple chunks: merge them
-            my @quoted_files = map { "'$_'" } @chunks_to_use;
-            my $cat_cmd = "cat " . join(" ", @quoted_files) . " > '$refiner_genome'";
-            system($cat_cmd) == 0 or do {
-                $logger->error("Failed to merge RepeatScout chunks for reuse");
-                return undef;
-            };
-        }
-        
-        # Verify the output file was created successfully
-        if (-s $refiner_genome) {
-            my $size = -s $refiner_genome;
-            $logger->info("Successfully created Refiner genome input from existing chunks: $refiner_genome ($size bytes)");
-            return $refiner_genome;
-        } else {
-            $logger->warn("Failed to create Refiner genome from existing chunks");
-            return undef;
-        }
-    } else {
-        $logger->info("Insufficient RepeatScout chunks for reuse (found: " . scalar(@available_chunks) . ", need: $needed_chunks)");
-        return undef;
-    }
-}
-
-sub which {
-    my ($program) = @_;
-    for my $path (split /:/, $ENV{PATH}) {
-        my $file = "$path/$program";
-        return $file if -x $file;
-    }
-    $logger->error("Cannot find $program in PATH");
-    die "Cannot find $program in PATH\n";
-}
-
-sub determine_sampling_strategy {
+sub determine_strategy {
     my ($genome_size) = @_;
     
-    my $mb_500 = 500 * 1024 * 1024;    # 500MB
-    my $gb_1 = 1024 * 1024 * 1024;     # 1GB
+    my $mb_200 = 200 * 1024 * 1024;    # 200MB
+    my $mb_800 = 800 * 1024 * 1024;   # 800MB  
+    my $gb_1 = 1 * 1024 * 1024 * 1024; # 1GB
+    my $gb_2 = 2 * 1024 * 1024 * 1024; # 2GB
     my $gb_3 = 3 * 1024 * 1024 * 1024; # 3GB
     my $gb_5 = 5 * 1024 * 1024 * 1024; # 5GB
     
-    if ($genome_size < $mb_500) {
-        # Small genome (<500Mb): fragment into 30Kb pieces
-        my $strategy = "fragment_all";
-        my $chunk_size = 30 * 1024;  # 30KB
-        my $num_chunks = 1;  # Single run
-        return ($strategy, $genome_size, $chunk_size, $num_chunks);
+    my (@lmer_sizes, @copy_thresholds, $strategy, $data_size, $num_samples);
+    
+    if ($genome_size < $mb_200) {
+        # Small genomes <200MB: use full genome
+        @lmer_sizes = (14, 16);
+        @copy_thresholds = (5, 3);
+        $strategy = "small_genome_parallel";
+        $data_size = $genome_size;
+        $num_samples = 1;
     }
-    elsif ($genome_size >= $mb_500 && $genome_size < $gb_1) {
-        # Medium genome (500Mb-1Gb): sample 500Mb in 30Kb chunks
-        my $strategy = "sample_single";
-        my $sample_size = 500 * 1024 * 1024;  # 500MB
-        my $chunk_size = 30 * 1024;  # 30KB
-        my $num_chunks = 1;  # Single run
-        return ($strategy, $sample_size, $chunk_size, $num_chunks);
+    elsif ($genome_size >= $mb_200 && $genome_size < $gb_1) {
+        # Medium genomes 200MB-1GB
+        @lmer_sizes = (14, 16, 18);
+        @copy_thresholds = (5, 5, 3);
+        if ($genome_size < $mb_800) {
+            $strategy = "medium_genome_full";
+            $data_size = $genome_size;
+            $num_samples = 1;
+        } else {
+            $strategy = "medium_genome_sampled";
+            $data_size = $mb_800;  # Sample 800MB
+            $num_samples = 1;
+        }
     }
-    elsif ($genome_size >= $gb_1 && $genome_size < $gb_3) {
-        # Large genome (1Gb-3Gb): sample 2×500Mb in 40Kb chunks
-        my $strategy = "sample_parallel";
-        my $sample_size = 500 * 1024 * 1024;  # 500MB per chunk
-        my $chunk_size = 40 * 1024;  # 40KB
-        my $num_chunks = 2;  # Two parallel runs
-        return ($strategy, $sample_size, $chunk_size, $num_chunks);
+    elsif ($genome_size >= $gb_1 && $genome_size < $gb_2) {
+        # Large genomes 1-2GB: single 800MB sample
+        @lmer_sizes = (14, 16, 18);
+        @copy_thresholds = (5, 5, 3);
+        $strategy = "large_genome_sampled";
+        $data_size = $mb_800;  # Sample 800MB
+        $num_samples = 1;
+    }
+    elsif ($genome_size >= $gb_2 && $genome_size < $gb_3) {
+        # Very large genomes 2-3GB: 2 samples of 800MB each (6 total jobs: 2 samples × 3 lmers)
+        @lmer_sizes = (14, 16, 18);
+        @copy_thresholds = (5, 5, 3);
+        $strategy = "very_large_genome_multi_sampled";
+        $data_size = $mb_800;  # Each sample 800MB
+        $num_samples = 2;
     }
     elsif ($genome_size >= $gb_3 && $genome_size < $gb_5) {
-        # Very large genome (3Gb-5Gb): sample 3×500Mb in 50Kb chunks
-        my $strategy = "sample_parallel";
-        my $sample_size = 500 * 1024 * 1024;  # 500MB per chunk
-        my $chunk_size = 50 * 1024;  # 50KB
-        my $num_chunks = 3;  # Three parallel runs
-        return ($strategy, $sample_size, $chunk_size, $num_chunks);
+        # Huge genomes 3-5GB: 3 samples of 800MB each (9 total jobs: 3 samples × 3 lmers)
+        @lmer_sizes = (14, 16, 18);
+        @copy_thresholds = (5, 5, 3);
+        $strategy = "huge_genome_multi_sampled";
+        $data_size = $mb_800;  # Each sample 800MB
+        $num_samples = 3;
     }
     else {
-        # Massive genome (>5Gb): sample 4×500Mb in 50Kb chunks
-        my $strategy = "sample_parallel";
-        my $sample_size = 500 * 1024 * 1024;  # 500MB per chunk
-        my $chunk_size = 50 * 1024;  # 50KB
-        my $num_chunks = 4;  # Four parallel runs
-        return ($strategy, $sample_size, $chunk_size, $num_chunks);
+        # Massive genomes >=5GB: 4 samples of 800MB each (12 total jobs: 4 samples × 3 lmers)
+        @lmer_sizes = (14, 16, 18);
+        @copy_thresholds = (5, 5, 3);
+        $strategy = "massive_genome_multi_sampled";
+        $data_size = $mb_800;  # Each sample 800MB
+        $num_samples = 4;
     }
+    
+    return ($strategy, $data_size, \@lmer_sizes, \@copy_thresholds, $num_samples);
 }
 
-sub process_genome_by_strategy {
-    my ($strategy, $num_chunks, $chunk_size) = @_;
+sub run_multi_parameter_repeatscout {
+    my ($strategy, $data_size, $lmer_sizes_ref, $copy_thresholds_ref, $num_samples) = @_;
     
-    $logger->info("Processing genome with strategy: $strategy");
+    my @lmer_sizes = @$lmer_sizes_ref;
+    my @copy_thresholds = @$copy_thresholds_ref;
     
-    if ($strategy eq "fragment_all") {
-        fragment_entire_genome($chunk_size);
+    $logger->info("Running multi-parameter RepeatScout analysis...");
+    
+    # Check for dust_trf_masking checkpoint first
+    my $masking_checkpoint = "dust_trf_masking";
+    my @working_genomes;
+    
+    if (check_checkpoint($masking_checkpoint) && !$config{force_overwrite}) {
+        $logger->info("Found existing dust and TRF masking checkpoint, looking for masked files...");
+        
+        # Try to find existing masked files based on strategy
+        if ($strategy =~ /multi_sampled/) {
+            # Look for multiple masked sample files
+            for my $sample_id (1..$num_samples) {
+                my $masked_file = "$config{tmp_dir}/genome_sample_${sample_id}_masked.fa";
+                if (-s $masked_file) {
+                    push @working_genomes, $masked_file;
+                    $logger->info("Found existing masked sample $sample_id: $masked_file");
+                }
+            }
+        } elsif ($strategy =~ /sampled/) {
+            # Look for single masked sample file
+            my $masked_file = "$config{tmp_dir}/genome_sample_masked.fa";
+            if (-s $masked_file) {
+                push @working_genomes, $masked_file;
+                $logger->info("Found existing masked sample: $masked_file");
+            }
+        } else {
+            # Look for full genome masked file
+            my $masked_file = "$config{tmp_dir}/tmp_masked.fa";
+            if (-s $masked_file) {
+                push @working_genomes, $masked_file;
+                $logger->info("Found existing masked genome: $masked_file");
+            }
+        }
     }
-    elsif ($strategy eq "sample_single") {
-        # Single sampling run
-        my $sample_size = 500 * 1024 * 1024;  # 500MB
-        my $num_samples = $sample_size / $chunk_size;
-        sample_genome_chunks($num_samples, $chunk_size);
-    }
-    else {
-        die "Unknown single sampling strategy: $strategy\n";
-    }
-}
-
-sub fragment_entire_genome {
-    my ($fragment_size) = @_;
     
-    $logger->info("Fragmenting entire genome into ${fragment_size}bp pieces...");
-    
-    # For small genomes, we should just copy the whole genome
-    # since fragmenting sequences shorter than fragment_size would result in empty output
-    my $genome_size = -s $config{genome_file};
-    
-    if ($genome_size < $fragment_size) {
-        # If genome is smaller than fragment size, just copy it as is
-        $logger->info("Genome smaller than fragment size, using entire genome");
-        my $cmd = "cp $config{genome_file} $config{tmp_dir}/tmp.fa";
-        run_cmd($cmd);
+    # If we found all expected masked files, use them; otherwise create new ones
+    if (@working_genomes == $num_samples || (@working_genomes == 1 && $num_samples == 1)) {
+        $logger->info("Using existing masked files from checkpoint");
     } else {
-        # Use seqkit sliding with step size = 1/10 of window to ensure coverage
-        # This creates overlapping fragments for better repeat detection
-        my $step_size = int($fragment_size / 10);
-        $step_size = $step_size > 0 ? $step_size : 1;
+        $logger->info("Creating new genome samples with masking...");
+        @working_genomes = ();  # Clear any partial results
         
-        my $cmd = join(" ",
-            "seqkit sliding",
-            "-s $step_size",           # Step size for overlap
-            "-W $fragment_size",       # Window size = fragment size
-            "-g",                      # Remove gap characters in sequences
-            "$config{genome_file}",
-            "> $config{tmp_dir}/tmp.fa"
-        );
-        
-        run_cmd($cmd);
-    }
-    
-    $logger->info("Genome fragmentation completed");
-}
-
-sub sample_genome_chunks {
-    my ($num_samples, $chunk_size) = @_;
-    
-    $logger->info("Sampling $num_samples chunks of ${chunk_size}bp from genome...");
-    
-    # First create an index if it doesn't exist
-    unless (-f "$config{genome_file}.fai") {
-        run_cmd("samtools faidx $config{genome_file}");
-    }
-    
-    # Use custom sampling function
-    sample_random_chunks($config{genome_file}, $num_samples, $chunk_size, "$config{tmp_dir}/tmp.fa");
-    
-    $logger->info("Random chunk sampling completed");
-}
-
-sub run_parallel_repeatscout {
-    my ($strategy, $sample_size_per_chunk, $chunk_size, $num_chunks, $lmer_size) = @_;
-    
-    $logger->info("Running parallel RepeatScout with $num_chunks chunks...");
-    
-    # Create index if needed
-    unless (-f "$config{genome_file}.fai") {
-        run_cmd("samtools faidx $config{genome_file}");
-    }
-    
-    # Create parallel work directories
-    my @chunk_dirs;
-    for my $i (1..$num_chunks) {
-        my $chunk_dir = "$config{tmp_dir}/chunk_$i";
-        make_path($chunk_dir) unless -d $chunk_dir;
-        push @chunk_dirs, $chunk_dir;
-    }
-    
-    # Generate sampling for each chunk (skip if existing and valid)
-    my $num_samples_per_chunk = int($sample_size_per_chunk / $chunk_size);
-    for my $i (1..$num_chunks) {
-        my $chunk_dir = $chunk_dirs[$i-1];
-        my $chunk_fa = "$chunk_dir/chunk.fa";
-        my $filtered_file = "$chunk_dir/repeats.filtered.fa";
-        
-        # Skip chunk generation if we already have a valid filtered result
-        if (!$config{force_overwrite} && -s $filtered_file) {
-            my $header_check = `head -1 "$filtered_file" 2>/dev/null`;
-            if ($header_check && $header_check =~ /^>/) {
-                my $size = -s $filtered_file;
-                $logger->info("Chunk $i: Found existing filtered results ($size bytes), skipping chunk generation");
-                next;
-            } else {
-                $logger->warn("Chunk $i: Existing filtered file appears invalid, will regenerate");
-            }
+        # Prepare working genomes (multiple samples for large genomes)
+        if ($strategy =~ /multi_sampled/) {
+            # Create multiple non-overlapping samples for large genomes
+            $logger->info("Creating $num_samples non-overlapping samples of " . sprintf("%.1f MB each", $data_size/1e6));
+            @working_genomes = create_non_overlapping_genome_samples($data_size, $num_samples);
+        } elsif ($strategy =~ /sampled/) {
+            # Single sample for medium genomes
+            my $working_genome = create_genome_sample($data_size);
+            push @working_genomes, $working_genome;
+        } else {
+            # Full genome for small genomes
+            my $working_genome = "$config{tmp_dir}/tmp.fa";
+            run_cmd("cp $config{genome_file} $working_genome");
+            
+            # Apply masking to full genome
+            my @masked_files = apply_soft_masking_to_samples($working_genome);
+            @working_genomes = @masked_files;
         }
-        
-        # Skip chunk generation if we already have a valid chunk.fa
-        if (!$config{force_overwrite} && -s $chunk_fa) {
-            my $header_check = `head -1 "$chunk_fa" 2>/dev/null`;
-            if ($header_check && $header_check =~ /^>/) {
-                my $size = -s $chunk_fa;
-                $logger->info("Chunk $i: Found existing chunk file ($size bytes), skipping generation");
-                next;
-            } else {
-                $logger->warn("Chunk $i: Existing chunk file appears invalid, will regenerate");
-            }
-        }
-        
-        $logger->info("Generating chunk $i: $num_samples_per_chunk samples of ${chunk_size}bp");
-        sample_random_chunks($config{genome_file}, $num_samples_per_chunk, $chunk_size, $chunk_fa);
     }
     
-    # Run RepeatScout in parallel using fork
-    use Parallel::ForkManager;
-    my $pm = Parallel::ForkManager->new($num_chunks);
+    # Run parallel RepeatScout with different sample×lmer combinations
+    my $pm = Parallel::ForkManager->new($config{threads});
+    my @result_files;
     
-    my @results;
+    my $job_id = 0;
+    for my $sample_idx (0..$#working_genomes) {
+        my $sample_genome = $working_genomes[$sample_idx];
+        
+        for my $lmer_idx (0..$#lmer_sizes) {
+            $pm->start and next;
+            
+            my $lmer = $lmer_sizes[$lmer_idx];
+            my $threshold = $copy_thresholds[$lmer_idx];
+            
+            # Include sample ID in job naming for multi-sample strategies
+            # run_single_repeatscout_job now includes filtering
+            my $result_file;
+            if ($strategy =~ /multi_sampled/) {
+                $result_file = run_single_repeatscout_job($sample_genome, $lmer, $threshold, $job_id, $sample_idx + 1);
+            } else {
+                $result_file = run_single_repeatscout_job($sample_genome, $lmer, $threshold, $job_id);
+            }
+            
+            $pm->finish(0, { result_file => $result_file });
+            $job_id++;
+        }
+    }
+    
+    # Collect results from parallel processes
     $pm->run_on_finish(sub {
-        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_ref) = @_;
-        if ($data_ref) {
-            push @results, $data_ref;
+        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data) = @_;
+        if ($data && $data->{result_file} && -s $data->{result_file}) {
+            push @result_files, $data->{result_file};
         }
     });
     
-    # Fork and run RepeatScout for each chunk
-    for my $i (1..$num_chunks) {
-        my $chunk_dir = $chunk_dirs[$i-1];
-        my $filtered_file = "$chunk_dir/repeats.filtered.fa";
-        
-        # Check if this chunk already has valid results before forking
-        if (!$config{force_overwrite} && -s $filtered_file) {
-            my $header_check = `head -1 "$filtered_file" 2>/dev/null`;
-            if ($header_check && $header_check =~ /^>/) {
-                my $size = -s $filtered_file;
-                $logger->info("Chunk $i: Found existing filtered results ($size bytes), skipping processing");
-                next;
-            } else {
-                $logger->warn("Chunk $i: Existing filtered file appears invalid, will regenerate");
-            }
+    $pm->wait_all_children;
+    
+    # Results are already filtered, just merge them
+    merge_repeatscout_results(\@result_files, "$config{tmp_dir}/repeats.fa");
+    
+    $logger->info("Multi-parameter RepeatScout analysis completed ($num_samples samples × " . scalar(@lmer_sizes) . " lmers = " . scalar(@result_files) . " jobs)");
+    $logger->info("All RepeatScout jobs completed with immediate filtering, results merged and ready for Refiner pipeline");
+}
+
+sub create_genome_sample {
+    my ($target_size) = @_;
+    
+    $logger->info("Creating genome sample of " . sprintf("%.1f MB", $target_size/1e6) . " using BED-based sampling");
+    
+    # Create initial empty mask BED file
+    my $mask_bed = "$config{tmp_dir}/sample_mask.bed";
+    open(my $mask_fh, '>', $mask_bed) or die "Cannot create mask BED file: $!";
+    close($mask_fh);
+    
+    # Generate sample using BED-based approach
+    $logger->info("Generating BED samples for target size: " . sprintf("%.1f MB", $target_size/1e6));
+    my @sample_beds = generate_progressive_bed_samples($target_size, 1, $mask_bed);
+    
+    unless (@sample_beds) {
+        $logger->error("No BED files were generated");
+        die "BED file generation failed\n";
+    }
+    
+    my $sample_bed = $sample_beds[0];
+    $logger->info("Generated BED file: $sample_bed");
+    
+    # Check if BED file was actually created
+    if (-s $sample_bed) {
+        my $bed_regions = `wc -l < '$sample_bed'`;
+        chomp($bed_regions);
+        $logger->info("BED file contains $bed_regions regions");
+    } else {
+        $logger->error("BED file is empty or missing: $sample_bed");
+        die "BED file creation failed\n";
+    }
+    
+    # Extract sequences using bedtools
+    my $sample_file = "$config{tmp_dir}/genome_sample.fa";
+    $logger->info("Extracting sequences to: $sample_file");
+    $logger->info("Using BED file: $sample_bed");
+    my $extraction_success = extract_sequences_from_bed($sample_bed, $sample_file);
+    
+    unless ($extraction_success) {
+        $logger->error("Failed to extract sequences from BED file: $sample_bed");
+        die "Sequence extraction failed for single sample\n";
+    }
+    
+    # Apply soft masking
+    my @masked_files = apply_soft_masking_to_samples($sample_file);
+    my $masked_sample = $masked_files[0];
+    
+    unless (-s $masked_sample) {
+        $logger->error("Masking failed - no output file created");
+        die "Sample masking failed\n";
+    }
+    
+    my $actual_size = -s $masked_sample;
+    $logger->info("BED-based sample created and masked: " . sprintf("%.1f MB", $actual_size/1e6));
+    $logger->info("Returning masked file for RepeatScout: $masked_sample");
+    
+    return $masked_sample;
+}
+
+sub create_non_overlapping_genome_samples {
+    my ($target_size, $num_samples) = @_;
+    
+    $logger->info("Creating $num_samples non-overlapping samples of " . sprintf("%.1f MB each", $target_size/1e6) . " using progressive BED-based sampling");
+    
+    # Create initial empty mask BED file
+    my $mask_bed = "$config{tmp_dir}/progressive_mask.bed";
+    open(my $mask_fh, '>', $mask_bed) or die "Cannot create mask BED file: $!";
+    close($mask_fh);
+    
+    # Generate progressive samples using BED-based approach
+    $logger->info("Generating progressive BED samples for $num_samples samples, target size: " . sprintf("%.1f MB each", $target_size/1e6));
+    my @sample_beds = generate_progressive_bed_samples($target_size, $num_samples, $mask_bed);
+    
+    unless (@sample_beds) {
+        $logger->error("No BED files were generated for any samples");
+        die "BED file generation failed for all samples\n";
+    }
+    
+    $logger->info("Generated " . scalar(@sample_beds) . " BED files");
+    
+    my @sample_files;
+    
+    # Extract sequences for each sample
+    for my $sample_id (1..$num_samples) {
+        my $sample_bed = $sample_beds[$sample_id - 1];
+        unless ($sample_bed) {
+            $logger->warn("No BED file for sample $sample_id, skipping");
+            next;
         }
         
-        $pm->start and next;  # Fork
+        $logger->info("Processing sample $sample_id with BED file: $sample_bed");
         
-        # Child process
+        # Check BED file before extraction
+        if (-s $sample_bed) {
+            my $bed_regions = `wc -l < '$sample_bed'`;
+            chomp($bed_regions);
+            $logger->info("Sample $sample_id BED file contains $bed_regions regions");
+        } else {
+            $logger->error("Sample $sample_id BED file is empty or missing: $sample_bed");
+            next;
+        }
+        
+        my $sample_file = "$config{tmp_dir}/genome_sample_${sample_id}.fa";
+        $logger->info("Extracting sequences for sample $sample_id to: $sample_file");
+        $logger->info("Using BED file for sample $sample_id: $sample_bed");
+        my $extraction_success = extract_sequences_from_bed($sample_bed, $sample_file);
+        
+        if ($extraction_success) {
+            $logger->info("Sample $sample_id extraction successful: " . sprintf("%.1f MB", (-s $sample_file)/1e6));
+            push @sample_files, $sample_file;
+        } else {
+            $logger->error("Failed to extract sequences for sample $sample_id from BED: $sample_bed");
+        }
+    }
+    
+    if (@sample_files == 0) {
+        $logger->error("No sample files were successfully created");
+        die "All sample extractions failed\n";
+    }
+    
+    $logger->info("Successfully created " . scalar(@sample_files) . " sample files out of $num_samples requested");
+    
+    # Apply soft masking to all samples in parallel
+    $logger->info("Applying soft masking to all " . scalar(@sample_files) . " samples...");
+    my @masked_files = apply_soft_masking_to_samples(@sample_files);
+    
+    # Filter out failed masking results
+    @masked_files = grep { -s $_ } @masked_files;
+    
+    if (@masked_files == 0) {
+        $logger->error("No masked files were successfully created");
+        die "All sample masking failed\n";
+    }
+    
+    # Log final results
+    for my $i (0..$#masked_files) {
+        my $actual_size = -s $masked_files[$i];
+        $logger->info("Progressive BED-based sample " . ($i + 1) . " created and masked: " . sprintf("%.1f MB", $actual_size/1e6));
+        $logger->info("Returning masked file " . ($i + 1) . " for RepeatScout: $masked_files[$i]");
+    }
+    
+    return @masked_files;
+}
+
+sub generate_progressive_bed_samples {
+    my ($target_size, $num_samples, $mask_bed) = @_;
+    
+    # Create genome index if needed
+    unless (-f "$config{genome_file}.fai") {
+        run_cmd("samtools faidx $config{genome_file}");
+    }
+    
+    my $window_size = 500000;  # 500kb windows
+    my $overlap_size = 0;  # No overlap between windows
+    my $effective_window = $window_size;  # Full 500kb chunks
+    my $num_windows_per_sample = int($target_size / $effective_window);
+    
+    $logger->info("Generating $num_samples progressive BED samples with ${num_windows_per_sample} windows each");
+    
+    my @sample_beds;
+    
+    for my $sample_id (1..$num_samples) {
+        $logger->info("Generating BED file for sample $sample_id...");
+        
+        my $sample_bed = "$config{tmp_dir}/sample_${sample_id}.bed";
+        $logger->info("Sample $sample_id BED file path: $sample_bed");
+        
+        generate_random_bed_regions($sample_bed, $num_windows_per_sample, $window_size, $mask_bed);
+        
+        # Check if BED file was created
+        if (-f $sample_bed) {
+            my $bed_size = count_bed_regions($sample_bed);
+            $logger->info("Sample $sample_id BED file created with $bed_size regions");
+            
+            if ($bed_size > 0) {
+                # Update the mask with current sample regions
+                update_mask_bed($mask_bed, $sample_bed);
+                push @sample_beds, $sample_bed;
+            } else {
+                $logger->warn("Sample $sample_id BED file is empty, skipping");
+            }
+        } else {
+            $logger->error("Failed to create BED file for sample $sample_id: $sample_bed");
+        }
+    }
+    
+    return @sample_beds;
+}
+
+sub generate_random_bed_regions {
+    my ($output_bed, $num_windows, $window_size, $mask_bed) = @_;
+    
+    $logger->info("Generating $num_windows random BED regions of size $window_size");
+    
+    # Get genome chromosome sizes
+    my %chr_sizes = read_genome_sizes("$config{genome_file}.fai");
+    my @chromosomes = keys %chr_sizes;
+    
+    if (@chromosomes == 0) {
+        $logger->error("No chromosomes found in genome index: $config{genome_file}.fai");
+        return;
+    }
+    
+    $logger->info("Found " . scalar(@chromosomes) . " chromosomes");
+    
+    # Calculate total genome size for proportional sampling
+    my $total_genome_size = 0;
+    $total_genome_size += $chr_sizes{$_} for @chromosomes;
+    
+    $logger->info("Total genome size: " . sprintf("%.1f MB", $total_genome_size/1e6));
+    
+    # Filter chromosomes that are large enough
+    my @valid_chromosomes = grep { $chr_sizes{$_} >= $window_size } @chromosomes;
+    
+    if (@valid_chromosomes == 0) {
+        $logger->error("No chromosomes are large enough for window size $window_size");
+        return;
+    }
+    
+    $logger->info("Valid chromosomes for sampling: " . scalar(@valid_chromosomes));
+    
+    open(my $bed_fh, '>', $output_bed) or die "Cannot create BED file $output_bed: $!";
+    
+    my $attempts = 0;
+    my $max_attempts = $num_windows * 10;  # Allow up to 10x attempts to find non-masked regions
+    my $regions_generated = 0;
+    
+    while ($regions_generated < $num_windows && $attempts < $max_attempts) {
+        $attempts++;
+        
+        # Choose random chromosome from valid ones
+        my $chr = $valid_chromosomes[int(rand(@valid_chromosomes))];
+        my $chr_size = $chr_sizes{$chr};
+        
+        # Generate random position with proper boundary checks
+        my $max_start = $chr_size - $window_size;
+        my $start = int(rand($max_start + 1));  # +1 to include max_start
+        my $end = $start + $window_size;
+        
+        # 确保重叠区域不会导致边界问题
+        if ($end > $chr_size) {
+            $end = $chr_size;
+            $start = max(0, $end - $window_size);
+        }
+        
+        # Double check boundaries (should not be needed but safety first)
+        if ($start < 0) {
+            $start = 0;
+            $end = $window_size;
+        }
+        if ($end > $chr_size) {
+            $end = $chr_size;
+            $start = $chr_size - $window_size;
+        }
+        
+        # Final validation
+        if ($start < 0 || $end > $chr_size || $start >= $end) {
+            next;  # Skip this iteration if coordinates are invalid
+        }
+        
+        # Check if this region overlaps with mask
+        unless (region_overlaps_mask($chr, $start, $end, $mask_bed)) {
+            print $bed_fh "$chr\t$start\t$end\n";
+            $regions_generated++;
+            
+            # Update mask without overlap since overlap_size is 0
+            # Simply add the current region to the mask
+            my $temp_region = "$config{tmp_dir}/temp_region_$$.bed";
+            open(my $temp_fh, '>', $temp_region) or next;
+            print $temp_fh "$chr\t$start\t$end\n";
+            close($temp_fh);
+            update_mask_bed($mask_bed, $temp_region);
+            unlink($temp_region);
+            
+            # Log progress every 100 regions
+            if ($regions_generated % 100 == 0) {
+                $logger->info("Generated $regions_generated/$num_windows regions");
+            }
+        }
+    }
+    
+    close($bed_fh);
+    
+    if ($regions_generated < $num_windows) {
+        $logger->warn("Only generated $regions_generated regions out of $num_windows requested (after $attempts attempts)");
+    } else {
+        $logger->info("Successfully generated $regions_generated BED regions");
+    }
+}
+
+sub read_genome_sizes {
+    my ($fai_file) = @_;
+    my %sizes;
+    
+    open(my $fai_fh, '<', $fai_file) or die "Cannot open FAI file $fai_file: $!";
+    while (my $line = <$fai_fh>) {
+        chomp $line;
+        my ($chr, $size) = split(/\t/, $line);
+        $sizes{$chr} = $size;
+    }
+    close($fai_fh);
+    
+    return %sizes;
+}
+
+sub choose_weighted_chromosome {
+    my ($chr_sizes_ref, $total_size) = @_;
+    my %chr_sizes = %$chr_sizes_ref;
+    
+    my $rand_pos = rand($total_size);
+    my $cumulative = 0;
+    
+    for my $chr (sort keys %chr_sizes) {
+        $cumulative += $chr_sizes{$chr};
+        if ($rand_pos <= $cumulative) {
+            return $chr;
+        }
+    }
+    
+    # Fallback to first chromosome if something goes wrong
+    return (sort keys %chr_sizes)[0];
+}
+
+sub region_overlaps_mask {
+    my ($chr, $start, $end, $mask_bed) = @_;
+    
+    # If mask is empty, no overlap
+    return 0 unless -s $mask_bed;
+    
+    # Create temporary BED file for this region
+    my $temp_region_bed = "$config{tmp_dir}/temp_region_$$.bed";
+    open(my $temp_fh, '>', $temp_region_bed) or die "Cannot create temp BED: $!";
+    print $temp_fh "$chr\t$start\t$end\n";
+    close($temp_fh);
+    
+    # Use bedtools intersect to check overlap
+    my $cmd = "bedtools intersect -a $temp_region_bed -b $mask_bed -u 2>/dev/null";
+    my $result = `$cmd`;
+    
+    # Clean up temp region file
+    unlink($temp_region_bed);
+    
+    # Return true if there's any overlap
+    return length($result) > 0;
+}
+
+sub update_mask_bed {
+    my ($mask_bed, $new_regions_bed) = @_;
+    
+    # If mask is empty, just copy new regions
+    unless (-s $mask_bed) {
+        run_cmd("cp $new_regions_bed $mask_bed");
+        return;
+    }
+    
+    # Merge existing mask with new regions (DISABLED - keeping temp files)
+    my $temp_merged = "$config{tmp_dir}/temp_merged_mask_$$.bed";
+    run_cmd("cat $mask_bed $new_regions_bed | bedtools sort | bedtools merge > $temp_merged");
+    # run_cmd("mv $temp_merged $mask_bed");  # DISABLED - keeping temp files
+    $logger->info("Would have moved $temp_merged to $mask_bed, but keeping both files");
+}
+
+# Function removed - no longer needed since we don't use overlapping regions
+
+sub count_bed_regions {
+    my ($bed_file) = @_;
+    return 0 unless -s $bed_file;
+    
+    my $count = `wc -l < $bed_file`;
+    chomp($count);
+    return $count;
+}
+
+sub validate_bed_file {
+    my ($bed_file) = @_;
+    
+    return 0 unless -s $bed_file;
+    
+    my $valid_lines = 0;
+    my $invalid_lines = 0;
+    my $temp_validated = "$bed_file.validated";
+    
+    open(my $in_fh, '<', $bed_file) or die "Cannot open BED file $bed_file: $!";
+    open(my $out_fh, '>', $temp_validated) or die "Cannot create validated BED file: $!";
+    
+    while (my $line = <$in_fh>) {
+        chomp $line;
+        next if $line =~ /^\s*$/;  # Skip empty lines
+        
+        my @fields = split(/\t/, $line);
+        if (@fields >= 3) {
+            my ($chr, $start, $end) = @fields[0..2];
+            
+            # Validate coordinates
+            if ($start =~ /^\d+$/ && $end =~ /^\d+$/ && $start >= 0 && $end > $start) {
+                print $out_fh "$chr\t$start\t$end\n";
+                $valid_lines++;
+            } else {
+                $invalid_lines++;
+                $logger->warn("Invalid BED line: $line (start=$start, end=$end)");
+            }
+        } else {
+            $invalid_lines++;
+            $logger->warn("Malformed BED line: $line");
+        }
+    }
+    
+    close($in_fh);
+    close($out_fh);
+    
+    if ($invalid_lines > 0) {
+        $logger->warn("Found $invalid_lines invalid lines in BED file $bed_file, fixed to $temp_validated");
+        # rename($temp_validated, $bed_file) or die "Cannot replace BED file: $!";  # DISABLED - keeping temp files
+        $logger->info("Would have replaced BED file with validated version, but keeping both files");
+    } else {
+        # unlink($temp_validated);  # DISABLED - keeping temp files
+    }
+    
+    return $valid_lines;
+}
+
+sub extract_sequences_from_bed {
+    my ($bed_file, $output_fasta) = @_;
+    
+    $logger->info("Extracting sequences from BED file: $bed_file");
+    
+    # Check if BED file exists
+    unless (-s $bed_file) {
+        $logger->error("BED file does not exist or is empty: $bed_file");
+        return 0;
+    }
+    
+    # Check if genome file exists and is accessible
+    unless (-s $config{genome_file}) {
+        $logger->error("Genome file does not exist or is empty: $config{genome_file}");
+        return 0;
+    }
+    
+    # Check if genome index exists
+    unless (-f "$config{genome_file}.fai") {
+        $logger->warn("Genome index missing, creating: $config{genome_file}.fai");
+        my $index_cmd = "samtools faidx '$config{genome_file}'";
         eval {
-            my $chunk_fa = "$chunk_dir/chunk.fa";
-            my $freq_file = "$chunk_dir/lmer.freq";
-            my $repeats_file = "$chunk_dir/repeats.fa";
-            my $filtered_file = "$chunk_dir/repeats.filtered.fa";
-            
-            # Check if chunk.fa exists (should have been checked above, but safety check)
-            die "Chunk file missing: $chunk_fa\n" unless -s $chunk_fa;
-            
-            # Build lmer table for this chunk (skip if exists and valid)
-            if (!$config{force_overwrite} && -s $freq_file) {
-                $logger->info("Found existing lmer table for chunk $i, skipping build_lmer_table");
-            } else {
-                $logger->info("Building lmer table for chunk $i...");
-                my $cmd = "build_lmer_table -l $lmer_size -sequence $chunk_fa -freq $freq_file 2> $chunk_dir/build_lmer.log";
-                system($cmd) == 0 or die "Failed to build lmer table for chunk $i: $?\n";
-            }
-            
-            # Run RepeatScout for this chunk (skip if exists and valid)
-            if (!$config{force_overwrite} && -s $repeats_file) {
-                my $header_check = `head -1 "$repeats_file" 2>/dev/null`;
-                if ($header_check && $header_check =~ /^>/) {
-                    $logger->info("Found existing RepeatScout results for chunk $i, skipping RepeatScout");
-                } else {
-                    $logger->warn("Existing RepeatScout file appears invalid for chunk $i, will regenerate");
-                    goto run_repeatscout;
-                }
-            } else {
-                run_repeatscout:
-                $logger->info("Running RepeatScout for chunk $i...");
-                my $cmd = "RepeatScout -sequence $chunk_fa -output $repeats_file -freq $freq_file -l $lmer_size -tandemdist 50 -minthresh 3 2> $chunk_dir/repeatscout.log";
-                system($cmd) == 0 or die "Failed to run RepeatScout for chunk $i: $?\n";
-            }
-            
-            # Filter results for this chunk (skip if exists and valid)
-            if (!$config{force_overwrite} && -s $filtered_file) {
-                my $header_check = `head -1 "$filtered_file" 2>/dev/null`;
-                if ($header_check && $header_check =~ /^>/) {
-                    $logger->info("Found existing filtered results for chunk $i, skipping filtering");
-                } else {
-                    $logger->warn("Existing filtered file appears invalid for chunk $i, will regenerate");
-                    goto run_filter;
-                }
-            } else {
-                run_filter:
-                $logger->info("Filtering repeats for chunk $i...");
-                $ENV{TRF_COMMAND} = which('trf');
-                $ENV{RMBLAST_DIR} = $config{rmblast_dir};
-                my $filter_threads = int($config{threads} / $config{parallel_chunks}) || 1;
-                my $filter_script = File::Spec->catfile($FindBin::RealBin, 'filter-stage-1.prl');
-                system("$filter_script -t $filter_threads $repeats_file > $filtered_file 2> $chunk_dir/filter.log") == 0
-                    or die "Failed to filter repeats for chunk $i: $?\n";
-            }
-            
-            $logger->info("Chunk $i completed successfully");
+            run_cmd($index_cmd);
+        };
+        if ($@) {
+            $logger->error("Failed to create genome index: $@");
+            return 0;
+        }
+    }
+    
+    # Test genome file accessibility by reading the first sequence header
+    my $first_header = `head -1 '$config{genome_file}'`;
+    chomp($first_header);
+    unless ($first_header =~ /^>/) {
+        $logger->error("Genome file does not appear to be in FASTA format: $first_header");
+        return 0;
+    }
+    $logger->info("Genome file format check passed: $first_header");
+    
+    # Validate and clean the BED file first
+    my $valid_regions = validate_bed_file($bed_file);
+    if ($valid_regions == 0) {
+        $logger->error("No valid regions found in BED file: $bed_file");
+        return 0;
+    }
+    
+    # Test bedtools with the first BED region before full extraction
+    my $test_bed = "$bed_file.test.$$";  # Add process ID to avoid conflicts
+    my $test_output = "$output_fasta.test.$$";
+    
+    # Create a test BED file with just the first region
+    my $first_region = `head -1 '$bed_file'`;
+    chomp($first_region);
+    
+    if ($first_region) {
+        open(my $test_fh, '>', $test_bed) or die "Cannot create test BED: $!";
+        print $test_fh "$first_region\n";
+        close($test_fh);
+        
+        my $test_cmd = "bedtools getfasta -fi '$config{genome_file}' -bed '$test_bed' -fo '$test_output'";
+        $logger->info("Testing bedtools with first region: $first_region");
+        
+        eval {
+            run_cmd($test_cmd);
         };
         
-        if ($@) {
-            $logger->error("Chunk $i failed: $@");
-            $pm->finish(1);  # Exit child with error
+        if ($@ || !-s $test_output) {
+            $logger->error("bedtools test extraction failed: $@");
+            $logger->error("Test command: $test_cmd");
+            # safe_unlink($test_bed, $test_output);  # DISABLED - keeping temp files
+            return 0;
         } else {
-            $pm->finish(0);  # Exit child successfully
+            $logger->info("bedtools test extraction successful");
+            # safe_unlink($test_bed, $test_output);  # DISABLED - keeping temp files
         }
+    }
+    
+    # Use bedtools getfasta to extract sequences
+    my $cmd = "bedtools getfasta -fi '$config{genome_file}' -bed '$bed_file' -fo '$output_fasta'";
+    
+    $logger->info("Running bedtools command: $cmd");
+    
+    # Check all file paths before running bedtools
+    $logger->info("Genome file: $config{genome_file} (size: " . (-s $config{genome_file}) . " bytes)");
+    $logger->info("BED file: $bed_file (size: " . (-s $bed_file) . " bytes)");
+    $logger->info("Output file: $output_fasta");
+    
+    # Check if bedtools is available
+    my $bedtools_check = `which bedtools 2>/dev/null`;
+    if (!$bedtools_check) {
+        $logger->error("bedtools command not found in PATH");
+        return 0;
+    }
+    
+    eval {
+        run_cmd($cmd);
+    };
+    
+    if ($@) {
+        $logger->error("bedtools getfasta failed: $@");
+        $logger->error("Command that failed: $cmd");
+        return 0;
+    }
+    
+    # Check if output file was created successfully
+    unless (-s $output_fasta) {
+        $logger->error("No sequences extracted - output file is empty: $output_fasta");
+        return 0;
+    }
+    
+    # Log extraction results
+    my $seq_count = `grep -c '^>' '$output_fasta' 2>/dev/null || echo 0`;
+    chomp($seq_count);
+    my $file_size = -s $output_fasta;
+    $logger->info("Extracted $seq_count sequences (" . sprintf("%.1f MB", $file_size/1e6) . ") to $output_fasta");
+    
+    return 1;  # Success
+}
+
+sub apply_soft_masking_to_samples {
+    my (@sample_files) = @_;
+    
+    $logger->info("Applying dust and TRF soft masking to " . scalar(@sample_files) . " samples with thread-based splitting");
+    
+    # Calculate optimal splitting strategy
+    my ($dust_threads_per_sample, $total_dust_jobs) = calculate_dust_parallelization(scalar(@sample_files));
+    
+    $logger->info("Dust parallelization: $dust_threads_per_sample threads per sample, $total_dust_jobs total jobs");
+    
+    my @all_masked_files;
+    
+    # Process each sample with its own thread allocation
+    for my $sample_file (@sample_files) {
+        my $masked_file = apply_soft_masking_with_splitting($sample_file, $dust_threads_per_sample);
+        if ($masked_file && -s $masked_file) {
+            push @all_masked_files, $masked_file;
+        } else {
+            $logger->error("Masking failed for sample: $sample_file");
+        }
+    }
+    
+    $logger->info("Soft masking completed for all samples");
+    
+    # Create checkpoint after successful masking (checkpoint name is fixed)
+    if (@all_masked_files == @sample_files) {
+        create_checkpoint("dust_trf_masking");
+        $logger->info("Dust and TRF masking checkpoint created successfully");
+    } else {
+        $logger->warn("Not all samples were masked successfully, skipping checkpoint creation");
+    }
+    
+    return @all_masked_files;
+}
+
+sub calculate_dust_parallelization {
+    my ($num_samples) = @_;
+    
+    my $total_threads = $config{threads};
+    
+    # Strategy: maximize dust parallelization while keeping reasonable sample processing
+    if ($num_samples == 1) {
+        # Single sample: use all threads for dust splitting
+        return ($total_threads, $total_threads);
+    } elsif ($num_samples <= 4) {
+        # Few samples: allocate threads evenly, minimum 2 per sample
+        my $threads_per_sample = max(2, int($total_threads / $num_samples));
+        return ($threads_per_sample, $num_samples * $threads_per_sample);
+    } else {
+        # Many samples: limit to reasonable split sizes
+        my $threads_per_sample = max(2, min(8, int($total_threads / 4)));
+        return ($threads_per_sample, $num_samples * $threads_per_sample);
+    }
+}
+
+sub apply_soft_masking_with_splitting {
+    my ($sample_file, $dust_threads) = @_;
+    
+    # Check if input file exists
+    unless (-s $sample_file) {
+        $logger->error("Sample file does not exist or is empty: $sample_file");
+        return undef;
+    }
+    
+    my $sample_basename = basename($sample_file, '.fa');
+    my $working_dir = dirname($sample_file);
+    
+    $logger->info("Applying soft masking directly to: $sample_basename");
+    
+    # Step 1: Apply dust masking directly to the whole sample
+    my $dust_masked = "$working_dir/${sample_basename}_dust.fa";
+    $logger->info("Applying dust masking to: $sample_basename");
+    apply_dust_masking($sample_file, $dust_masked);
+    
+    unless (-s $dust_masked) {
+        $logger->error("Dust masking failed for: $sample_basename");
+        return undef;
+    }
+    
+    # Step 2: Apply TRF masking directly to the dust-masked file
+    my $final_masked = "$working_dir/${sample_basename}_masked.fa";
+    $logger->info("Applying TRF masking to dust-masked file: $sample_basename");
+    apply_trf_masking($dust_masked, $final_masked);
+    
+    unless (-s $final_masked) {
+        $logger->error("TRF masking failed for: $sample_basename");
+        return undef;
+    }
+    
+    # Clean up temporary files after TRF completion
+    $logger->info("Cleaning up temporary files in $working_dir");
+    
+    # Clean up HTML files generated by TRF
+    my @html_files = glob("$working_dir/*.html");
+    for my $html_file (@html_files) {
+        if (-f $html_file) {
+            unlink($html_file);
+            $logger->debug("Removed HTML file: $html_file");
+        }
+    }
+    if (@html_files) {
+        $logger->info("Removed " . scalar(@html_files) . " HTML files");
+    }
+    
+    # Clean up TRF dat files if present
+    my @dat_files = glob("$working_dir/*.dat");
+    for my $dat_file (@dat_files) {
+        if (-f $dat_file) {
+            unlink($dat_file);
+            $logger->debug("Removed TRF dat file: $dat_file");
+        }
+    }
+    if (@dat_files) {
+        $logger->info("Removed " . scalar(@dat_files) . " TRF dat files");
+    }
+    
+    # Clean up TRF mask files
+    my @mask_files = glob("$working_dir/*.2.7.7.80.10.50.500.mask");
+    for my $mask_file (@mask_files) {
+        if (-f $mask_file) {
+            unlink($mask_file);
+            $logger->debug("Removed TRF mask file: $mask_file");
+        }
+    }
+    if (@mask_files) {
+        $logger->info("Removed " . scalar(@mask_files) . " TRF mask files");
+    }
+    
+    # Clean up the intermediate dust file
+    if (-f $dust_masked) {
+        unlink($dust_masked);
+        $logger->debug("Removed intermediate dust file: $dust_masked");
+    }
+    
+    # Log masking statistics
+    my $original_size = -s $sample_file;
+    my $masked_size = -s $final_masked;
+    $logger->info("Sample $sample_basename masked: " . 
+                 sprintf("%.1f MB -> %.1f MB", $original_size/1e6, $masked_size/1e6));
+    
+    return $final_masked;
+}
+
+sub split_sample_for_dust {
+    my ($sample_file, $num_splits) = @_;
+    
+    return ($sample_file) if $num_splits <= 1;
+    
+    # Check if input file exists and has content
+    unless (-s $sample_file) {
+        $logger->error("Cannot split sample file - file is empty or missing: $sample_file");
+        return ();
+    }
+    
+    my $sample_basename = basename($sample_file, '.fa');
+    my $working_dir = dirname($sample_file);
+    
+    $logger->info("Splitting sample $sample_basename into $num_splits parts for parallel dust processing");
+    
+    # Count sequences first
+    my $seq_count = `grep -c '^>' $sample_file`;
+    chomp($seq_count);
+    
+    if ($seq_count <= $num_splits) {
+        $logger->info("Sample has only $seq_count sequences, using sequence-based splitting");
+        return split_by_sequences($sample_file, $num_splits);
+    } else {
+        $logger->info("Using size-based splitting for $seq_count sequences");
+        return split_by_size($sample_file, $num_splits);
+    }
+}
+
+sub split_by_sequences {
+    my ($sample_file, $num_splits) = @_;
+    
+    return ($sample_file) unless -s $sample_file;
+    
+    my $sample_basename = basename($sample_file, '.fa');
+    my $working_dir = dirname($sample_file);
+    
+    $logger->info("Splitting $sample_basename by sequences ($num_splits parts)");
+    
+    # Use seqkit to split by sequence count
+    my $cmd = "seqkit split --quiet -p $num_splits '$sample_file' -O '$working_dir'";
+    
+    eval {
+        run_cmd($cmd);
+    };
+    
+    if ($@) {
+        $logger->warn("seqkit sequence splitting failed, using fallback");
+        return split_by_simple_method($sample_file, $num_splits);
+    }
+    
+    # Find the created split files
+    my @split_files = glob("$working_dir/${sample_basename}.fa.split/*.fa");
+    
+    if (!@split_files) {
+        $logger->warn("No split files found, using fallback");
+        return split_by_simple_method($sample_file, $num_splits);
+    }
+    
+    # Rename files to a predictable pattern (DISABLED - keeping original names)
+    my @renamed_files;
+    for my $i (0..$#split_files) {
+        my $new_name = "$working_dir/${sample_basename}_split_$i.fa";
+        # run_cmd("mv '$split_files[$i]' '$new_name'");  # DISABLED - keeping temp files
+        $logger->info("Would have renamed $split_files[$i] to $new_name, but keeping original name");
+        push @renamed_files, $split_files[$i];  # Use original filename
+    }
+    
+    # Clean up seqkit split directory safely
+    my $split_dir = "$working_dir/${sample_basename}.fa.split";
+    if (-d $split_dir) {
+        $logger->info("Cleaning up seqkit split directory: $split_dir");
+        run_cmd("rm -rf '$split_dir'");
+    }
+    
+    $logger->info("Split into " . scalar(@renamed_files) . " sequence-based parts");
+    return @renamed_files;
+}
+
+sub split_by_size {
+    my ($sample_file, $num_splits) = @_;
+    
+    return ($sample_file) unless -s $sample_file;
+    
+    my $sample_basename = basename($sample_file, '.fa');
+    my $working_dir = dirname($sample_file);
+    
+    # Get file size and calculate split size
+    my $total_size = -s $sample_file;
+    my $target_size = int($total_size / $num_splits);
+    
+    return ($sample_file) if $target_size <= 0;
+    
+    $logger->info("Splitting $sample_basename by size ($num_splits parts, ${target_size}B each)");
+    
+    # Use seqkit to split by size
+    my $cmd = "seqkit split --quiet -s $target_size '$sample_file' -O '$working_dir'";
+    
+    eval {
+        run_cmd($cmd);
+    };
+    
+    if ($@) {
+        $logger->warn("seqkit size splitting failed, using fallback");
+        return split_by_simple_method($sample_file, $num_splits);
+    }
+    
+    # Find the created split files
+    my @split_files = glob("$working_dir/${sample_basename}.fa.split/*.fa");
+    
+    if (!@split_files) {
+        $logger->warn("No split files found, using fallback");
+        return split_by_simple_method($sample_file, $num_splits);
+    }
+    
+    # Rename files to a predictable pattern (DISABLED - keeping original names)
+    my @renamed_files;
+    for my $i (0..$#split_files) {
+        my $new_name = "$working_dir/${sample_basename}_split_$i.fa";
+        # run_cmd("mv '$split_files[$i]' '$new_name'");  # DISABLED - keeping temp files
+        $logger->info("Would have renamed $split_files[$i] to $new_name, but keeping original name");
+        push @renamed_files, $split_files[$i];  # Use original filename
+    }
+    
+    # Clean up seqkit split directory safely
+    my $split_dir = "$working_dir/${sample_basename}.fa.split";
+    if (-d $split_dir) {
+        $logger->info("Cleaning up seqkit split directory: $split_dir");
+        run_cmd("rm -rf '$split_dir'");
+    }
+    
+    $logger->info("Split into " . scalar(@renamed_files) . " size-based parts");
+    return @renamed_files;
+}
+
+sub split_by_simple_method {
+    my ($sample_file, $num_splits) = @_;
+    
+    $logger->info("Using simple FASTA-aware splitting fallback method");
+    
+    my $sample_basename = basename($sample_file, '.fa');
+    my $working_dir = dirname($sample_file);
+    
+    # Count sequences in the file
+    my $seq_count = `grep -c '^>' '$sample_file'`;
+    chomp($seq_count);
+    
+    # Check if file exists and has content
+    unless (-s $sample_file && $seq_count && $seq_count =~ /^\d+$/ && $seq_count > 0) {
+        $logger->error("Sample file is empty or missing sequences: $sample_file (sequences: '$seq_count')");
+        return ();
+    }
+    
+    # If too few sequences for splitting, return original file
+    if ($seq_count < $num_splits) {
+        $logger->info("File has only $seq_count sequences, cannot split into $num_splits parts");
+        return ($sample_file);
+    }
+    
+    my $seqs_per_split = int($seq_count / $num_splits) + 1;
+    my @split_files;
+    
+    # Manual FASTA-aware splitting
+    $logger->info("Splitting $seq_count sequences into $num_splits parts (~$seqs_per_split sequences each)");
+    
+    open(my $in_fh, '<', $sample_file) or die "Cannot open $sample_file: $!";
+    
+    my $current_split = 0;
+    my $current_seq_count = 0;
+    my $out_fh;
+    my $current_file;
+    
+    while (my $line = <$in_fh>) {
+        # Start new split file if needed
+        if ($line =~ /^>/) {
+            if ($current_seq_count >= $seqs_per_split || !$out_fh) {
+                # Close previous file
+                close($out_fh) if $out_fh;
+                
+                # Open new split file
+                $current_file = "$working_dir/${sample_basename}_part_" . sprintf("%03d", $current_split) . ".fa";
+                open($out_fh, '>', $current_file) or die "Cannot create split file $current_file: $!";
+                push @split_files, $current_file;
+                
+                $current_split++;
+                $current_seq_count = 0;
+                
+                last if $current_split >= $num_splits && scalar(@split_files) >= $num_splits;
+            }
+            $current_seq_count++;
+        }
+        
+        # Write line to current split file
+        print $out_fh $line if $out_fh;
+    }
+    
+    close($out_fh) if $out_fh;
+    close($in_fh);
+    
+    $logger->info("Simple FASTA-aware split created " . scalar(@split_files) . " parts");
+    return @split_files;
+}
+
+sub apply_dust_masking_parallel {
+    my ($split_files_ref) = @_;
+    my @split_files = @$split_files_ref;
+    
+    $logger->info("Applying dust masking to " . scalar(@split_files) . " split parts in parallel");
+    
+    # Use parallel processing for dust masking
+    my $pm = Parallel::ForkManager->new(scalar(@split_files));
+    my @dust_masked_files;
+    
+    # Collect results from parallel processes
+    $pm->run_on_finish(sub {
+        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data) = @_;
+        if ($data && $data->{masked_file} && -s $data->{masked_file}) {
+            push @dust_masked_files, $data->{masked_file};
+        }
+    });
+    
+    for my $split_file (@split_files) {
+        $pm->start and next;
+        
+        my $split_basename = basename($split_file, '.fa');
+        my $working_dir = dirname($split_file);
+        my $dust_masked = "$working_dir/${split_basename}_dust.fa";
+        
+        apply_dust_masking($split_file, $dust_masked);
+        
+        $pm->finish(0, { masked_file => $dust_masked });
     }
     
     $pm->wait_all_children;
     
-    # Merge results from all chunks
-    $logger->info("Merging results from $num_chunks chunks...");
-    merge_parallel_results(\@chunk_dirs);
-    
-    $logger->info("Parallel RepeatScout processing completed");
+    $logger->info("Dust masking completed for all split parts");
+    return sort @dust_masked_files;  # Sort to maintain order
 }
 
-sub merge_parallel_results {
-    my ($chunk_dirs) = @_;
+sub apply_trf_masking_parallel {
+    my ($dust_files_ref) = @_;
+    my @dust_files = @$dust_files_ref;
     
-    my $merged_file = "$config{tmp_dir}/repeats.filtered.fa";
+    $logger->info("Applying TRF masking to " . scalar(@dust_files) . " dust-masked parts in parallel");
     
-    # Collect all filtered results
-    my @filtered_files;
-    for my $chunk_dir (@$chunk_dirs) {
-        my $filtered_file = "$chunk_dir/repeats.filtered.fa";
-        if (-s $filtered_file) {
-            # Verify file contains sequences by checking for FASTA headers
-            my $header_check = `head -1 "$filtered_file" 2>/dev/null`;
-            if ($header_check && $header_check =~ /^>/) {
-                push @filtered_files, $filtered_file;
-                $logger->info("Found valid filtered results in $chunk_dir");
-            } else {
-                $logger->warn("Filtered file in $chunk_dir exists but appears empty or invalid");
-            }
-        } else {
-            $logger->warn("No filtered results found in $chunk_dir");
+    # Use parallel processing for TRF masking
+    my $pm = Parallel::ForkManager->new(scalar(@dust_files));
+    my @trf_masked_files;
+    
+    # Collect results from parallel processes
+    $pm->run_on_finish(sub {
+        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data) = @_;
+        if ($data && $data->{masked_file} && -s $data->{masked_file}) {
+            push @trf_masked_files, $data->{masked_file};
+        }
+    });
+    
+    for my $dust_file (@dust_files) {
+        $pm->start and next;
+        
+        my $dust_basename = basename($dust_file, '.fa');
+        # Remove _dust suffix if present
+        $dust_basename =~ s/_dust$//;
+        my $working_dir = dirname($dust_file);
+        my $trf_masked = "$working_dir/${dust_basename}_trf.fa";
+        
+        apply_trf_masking($dust_file, $trf_masked);
+        
+        $pm->finish(0, { masked_file => $trf_masked });
+    }
+    
+    $pm->wait_all_children;
+    
+    $logger->info("TRF masking completed for all dust-masked parts");
+    
+    # Clean up all intermediate part files after TRF masking
+    my $cleanup_cmd = "rm -f $config{tmp_dir}/*part* 2>/dev/null";
+    system($cleanup_cmd);
+    $logger->info("Cleaned up intermediate part files");
+    
+    return sort @trf_masked_files;  # Sort to maintain order
+}
+
+sub merge_fasta_files {
+    my ($files_ref, $output_file) = @_;
+    my @files = @$files_ref;
+    
+    $logger->info("Merging " . scalar(@files) . " dust-masked parts");
+    
+    # Simple concatenation
+    my $cmd = "cat " . join(" ", map { "'$_'" } @files) . " > '$output_file'";
+    run_cmd($cmd);
+    
+    my $merged_size = -s $output_file;
+    $logger->info("Merged file size: " . sprintf("%.1f MB", $merged_size/1e6));
+}
+
+sub apply_dust_masking {
+    my ($input_file, $output_file) = @_;
+    
+    $logger->info("Applying dust masking to: " . basename($input_file));
+    
+    # Use dustmasker from BLAST+ suite for low-complexity region masking
+    my $cmd = "dustmasker -in $input_file -out $output_file -outfmt fasta -parse_seqids";
+    
+    eval {
+        run_cmd($cmd);
+    };
+    
+    if ($@ || !-s $output_file) {
+        $logger->warn("dustmasker failed, trying alternative dust implementation");
+        # Fallback: try sdust if available
+        eval {
+            my $alt_cmd = "sdust $input_file > $output_file";
+            run_cmd($alt_cmd);
+        };
+        
+        if ($@ || !-s $output_file) {
+            $logger->warn("All dust implementations failed, copying original file");
+            run_cmd("cp $input_file $output_file");
         }
     }
     
-    die "No filtered results found from any chunk\n" unless @filtered_files;
-    
-    # Direct concatenation with proper file quoting
-    $logger->info("Concatenating results from " . scalar(@filtered_files) . " chunks...");
-    
-    # Quote all filenames to handle spaces and special characters
-    my @quoted_files = map { "'$_'" } @filtered_files;
-    my $cat_cmd = "cat " . join(" ", @quoted_files) . " > '$merged_file'";
-    
-    # Use system call instead of run_cmd to avoid string escaping issues
-    $logger->info("Executing merge command: $cat_cmd");
-    my $result = system($cat_cmd);
-    if ($result != 0) {
-        $logger->error("Failed to merge chunk results: exit code " . ($result >> 8));
-        die "Failed to merge chunk results\n";
-    }
-    
-    # Verify the merged file was created successfully
-    if (-s $merged_file) {
-        my $merged_size = -s $merged_file;
-        $logger->info("Results merging completed successfully - merged file size: $merged_size bytes");
-    } else {
-        $logger->error("Merged file is empty or was not created");
-        die "Merged file is empty or was not created\n";
-    }
+    $logger->info("Dust masking completed for: " . basename($input_file));
 }
 
-
-sub sample_random_chunks_legacy {
-    my ($genome_file, $num_samples, $chunk_size, $output_file) = @_;
+sub apply_trf_masking {
+    my ($input_file, $output_file) = @_;
     
-    # Read genome index to get sequence information
-    my @sequences;
-    open(my $fai_fh, '<', "$genome_file.fai") or die "Cannot read fai file: $!\n";
-    while (my $line = <$fai_fh>) {
-        chomp $line;
-        my ($seq_name, $length) = split(/\t/, $line);
-        # Include all sequences, even those shorter than chunk size
-        push @sequences, {name => $seq_name, length => $length};
-    }
-    close($fai_fh);
+    $logger->info("Applying TRF masking to: " . basename($input_file));
     
-    die "No sequences long enough for sampling\n" unless @sequences;
+    my $working_dir = dirname($input_file);
+    my $input_basename = basename($input_file, '.fa');
     
-    # Calculate total available length
-    my $total_length = 0;
-    for my $seq (@sequences) {
-        if ($seq->{length} >= $chunk_size) {
-            $total_length += $seq->{length} - $chunk_size + 1;  # Available positions for sampling
-        } else {
-            $total_length += 1;  # Can use the whole sequence as one sample
+    # TRF parameters: match=2, mismatch=7, delta=7, PM=80, PI=10, minscore=50, maxperiod=500
+    my $cmd = "trf $input_file 2 7 7 80 10 50 500 -d -m";
+    
+    my $original_dir = getcwd();
+    eval {
+        # Change to working directory for TRF (it creates output files in current dir)
+        chdir($working_dir) or die "Cannot change to $working_dir: $!";
+        
+        # Run TRF - capture output but don't fail on non-zero exit code
+        $logger->info("Running TRF command: $cmd");
+        my $trf_output = `$cmd 2>&1`;
+        my $trf_exit_code = $? >> 8;
+        
+        # Log TRF output for debugging
+        if ($trf_output) {
+            $logger->debug("TRF output: $trf_output");
         }
-    }
-    
-    $logger->info("Total sequences: " . scalar(@sequences));
-    $logger->info("Total available positions: $total_length");
-    
-    # Generate random sampling positions
-    my @samples;
-    my $attempts = 0;
-    my $max_attempts = $num_samples * 10;
-    
-    while (@samples < $num_samples && $attempts < $max_attempts) {
-        $attempts++;
+        if ($trf_exit_code != 0) {
+            $logger->warn("TRF exited with code: $trf_exit_code");
+        }
         
-        # Randomly select a sequence weighted by length
-        my $rand_pos = int(rand($total_length));
-        my $cumulative = 0;
-        my $selected_seq;
+        # Wait a moment for TRF to finish writing files
+        sleep(2);
         
-        for my $seq (@sequences) {
-            my $available_positions;
-            if ($seq->{length} >= $chunk_size) {
-                $available_positions = $seq->{length} - $chunk_size + 1;
-            } else {
-                $available_positions = 1;  # Can only take the whole sequence
-            }
-            $cumulative += $available_positions;
-            if ($rand_pos < $cumulative) {
-                $selected_seq = $seq;
+        # TRF creates a .mask file - try different possible names
+        my $base_without_ext = basename($input_file);
+        my @possible_mask_files = (
+            "$input_basename.fa.2.7.7.80.10.50.500.mask",
+            "${input_basename}_dust.fa.2.7.7.80.10.50.500.mask",
+            basename($input_file) . ".2.7.7.80.10.50.500.mask",
+            "$base_without_ext.2.7.7.80.10.50.500.mask"
+        );
+        
+        # Also check for any TRF output files in the directory
+        my @trf_mask_files = glob("*.2.7.7.80.10.50.500.mask");
+        if (@trf_mask_files) {
+            $logger->info("Found TRF mask files: " . join(", ", @trf_mask_files));
+            push @possible_mask_files, @trf_mask_files;
+        }
+        
+        my $found_mask = 0;
+        for my $trf_mask_file (@possible_mask_files) {
+            if (-s $trf_mask_file) {
+                # Move the masked file to desired output location
+                run_cmd("mv $trf_mask_file $output_file");
+                $logger->info("Moved TRF mask file: $trf_mask_file -> $output_file");
+                $found_mask = 1;
                 last;
             }
         }
         
-        next unless $selected_seq;
-        
-        # Handle position selection based on sequence length
-        my ($start_pos, $end_pos);
-        if ($selected_seq->{length} >= $chunk_size) {
-            # Random position within selected sequence
-            my $max_start = $selected_seq->{length} - $chunk_size;
-            $start_pos = int(rand($max_start)) + 1;  # 1-based coordinates
-            $end_pos = $start_pos + $chunk_size - 1;
+        if ($found_mask) {
+            $logger->info("TRF masking successful");
         } else {
-            # For sequences shorter than chunk size, take the whole sequence
-            $start_pos = 1;
-            $end_pos = $selected_seq->{length};
+            $logger->warn("TRF mask file not found, copying input file");
+            run_cmd("cp $input_file $output_file");
         }
         
-        # Create sample entry
-        my $sample_id = sprintf("sample_%04d_%s_%d_%d", 
-                               scalar(@samples), $selected_seq->{name}, $start_pos, $end_pos);
-        
-        push @samples, {
-            id => $sample_id,
-            seq => $selected_seq->{name},
-            start => $start_pos,
-            end => $end_pos
-        };
-        
-        if (@samples % 500 == 0) {
-            $logger->info("Generated " . scalar(@samples) . " / $num_samples samples");
+        # Clean up all TRF intermediate files in the specific working directory  
+        # Note: These are cleaned up later in cleanup_tmp_directory() for better control
+        my @trf_files = glob("$working_dir/*.2.7.7.80.10.50.500.*");
+        if (@trf_files) {
+            $logger->info("Found " . scalar(@trf_files) . " TRF intermediate files (will be cleaned later)");
         }
-    }
-    
-    $logger->info("Generated " . scalar(@samples) . " samples total");
-    
-    # Extract sequences using samtools faidx
-    open(my $out_fh, '>', $output_file) or die "Cannot create output file: $!\n";
-    
-    for my $sample (@samples) {
-        my $region = "$sample->{seq}:$sample->{start}-$sample->{end}";
-        my $seq_data = `samtools faidx $genome_file $region`;
-        
-        if ($seq_data) {
-            # Replace header with our sample ID
-            $seq_data =~ s/^>[^\n]+/>$sample->{id}/;
-            print $out_fh $seq_data;
-        }
-    }
-    
-    close($out_fh);
-    $logger->info("Sequence extraction completed");
-}
-
-sub sample_random_chunks {
-    my ($genome_file, $num_samples, $chunk_size, $output_file) = @_;
-    
-    $logger->info("Using optimized seqkit-based parallel chunk generation...");
-    
-    # Check if seqkit is available, fallback to legacy method if not
-    unless (check_seqkit_available()) {
-        $logger->warn("seqkit not available, falling back to legacy sampling method");
-        return sample_random_chunks_legacy($genome_file, $num_samples, $chunk_size, $output_file);
-    }
-    
-    # Calculate sampling ratio based on genome size and required samples
-    my $genome_size = -s $genome_file;
-    my $total_needed = $num_samples * $chunk_size;
-    my $sample_ratio = sprintf("%.6f", ($total_needed * 1.5) / $genome_size);  # 1.5x buffer for better coverage
-    $sample_ratio = 1.0 if $sample_ratio > 1.0;
-    
-    $logger->info("Genome size: " . sprintf("%.2f", $genome_size/1e6) . " Mb");
-    $logger->info("Target samples: $num_samples, chunk size: $chunk_size bp");
-    $logger->info("Sample ratio: $sample_ratio");
-    
-    # Create temporary file for intermediate results
-    my $temp_sampled = "$config{tmp_dir}/temp_sampled_$$.fa";
-    
-    eval {
-        # Stage 1: Random sampling from genome
-        $logger->info("Stage 1: Random genome sampling...");
-        my $sample_cmd = join(" ",
-            "seqkit sample",
-            "--threads $config{threads}",
-            "-p $sample_ratio",
-            "-s 42",  # Fixed random seed for reproducibility
-            "\"$genome_file\"",
-            "> \"$temp_sampled\""
-        );
-        
-        run_cmd($sample_cmd);
-        
-        # Check if we have enough data from sampling
-        my $sampled_size = -s $temp_sampled;
-        if ($sampled_size < ($total_needed * 0.8)) {
-            $logger->warn("Initial sampling yielded less data than expected, using sliding window approach");
-            
-            # Stage 2a: Sliding window on sampled sequences
-            my $temp_windowed = "$config{tmp_dir}/temp_windowed_$$.fa";
-            my $step_size = int($chunk_size / 4);  # 25% step size for good coverage
-            $step_size = 1000 if $step_size < 1000;  # Minimum step size
-            
-            my $sliding_cmd = join(" ",
-                "seqkit sliding",
-                "-s $step_size",
-                "-W $chunk_size",
-                "--threads $config{threads}",
-                "\"$temp_sampled\"",
-                "> \"$temp_windowed\""
-            );
-            
-            run_cmd($sliding_cmd);
-            unlink $temp_sampled;
-            $temp_sampled = $temp_windowed;
-        }
-        
-        # Stage 3: Final random selection to get exact number of samples
-        $logger->info("Stage 2: Final sample selection...");
-        my $final_cmd = join(" ",
-            "seqkit sample",
-            "--threads $config{threads}",
-            "-n $num_samples",
-            "-s 43",  # Different seed for final selection
-            "\"$temp_sampled\"",
-            "> \"$output_file\""
-        );
-        
-        run_cmd($final_cmd);
-        
-        # Verify output
-        my $output_size = -s $output_file;
-        if ($output_size > 0) {
-            my $seq_count = `seqkit stat -T "$output_file" | tail -n 1 | cut -f 4`;
-            chomp $seq_count;
-            $logger->info("Successfully generated $seq_count sequences (target: $num_samples)");
-            $logger->info("Output file size: " . sprintf("%.2f", $output_size/1e6) . " Mb");
-        } else {
-            die "Output file is empty or was not created properly\n";
-        }
-        
     };
     
-    my $error = $@;
+    # Always return to original directory, even if there was an error
+    chdir($original_dir) or $logger->error("Cannot return to original directory: $!");
     
-    # Cleanup temporary files
-    unlink $temp_sampled if -f $temp_sampled;
-    
-    if ($error) {
-        $logger->error("Optimized chunk generation failed: $error");
-        $logger->info("Falling back to legacy sampling method");
-        return sample_random_chunks_legacy($genome_file, $num_samples, $chunk_size, $output_file);
+    if ($@ || !-s $output_file) {
+        $logger->warn("TRF masking failed: $@");
+        $logger->info("Copying input file without TRF masking");
+        run_cmd("cp $input_file $output_file");
     }
     
-    $logger->info("Optimized chunk generation completed successfully");
+    $logger->info("TRF masking completed for: " . basename($input_file));
 }
 
-sub check_seqkit_available {
-    my $seqkit_path = `which seqkit 2>/dev/null`;
-    chomp $seqkit_path;
+sub run_single_repeatscout_job {
+    my ($genome, $lmer, $threshold, $job_id, $sample_id) = @_;
+    $sample_id = $sample_id // 1;  # Default to sample 1 if not provided
     
-    if ($seqkit_path && -x $seqkit_path) {
-        my $version = `seqkit version 2>/dev/null`;
-        if ($version) {
-            chomp $version;
-            $logger->info("Found seqkit: $seqkit_path ($version)");
-            return 1;
+    my $job_prefix;
+    if (defined $sample_id && $sample_id > 1) {
+        $job_prefix = "$config{tmp_dir}/RS_job${job_id}_s${sample_id}_l${lmer}_t${threshold}";
+    } else {
+        $job_prefix = "$config{tmp_dir}/RS_job${job_id}_l${lmer}_t${threshold}";
+    }
+    
+    if (defined $sample_id && $sample_id > 1) {
+        $logger->info("Job $job_id (Sample $sample_id): Running RepeatScout (l-mer=$lmer, threshold=$threshold)");
+    } else {
+        $logger->info("Job $job_id: Running RepeatScout (l-mer=$lmer, threshold=$threshold)");
+    }
+    
+    # Build frequency table
+    my $freq_file = "${job_prefix}.freq";
+    $logger->info("RepeatScout Job $job_id using input file: $genome (size: " . (-s $genome) . " bytes)");
+    my $freq_cmd = "build_lmer_table -sequence $genome -freq $freq_file -l $lmer";
+    run_cmd($freq_cmd);
+    
+    # Run RepeatScout
+    my $raw_output = "${job_prefix}.raw.fa";
+    my $rs_cmd = "RepeatScout -sequence $genome -output $raw_output -freq $freq_file -l $lmer";
+    run_cmd($rs_cmd);
+    
+    # Filter immediately with filter-stage-1.prl if available
+    my $final_output = filter_single_repeatscout_result($raw_output, $job_prefix, $job_id, $sample_id);
+    
+    # Clean up intermediate files (DISABLED - keeping temp files)
+    # unlink($freq_file, $raw_output);
+    
+    if (defined $sample_id && $sample_id > 1) {
+        $logger->info("Job $job_id (Sample $sample_id) completed and filtered: $final_output");
+    } else {
+        $logger->info("Job $job_id completed and filtered: $final_output");
+    }
+    
+    return $final_output;
+}
+
+sub merge_repeatscout_results {
+    my ($files_ref, $output_file) = @_;
+    my @files = @$files_ref;
+    
+    $logger->info("Merging " . scalar(@files) . " pre-filtered RepeatScout result files");
+    
+    open(my $out_fh, '>', $output_file) or die "Cannot open $output_file: $!";
+    
+    my $seq_count = 0;
+    for my $i (0..$#files) {
+        my $file = $files[$i];
+        next unless -s $file;
+        
+        # Extract job information from filename for better labeling
+        my $job_info = "";
+        # Updated regex to handle both filtered and unfiltered file patterns
+        if ($file =~ /RS_job\d+(_s\d+)?(_l\d+)?(_t\d+)?(_filtered)?(_cleaned)?\.fa$/) {
+            my ($sample_part, $lmer_part, $threshold_part) = ($1, $2, $3);
+            $sample_part = $sample_part || "";
+            $lmer_part = $lmer_part || "";
+            $threshold_part = $threshold_part || "";
+            $job_info = "${sample_part}${lmer_part}${threshold_part}_set${i}";
+        } else {
+            $job_info = "_set${i}";
+        }
+        
+        open(my $in_fh, '<', $file) or die "Cannot open $file: $!";
+        while (my $line = <$in_fh>) {
+            if ($line =~ /^>/) {
+                $seq_count++;
+                chomp $line;
+                $line .= $job_info;  # Add detailed job identifier
+                print $out_fh "$line\n";
+            } else {
+                print $out_fh $line;
+            }
+        }
+        close $in_fh;
+    }
+    
+    close $out_fh;
+    
+    $logger->info("Merged $seq_count pre-filtered sequences from " . scalar(@files) . " RepeatScout jobs into $output_file");
+}
+
+sub filter_single_repeatscout_result {
+    my ($raw_output, $job_prefix, $job_id, $sample_id) = @_;
+    
+    # Check if filter-stage-1.prl exists (try multiple locations)
+    my $filter_script;
+    my @possible_locations = (
+        "$FindBin::RealBin/filter-stage-1.prl",
+        "filter-stage-1.prl"  # Let system PATH find it
+    );
+    
+    for my $location (@possible_locations) {
+        if ($location eq "filter-stage-1.prl") {
+            # Check if it's in PATH
+            my $which_result = `which filter-stage-1.prl 2>/dev/null`;
+            chomp($which_result);
+            if ($which_result && -x $which_result) {
+                $filter_script = $location;
+                if (defined $sample_id && $sample_id > 1) {
+                    $logger->info("Job $job_id (Sample $sample_id): Found filter-stage-1.prl in PATH");
+                } else {
+                    $logger->info("Job $job_id: Found filter-stage-1.prl in PATH");
+                }
+                last;
+            }
+        } elsif (-x $location) {
+            $filter_script = $location;
+            if (defined $sample_id && $sample_id > 1) {
+                $logger->info("Job $job_id (Sample $sample_id): Found filter-stage-1.prl at: $location");
+            } else {
+                $logger->info("Job $job_id: Found filter-stage-1.prl at: $location");
+            }
+            last;
         }
     }
     
-    $logger->warn("seqkit not found in PATH or not executable");
+    unless ($filter_script) {
+        if (defined $sample_id && $sample_id > 1) {
+            $logger->warn("Job $job_id (Sample $sample_id): filter-stage-1.prl not found, using unfiltered output");
+        } else {
+            $logger->warn("Job $job_id: filter-stage-1.prl not found, using unfiltered output");
+        }
+        # Copy raw output as final output if no filter available
+        my $final_output = "${job_prefix}.fa";
+        run_cmd("cp $raw_output $final_output");
+        return $final_output;
+    }
+    
+    # Generate filtered output filename
+    my $filtered_file = "${job_prefix}_filtered.fa";
+    
+    if (defined $sample_id && $sample_id > 1) {
+        $logger->info("Job $job_id (Sample $sample_id): Filtering with filter-stage-1.prl");
+    } else {
+        $logger->info("Job $job_id: Filtering with filter-stage-1.prl");
+    }
+    
+    # Run filter-stage-1.prl
+    my $filter_cmd = "$filter_script $raw_output > $filtered_file";
+    
+    eval {
+        run_cmd($filter_cmd);
+    };
+    
+    if ($@ || !-s $filtered_file) {
+        if (defined $sample_id && $sample_id > 1) {
+            $logger->warn("Job $job_id (Sample $sample_id): Filtering failed, using unfiltered output: $@");
+        } else {
+            $logger->warn("Job $job_id: Filtering failed, using unfiltered output: $@");
+        }
+        # Copy raw output as final output if filtering failed
+        my $final_output = "${job_prefix}.fa";
+        run_cmd("cp $raw_output $final_output");
+        return $final_output;
+    }
+    
+    # Clean the filtered file to remove any log contamination
+    my $cleaned_file = clean_fasta_file($filtered_file);
+    
+    my $original_seqs = `grep -c '^>' '$raw_output' 2>/dev/null || echo 0`;
+    my $filtered_seqs = `grep -c '^>' '$cleaned_file' 2>/dev/null || echo 0`;
+    chomp($original_seqs, $filtered_seqs);
+    
+    if (defined $sample_id && $sample_id > 1) {
+        $logger->info("Job $job_id (Sample $sample_id): Filtered $original_seqs -> $filtered_seqs sequences");
+    } else {
+        $logger->info("Job $job_id: Filtered $original_seqs -> $filtered_seqs sequences");
+    }
+    
+    return $cleaned_file;
+}
+
+sub filter_repeatscout_results {
+    my ($result_files_ref) = @_;
+    my @result_files = @$result_files_ref;
+    
+    $logger->info("Filtering " . scalar(@result_files) . " RepeatScout result files with filter-stage-1.prl");
+    
+    # Check if filter-stage-1.prl exists (try multiple locations)
+    my $filter_script;
+    my @possible_locations = (
+        "$FindBin::RealBin/filter-stage-1.prl",
+        "filter-stage-1.prl"  # Let system PATH find it
+    );
+    
+    for my $location (@possible_locations) {
+        if ($location eq "filter-stage-1.prl") {
+            # Check if it's in PATH
+            my $which_result = `which filter-stage-1.prl 2>/dev/null`;
+            chomp($which_result);
+            if ($which_result && -x $which_result) {
+                $filter_script = $location;
+                $logger->info("Found filter-stage-1.prl in PATH: $which_result");
+                last;
+            }
+        } elsif (-x $location) {
+            $filter_script = $location;
+            $logger->info("Found filter-stage-1.prl at: $location");
+            last;
+        }
+    }
+    
+    unless ($filter_script) {
+        $logger->warn("filter-stage-1.prl not found in any location, skipping filtering");
+        return @result_files;
+    }
+    
+    my @filtered_files;
+    
+    for my $result_file (@result_files) {
+        next unless -s $result_file;
+        
+        # Generate filtered output filename
+        my $basename = basename($result_file, '.fa');
+        my $working_dir = dirname($result_file);
+        my $filtered_file = "$working_dir/${basename}_filtered.fa";
+        
+        $logger->info("Filtering $result_file -> $filtered_file");
+        
+        # Run filter-stage-1.prl
+        my $filter_cmd = "$filter_script $result_file > $filtered_file";
+        
+        eval {
+            run_cmd($filter_cmd);
+        };
+        
+        if ($@ || !-s $filtered_file) {
+            $logger->warn("Filtering failed for $result_file: $@");
+            $logger->warn("Using unfiltered file instead");
+            push @filtered_files, $result_file;
+        } else {
+            # Clean the filtered file to remove any log contamination
+            my $cleaned_file = clean_fasta_file($filtered_file);
+            
+            my $original_seqs = `grep -c '^>' '$result_file' 2>/dev/null || echo 0`;
+            my $filtered_seqs = `grep -c '^>' '$cleaned_file' 2>/dev/null || echo 0`;
+            chomp($original_seqs, $filtered_seqs);
+            
+            $logger->info("Filtered and cleaned $result_file: $original_seqs -> $filtered_seqs sequences");
+            push @filtered_files, $cleaned_file;
+        }
+    }
+    
+    $logger->info("Filtering completed for all RepeatScout results");
+    return @filtered_files;
+}
+
+sub refine_consensus {
+    $logger->info("Refining consensus sequences with Refiner pipeline...");
+
+    my $input = "$config{tmp_dir}/repeats.fa";
+    my $refiner_script = "$FindBin::RealBin/Refiner/main.py";
+    my $refiner_output_dir = "$config{work_dir}/refiner_output";
+
+    # Create required directories
+    make_path($config{work_dir}) unless -d $config{work_dir};
+    make_path($refiner_output_dir) unless -d $refiner_output_dir;
+    
+    # Ensure all input files exist
+    die "Input file missing: $input\n" unless -f $input;
+    die "Refiner script missing: $refiner_script\n" unless -x $refiner_script;
+
+    # Determine which genome file to use for Refiner
+    my $genome_for_refiner = determine_genome_for_refiner();
+    $logger->info("Using genome file for Refiner: $genome_for_refiner");
+
+    # Build command for Refiner/main.py
+    my $cmd = join(" ",
+        "python3 '$refiner_script'",
+        "--repeatscout '$input'",
+        "--genome '$genome_for_refiner'", 
+        "--output '$refiner_output_dir'",
+        "--threads $config{threads}"
+    );
+
+    run_cmd($cmd);
+    
+    # Copy final consensus to expected location
+    my $final_consensus = "$refiner_output_dir/consensus_masking.fa";
+    my $output = "$config{work_dir}/consensi.fa";
+    
+    if (-s $final_consensus) {
+        run_cmd("cp '$final_consensus' '$output'");
+        $logger->info("Final consensus copied to $output");
+    } else {
+        $logger->warn("Refiner output not found: $final_consensus");
+    }
+    
+    $logger->info("Consensus refinement completed");
+}
+
+sub determine_genome_for_refiner {
+    # Priority order:
+    # 1. First masked sample (sample 1) if it exists
+    # 2. Single masked sample if it exists  
+    # 3. Original genome file as fallback
+    
+    # Check for sample 1 (multi-sample case)
+    my $sample1_masked = "$config{tmp_dir}/genome_sample_1_masked.fa";
+    if (-s $sample1_masked) {
+        $logger->info("Using sample 1 masked genome for Refiner (multi-sample strategy)");
+        return $sample1_masked;
+    }
+    
+    # Check for single sample (single-sample case)
+    my $single_sample_masked = "$config{tmp_dir}/genome_sample_masked.fa";
+    if (-s $single_sample_masked) {
+        $logger->info("Using single masked sample for Refiner (single-sample strategy)");
+        return $single_sample_masked;
+    }
+    
+    # Check for full genome masked (small genome case)
+    my $full_masked = "$config{tmp_dir}/tmp_masked.fa";
+    if (-s $full_masked) {
+        $logger->info("Using full masked genome for Refiner (small genome strategy)");
+        return $full_masked;
+    }
+    
+    # Fallback to original genome
+    $logger->warn("No masked sample found, falling back to original genome for Refiner");
+    $logger->warn("This may affect Refiner performance - consider checking sample generation");
+    return $config{genome_file};
+}
+
+sub cleanup_tmp_directory {
+    $logger->info("Performing final cleanup of tmp directory: $config{tmp_dir}");
+    
+    # Clean up all HTML files in tmp directory
+    my @html_files = glob("$config{tmp_dir}/*.html");
+    my $html_count = 0;
+    for my $html_file (@html_files) {
+        if (-f $html_file) {
+            unlink($html_file);
+            $logger->debug("Removed HTML file: $html_file");
+            $html_count++;
+        }
+    }
+    if ($html_count > 0) {
+        $logger->info("Removed $html_count HTML files from tmp directory");
+    }
+    
+    # Clean up all part files in tmp directory
+    my @part_files = glob("$config{tmp_dir}/*part*.fa");
+    my $part_count = 0;
+    for my $part_file (@part_files) {
+        if (-f $part_file) {
+            unlink($part_file);
+            $logger->debug("Removed part file: $part_file");
+            $part_count++;
+        }
+    }
+    if ($part_count > 0) {
+        $logger->info("Removed $part_count part files from tmp directory");
+    }
+    
+    # Clean up filtered files (keep the final ones but remove individual job filtered files)
+    my @filtered_files = glob("$config{tmp_dir}/RS_job*_filtered.fa");
+    my $filtered_count = 0;
+    for my $filtered_file (@filtered_files) {
+        if (-f $filtered_file) {
+            unlink($filtered_file);
+            $logger->debug("Removed filtered file: $filtered_file");
+            $filtered_count++;
+        }
+    }
+    if ($filtered_count > 0) {
+        $logger->info("Removed $filtered_count filtered intermediate files from tmp directory");
+    }
+    
+    # Clean up all TRF dat files in tmp directory
+    my @dat_files = glob("$config{tmp_dir}/*.dat");
+    my $dat_count = 0;
+    for my $dat_file (@dat_files) {
+        if (-f $dat_file) {
+            unlink($dat_file);
+            $logger->debug("Removed TRF dat file: $dat_file");
+            $dat_count++;
+        }
+    }
+    if ($dat_count > 0) {
+        $logger->info("Removed $dat_count TRF dat files from tmp directory");
+    }
+    
+    # Clean up TRF intermediate files with specific patterns
+    my @trf_intermediates = glob("$config{tmp_dir}/*.2.7.7.80.10.50.500.*");
+    my $trf_count = 0;
+    my $mask_count = 0;
+    for my $trf_file (@trf_intermediates) {
+        if (-f $trf_file) {
+            # Now also clean up .mask files from TRF/dust processing
+            if ($trf_file =~ /\.mask$/) {
+                unlink($trf_file);
+                $logger->debug("Removed TRF mask file: $trf_file");
+                $mask_count++;
+            } else {
+                unlink($trf_file);
+                $logger->debug("Removed TRF intermediate file: $trf_file");
+                $trf_count++;
+            }
+        }
+    }
+    if ($trf_count > 0) {
+        $logger->info("Removed $trf_count TRF intermediate files from tmp directory");
+    }
+    if ($mask_count > 0) {
+        $logger->info("Removed $mask_count TRF mask files from tmp directory");
+    }
+    
+    # Clean up dust-related files
+    my @dust_files = glob("$config{tmp_dir}/*_dust.fa");
+    my $dust_count = 0;
+    for my $dust_file (@dust_files) {
+        if (-f $dust_file) {
+            unlink($dust_file);
+            $logger->debug("Removed dust file: $dust_file");
+            $dust_count++;
+        }
+    }
+    if ($dust_count > 0) {
+        $logger->info("Removed $dust_count dust intermediate files from tmp directory");
+    }
+    
+    $logger->info("Final cleanup completed. Removed $html_count HTML files, $part_count part files, $dat_count dat files, $trf_count TRF intermediate files, $mask_count mask files, and $dust_count dust files");
+}
+
+sub clean_fasta_file {
+    my ($input_file) = @_;
+    
+    my $basename = basename($input_file, '.fa');
+    my $working_dir = dirname($input_file);
+    my $cleaned_file = "$working_dir/${basename}_cleaned.fa";
+    
+    $logger->info("Cleaning FASTA file to remove log contamination: $input_file");
+    
+    open(my $in_fh, '<', $input_file) or die "Cannot open input file $input_file: $!";
+    open(my $out_fh, '>', $cleaned_file) or die "Cannot create cleaned file $cleaned_file: $!";
+    
+    my $in_sequence = 0;
+    my $lines_written = 0;
+    my $lines_skipped = 0;
+    my $headers_extracted = 0;
+    
+    while (my $line = <$in_fh>) {
+        chomp $line;
+        
+        # Skip empty lines
+        next if $line =~ /^\s*$/;
+        
+        # Check for TRF log patterns - skip these entirely
+        if ($line =~ /^(Tandem Repeats Finder|Copyright.*Dr\. Gary Benson|Loading sequence|Allocating Memory|Initializing data structures|Computing TR Model Statistics|Scanning|Freeing Memory|Resolving output)/) {
+            $lines_skipped++;
+            next;
+        }
+        
+        # Check for lines that contain "Done." followed by sequence ID
+        if ($line =~ /^Done\./) {
+            $lines_skipped++;
+            
+            # Extract sequence ID if present
+            # Pattern: Done.deleting >R=0: 1 / 1 OR Done.>R=1 (RR=2.  TRF=0.075 DUST=0.220)
+            if ($line =~ /Done\.(deleting\s+)?(>R=\d+.*)$/) {
+                my $seq_id = $2;
+                if ($seq_id) {
+                    print $out_fh "$seq_id\n";
+                    $lines_written++;
+                    $headers_extracted++;
+                    $in_sequence = 1;
+                    $logger->debug("Extracted sequence ID from contaminated line: $seq_id");
+                }
+            }
+            next;
+        }
+        
+        # Check if this is a proper FASTA header
+        if ($line =~ /^>/) {
+            print $out_fh "$line\n";
+            $lines_written++;
+            $in_sequence = 1;
+            next;
+        }
+        
+        # Check if this looks like sequence data (DNA/RNA nucleotides)
+        if ($line =~ /^[ACGTNRWSMKYHBVDXacgtnrwsmkyhbvdx-]+$/i) {
+            if ($in_sequence) {
+                print $out_fh "$line\n";
+                $lines_written++;
+            } else {
+                # Orphan sequence without header - skip
+                $lines_skipped++;
+                $logger->debug("Skipped orphan sequence line without header");
+            }
+            next;
+        }
+        
+        # Any other line is considered contamination
+        $lines_skipped++;
+        $logger->debug("Skipped unrecognized line: " . substr($line, 0, 50) . "...");
+    }
+    
+    close($in_fh);
+    close($out_fh);
+    
+    # Check if the cleaned file has content
+    unless (-s $cleaned_file) {
+        $logger->warn("Cleaned file is empty, using original file");
+        run_cmd("cp '$input_file' '$cleaned_file'");
+    }
+    
+    $logger->info("FASTA cleaning completed: wrote $lines_written lines, skipped $lines_skipped lines, extracted $headers_extracted headers from contamination");
+    
+    return $cleaned_file;
+}
+
+sub safe_unlink {
+    my @files = @_;
+    my $deleted_count = 0;
+    
+    for my $file (@files) {
+        next unless defined $file;
+        next unless -f $file;
+        
+        # Safety check: only delete files in tmp directory or with specific patterns (DISABLED - keeping temp files)
+        if ($file =~ m{^$config{tmp_dir}/} || $file =~ /\.(test|temp|tmp|split|dust|part)/) {
+            # if (unlink($file)) {  # DISABLED - keeping temp files
+            #     $logger->debug("Safely deleted temporary file: $file");
+            #     $deleted_count++;
+            # } else {
+            #     $logger->warn("Failed to delete file: $file ($!)");
+            # }
+            $logger->debug("Would have safely deleted temporary file: $file");
+        } else {
+            $logger->warn("Skipping deletion of non-temporary file: $file");
+        }
+    }
+    
+    return $deleted_count;
+}
+
+sub create_checkpoint {
+    my ($checkpoint_name, $checkpoint_file) = @_;
+    
+    $checkpoint_file = $checkpoint_file || "$config{work_dir}/${checkpoint_name}.ok";
+    
+    $logger->info("Creating checkpoint: $checkpoint_name");
+    
+    open(my $fh, '>', $checkpoint_file) or die "Cannot create checkpoint file $checkpoint_file: $!";
+    print $fh "Checkpoint created: " . localtime() . "\n";
+    print $fh "Process ID: $$\n";
+    print $fh "Working directory: " . getcwd() . "\n";
+    close($fh);
+    
+    $logger->info("Checkpoint created successfully: $checkpoint_file");
+}
+
+sub check_checkpoint {
+    my ($checkpoint_name, $checkpoint_file) = @_;
+    
+    $checkpoint_file = $checkpoint_file || "$config{work_dir}/${checkpoint_name}.ok";
+    
+    if (-f $checkpoint_file) {
+        $logger->info("Found existing checkpoint: $checkpoint_name");
+        return 1;
+    }
+    
     return 0;
 }
 
 sub run_cmd {
     my $cmd = shift;
-    $cmd =~ s/[`;\$]/\\$&/g;
     $logger->info("Executing command: $cmd");
     
     my $output = `$cmd 2>&1`;
@@ -1171,3 +2076,50 @@ sub run_cmd {
     return $output;
 }
 
+__END__
+
+=head1 NAME
+
+build_RS - Multi-parameter RepeatScout Pipeline for Pan_TE
+
+=head1 SYNOPSIS
+
+build_RS --genome GENOME.fa --tmp TMP_DIR --workdir WORK_DIR [OPTIONS]
+
+=head1 DESCRIPTION
+
+This script implements a multi-parameter RepeatScout pipeline that runs 
+RepeatScout with different l-mer sizes and copy thresholds in parallel,
+then merges the results and passes them to the Refiner pipeline for
+consensus building.
+
+=head1 REQUIRED ARGUMENTS
+
+  --genome FILE      Input genome in FASTA format
+  --tmp DIR          Temporary directory for intermediate files  
+  --workdir DIR      Working directory for output files
+
+=head1 OPTIONS
+
+  --threads INT      Number of threads to use (default: 4)
+  --force, -f        Force overwrite of existing files
+  --help, -h         Show this help message
+  --version, -v      Show version information
+
+=head1 EXAMPLES
+
+  # Basic usage
+  build_RS --genome genome.fa --tmp /tmp/build_rs --workdir output
+
+  # With custom parameters
+  build_RS --genome genome.fa --tmp /tmp --workdir output --threads 16 --force
+
+=head1 AUTHOR
+
+Pan_TE Development Team
+
+=head1 VERSION
+
+2.0.0
+
+=cut

@@ -652,7 +652,7 @@ def build_expanded_consensus(copies: List[Dict],
             # 多序列比对 - 始终使用MAFFT获得高质量共识
             sequences = [{'id': f"copy_{i}", 'sequence': copy['sequence']} for i, copy in enumerate(copies)]
             
-            # 基于TE生物学特性选择MAFFT算法
+            # 基于TE生物学特性选择MAFFT算法 - 优化保留长度
             avg_identity = characteristics.get('avg_identity', 70)
             length_cv = characteristics.get('length_cv', 0)  # 长度变异系数
             
@@ -664,10 +664,10 @@ def build_expanded_consensus(copies: List[Dict],
                 # 高相似度且长度一致：年轻TE家族或同亚家族
                 algorithm = 'localpair'  # L-INS-i: 适合高度相似序列
                 logger.debug(f"Young TE family (id={avg_identity:.1f}%, cv={length_cv:.2f}): using localpair")
-            elif avg_identity > 65 and length_cv > 0.5:
-                # 中等相似度但长度变异大：典型的TE家族(如截断LINE)
-                algorithm = 'genafpair'  # E-INS-i: 处理大插入/缺失
-                logger.debug(f"TE with indels (id={avg_identity:.1f}%, cv={length_cv:.2f}): using genafpair")
+            elif length_cv > 0.5:
+                # 长度变异大：使用E-INS-i以更好处理长度差异
+                algorithm = 'genafpair'  # E-INS-i: 处理大插入/缺失，保留长序列
+                logger.debug(f"TE with length variation (id={avg_identity:.1f}%, cv={length_cv:.2f}): using genafpair")
             elif avg_identity > 65:
                 # 中等相似度，长度相对一致：保守TE类型(如SINE)
                 algorithm = 'localpair'  # L-INS-i
@@ -683,21 +683,27 @@ def build_expanded_consensus(copies: List[Dict],
                 # 对于极低相似度，使用最宽松的参数
                 algorithm = 'genafpair'
                 
-            # 检查长度变异是否过大
+            # 检查长度变异是否过大 - 优化：保留长序列
             if length_cv > 1.0:
-                logger.debug(f"Extreme length variation (cv={length_cv:.2f}) - filtering outliers")
-                # 过滤长度异常值 (保留中位数±2倍标准差范围内的序列)
+                logger.debug(f"Extreme length variation (cv={length_cv:.2f}) - intelligent filtering")
+                # 智能过滤：保留最长的序列和有代表性的序列
                 lengths = [len(seq['sequence']) for seq in sequences]
+                max_len = max(lengths)
                 median_len = np.median(lengths)
-                std_len = np.std(lengths)
-                filtered_sequences = []
-                for seq in sequences:
-                    if abs(len(seq['sequence']) - median_len) <= 2 * std_len:
-                        filtered_sequences.append(seq)
+                
+                # 策略1：总是保留最长的序列（可能是完整的TE）
+                longest_seqs = [seq for seq in sequences if len(seq['sequence']) >= max_len * 0.95]
+                
+                # 策略2：保留中位数附近的代表性序列
+                median_seqs = [seq for seq in sequences 
+                              if median_len * 0.8 <= len(seq['sequence']) <= median_len * 1.5]
+                
+                # 合并两组序列
+                filtered_sequences = list({seq['id']: seq for seq in longest_seqs + median_seqs}.values())
                 
                 if len(filtered_sequences) >= 2:
                     sequences = filtered_sequences
-                    logger.debug(f"Filtered to {len(sequences)} sequences after outlier removal")
+                    logger.debug(f"Retained {len(sequences)} sequences: {len(longest_seqs)} long + {len(median_seqs)} median")
                 else:
                     logger.warning("Too few sequences remain after filtering - using all sequences")
             
@@ -705,34 +711,41 @@ def build_expanded_consensus(copies: List[Dict],
             msa_result = run_mafft(sequences, algorithm=algorithm, thread=mafft_threads, config=config)
             
             if not msa_result:
-                # MSA失败，使用TE特异的后备策略
-                logger.warning(f"MAFFT failed for {seed_seq['id']}, using TE-aware fallback strategy")
+                # MSA失败，使用TE特异的后备策略 - 优先保留长度
+                logger.warning(f"MAFFT failed for {seed_seq['id']}, using length-preserving fallback strategy")
                 
-                if avg_identity < 60:
-                    # 极低相似度：可能不是同一家族，选择最高质量的
-                    best_copy = max(copies, key=lambda x: x.get('quality_score', x.get('identity', 0)))
-                    consensus_seq = best_copy['sequence']
-                    logger.debug("Using best quality sequence for low-identity TE family")
-                elif length_cv > 0.8:
-                    # 长度变异极大：选择中位数长度附近的最好序列
-                    lengths = [len(c['sequence']) for c in copies]
-                    median_len = np.median(lengths)
-                    candidates = [c for c in copies if abs(len(c['sequence']) - median_len) < median_len * 0.3]
-                    if candidates:
-                        best_copy = max(candidates, key=lambda x: x.get('quality_score', x.get('identity', 0)))
-                        consensus_seq = best_copy['sequence']
-                        logger.debug("Using median-length sequence for variable-length TE family")
-                    else:
-                        longest_copy = max(copies, key=lambda x: x['length'])
-                        consensus_seq = longest_copy['sequence']
-                else:
-                    # 使用最长的序列作为默认后备
-                    longest_copy = max(copies, key=lambda x: x['length'])
-                    consensus_seq = longest_copy['sequence']
+                # 策略：优先选择最长的高质量序列
+                # 计算综合分数：长度权重70%，质量权重30%
+                scored_copies = []
+                for copy in copies:
+                    length_score = copy['length'] / 1000  # 每1kb加1分
+                    quality_score = copy.get('quality_score', copy.get('identity', 0) / 100)
+                    combined_score = length_score * 0.7 + quality_score * 100 * 0.3
+                    scored_copies.append((combined_score, copy))
+                
+                scored_copies.sort(key=lambda x: x[0], reverse=True)
+                best_copy = scored_copies[0][1]
+                consensus_seq = best_copy['sequence']
+                
+                logger.debug(f"Using best length-quality balanced sequence: "
+                           f"{best_copy['length']}bp, identity={best_copy.get('identity', 0):.1f}%")
+                
+                # 如果最长序列比平均长度长很多，记录警告
+                avg_length = np.mean([c['length'] for c in copies])
+                if best_copy['length'] > avg_length * 1.5:
+                    logger.info(f"Selected sequence is significantly longer than average "
+                              f"({best_copy['length']}bp vs {avg_length:.0f}bp average) - likely full-length TE")
             else:
-                # 构建高质量共识序列，根据TE特性调整参数
-                min_coverage = 0.4 if avg_identity > 75 else 0.3  # 高相似度要求更高覆盖
-                quality_threshold = 0.6 if avg_identity > 80 else 0.5  # 高相似度要求更高质量
+                # 构建高质量共识序列，根据TE特性调整参数 - 优化保留长度
+                # 降低min_coverage以保留更多边界序列
+                min_coverage = 0.2 if avg_identity > 75 else 0.15  # 降低覆盖度要求，保留边界
+                quality_threshold = 0.5 if avg_identity > 80 else 0.4  # 适度降低质量阈值
+                
+                # 如果有长序列，进一步降低覆盖度要求
+                seq_lengths = [len(seq['sequence']) for seq in sequences]
+                if max(seq_lengths) > np.median(seq_lengths) * 1.5:
+                    min_coverage = max(0.1, min_coverage - 0.1)  # 为长序列降低覆盖度要求
+                    logger.debug(f"Long sequences detected, reducing min_coverage to {min_coverage}")
                 
                 consensus_seq = build_consensus_from_msa(
                     msa_result,
@@ -787,15 +800,38 @@ def build_expanded_consensus(copies: List[Dict],
                                 consensus_seq = consensus_seq_strict
                                 logger.debug(f"Using strict consensus without ambiguous bases")
                             else:
-                                # 策略2：使用最高质量的单个序列
-                                best_copy = max(copies, key=lambda x: x.get('quality_score', x.get('identity', 0)))
-                                consensus_seq = best_copy['sequence']
-                                logger.debug(f"Using best single sequence due to poor MSA quality")
+                                # 策略2：优先使用最长的高质量序列（保留完整性）
+                                # 按长度和质量综合排序
+                                sorted_copies = sorted(copies, 
+                                                     key=lambda x: (x['length'] * 0.6 + 
+                                                                   x.get('quality_score', x.get('identity', 0)) * x['length'] * 0.4),
+                                                     reverse=True)
+                                longest_good_copy = sorted_copies[0]
+                                consensus_seq = longest_good_copy['sequence']
+                                logger.debug(f"Using longest high-quality sequence ({longest_good_copy['length']}bp) due to poor MSA quality")
                         else:
-                            # N含量过高，直接使用最佳序列
-                            best_copy = max(copies, key=lambda x: x.get('quality_score', x.get('identity', 0)))
-                            consensus_seq = best_copy['sequence']
-                            logger.debug(f"Using best single sequence due to high N-content")
+                            # N含量过高，使用最长的高质量序列
+                            # 优先考虑长度，其次考虑质量
+                            sorted_copies = sorted(copies,
+                                                 key=lambda x: (x['length'] * 0.7 + 
+                                                               x.get('quality_score', x.get('identity', 0)) * 1000 * 0.3),
+                                                 reverse=True)
+                            longest_copy = sorted_copies[0]
+                            consensus_seq = longest_copy['sequence']
+                            logger.debug(f"Using longest sequence ({longest_copy['length']}bp) due to high N-content")
+        
+        # 尝试扩展边界（如果可能）
+        if consensus_seq and len(copies) > 0:
+            # 找到最长的拷贝作为扩展参考
+            longest_copy = max(copies, key=lambda x: x['length'])
+            if longest_copy.get('extended_sequence') or len(longest_copy['sequence']) > len(consensus_seq):
+                # 使用最长拷贝尝试扩展共识序列
+                from utils.sequence_utils import extend_consensus_boundaries
+                reference_seq = longest_copy.get('extended_sequence', longest_copy['sequence'])
+                extended_consensus = extend_consensus_boundaries(consensus_seq, reference_seq)
+                if len(extended_consensus) > len(consensus_seq):
+                    logger.debug(f"Extended consensus from {len(consensus_seq)}bp to {len(extended_consensus)}bp")
+                    consensus_seq = extended_consensus
         
         if not consensus_seq or len(consensus_seq) < 50:
             logger.debug(f"Filtered out consensus for {seed_seq['id']}_sf{subfamily_id}: sequence too short ({len(consensus_seq) if consensus_seq else 0}bp < 50bp)")
@@ -891,10 +927,16 @@ def calculate_consensus_quality(consensus: Dict, copies: List[Dict]) -> float:
 
 def improve_with_single_copy(seed_seq: Dict, copy: Dict) -> Dict:
     """使用单个拷贝改进原始序列"""
-    # 如果拷贝质量更好，使用拷贝序列
-    if copy.get('identity', 0) > 80:
+    # 优化：优先选择更长的序列
+    if copy['length'] > len(seed_seq['sequence']):
+        # 拷贝更长，使用拷贝
+        sequence = copy['sequence']
+        logger.debug(f"Using longer copy: {copy['length']}bp vs original {len(seed_seq['sequence'])}bp")
+    elif copy.get('identity', 0) > 80:
+        # 拷贝质量更高
         sequence = copy['sequence']
     else:
+        # 保留原始序列
         sequence = seed_seq['sequence']
     
     # 检查序列长度阈值
@@ -916,11 +958,13 @@ def improve_with_single_copy(seed_seq: Dict, copy: Dict) -> Dict:
 
 def improve_original_sequence(seed_seq: Dict, copies: List[Dict]) -> Dict:
     """使用拷贝信息改进原始序列"""
-    # 选择最好的拷贝作为参考
+    # 优化：选择最长的高质量拷贝作为参考
     if copies:
-        best_copy = max(copies, key=lambda x: x.get('identity', 0) * x['length'])
+        # 综合考虑长度和质量，长度权重更高
+        best_copy = max(copies, key=lambda x: x['length'] * 0.7 + x.get('identity', 0) * x['length'] * 0.003)
         sequence = best_copy['sequence']
         avg_identity = np.mean([c.get('identity', 0) for c in copies])
+        logger.debug(f"Selected best copy for improvement: {best_copy['length']}bp, {best_copy.get('identity', 0):.1f}% identity")
     else:
         sequence = seed_seq['sequence']
         avg_identity = 0

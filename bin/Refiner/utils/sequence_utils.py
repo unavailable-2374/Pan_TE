@@ -408,10 +408,18 @@ def build_consensus_from_msa(msa_result, min_coverage: float = 0.3, use_iupac: b
     
     return consensus_seq
 
-def extend_consensus_boundaries(consensus_seq: str, extended_sequence: str) -> str:
-    """使用扩展序列来改进共识序列的边界"""
+def extend_consensus_boundaries(consensus_seq: str, extended_sequence: str, aggressive: bool = True) -> str:
+    """使用扩展序列来改进共识序列的边界 - 优化版本，更积极地扩展"""
     if not consensus_seq or not extended_sequence:
         return consensus_seq
+    
+    # 如果扩展序列本身就比共识序列长，直接返回扩展序列（积极策略）
+    if aggressive and len(extended_sequence) > len(consensus_seq) * 1.2:
+        # 检查是否有基本的相似性
+        similarity = calculate_quick_similarity(consensus_seq, extended_sequence)
+        if similarity > 0.6:  # 60%相似度
+            logger.debug(f"Using full extended sequence ({len(extended_sequence)}bp vs {len(consensus_seq)}bp consensus)")
+            return extended_sequence.strip('N')
     
     # 找到共识序列在扩展序列中的最佳匹配位置
     best_match_pos = -1
@@ -420,7 +428,8 @@ def extend_consensus_boundaries(consensus_seq: str, extended_sequence: str) -> s
     # 简化的相似度匹配，支持IUPAC codes
     def matches_iupac(base1, base2):
         """检查两个碱基是否匹配（支持IUPAC codes）"""
-        if base1 == base2:
+        base1, base2 = base1.upper(), base2.upper()
+        if base1 == base2 or base1 == 'N' or base2 == 'N':
             return True
         
         iupac_matches = {
@@ -436,10 +445,29 @@ def extend_consensus_boundaries(consensus_seq: str, extended_sequence: str) -> s
         
         return False
     
-    # 搜索最佳匹配位置
-    max_search_len = min(len(extended_sequence) - len(consensus_seq) + 1, 100)
+    # 使用滑动窗口找到最佳匹配位置 - 扩大搜索范围
+    search_range = len(extended_sequence) - len(consensus_seq) + 1
     
-    for i in range(max_search_len):
+    # 使用采样搜索以提高效率
+    step = 1 if search_range < 1000 else max(1, search_range // 500)
+    
+    for i in range(0, search_range, step):
+        # 快速检查前100个碱基
+        quick_matches = 0
+        quick_checks = min(100, len(consensus_seq))
+        
+        for j in range(quick_checks):
+            if i + j < len(extended_sequence):
+                if matches_iupac(consensus_seq[j], extended_sequence[i + j]):
+                    quick_matches += 1
+        
+        quick_score = quick_matches / quick_checks if quick_checks > 0 else 0
+        
+        # 如果快速检查分数太低，跳过详细检查
+        if quick_score < 0.5:
+            continue
+        
+        # 详细检查
         matches = 0
         comparisons = 0
         
@@ -455,24 +483,55 @@ def extend_consensus_boundaries(consensus_seq: str, extended_sequence: str) -> s
                 best_score = score
                 best_match_pos = i
     
-    # 如果找到了好的匹配（>70%相似度），扩展边界
-    if best_match_pos >= 0 and best_score > 0.7:
-        # 获取左侧扩展
-        left_extension = extended_sequence[:best_match_pos]
+    # 降低阈值以更积极地扩展 - 从70%降到60%
+    if best_match_pos >= 0 and best_score > 0.6:
+        # 获取左侧扩展 - 限制最大扩展长度避免过度扩展
+        max_left_extension = min(best_match_pos, len(consensus_seq) // 2)  # 最多扩展50%长度
+        left_extension = extended_sequence[max(0, best_match_pos - max_left_extension):best_match_pos]
+        
         # 获取右侧扩展
         right_start = best_match_pos + len(consensus_seq)
-        right_extension = extended_sequence[right_start:]
+        max_right_extension = min(len(extended_sequence) - right_start, len(consensus_seq) // 2)
+        right_extension = extended_sequence[right_start:right_start + max_right_extension]
         
         # 组合扩展序列
         extended_consensus = left_extension + consensus_seq + right_extension
         
-        # 清理首尾的N和低质量区域
+        # 清理首尾的N和低质量区域，但保留内部的N
         extended_consensus = extended_consensus.strip('N')
+        
+        if len(extended_consensus) > len(consensus_seq):
+            logger.debug(f"Extended consensus from {len(consensus_seq)}bp to {len(extended_consensus)}bp ")
         
         return extended_consensus
     
-    # 没有找到好的匹配，返回原序列
+    # 如果没有找到好的匹配，但扩展序列更长，考虑直接使用
+    if aggressive and len(extended_sequence) > len(consensus_seq) * 1.1:
+        logger.debug(f"No good match found, but using longer extended sequence anyway ({len(extended_sequence)}bp)")
+        return extended_sequence.strip('N')
+    
+    # 返回原序列
     return consensus_seq
+
+def calculate_quick_similarity(seq1: str, seq2: str) -> float:
+    """快速计算两个序列的相似度（采样方法）"""
+    if not seq1 or not seq2:
+        return 0.0
+    
+    # 采样比较，每100bp取一个点
+    sample_size = min(100, min(len(seq1), len(seq2)))
+    step = max(1, min(len(seq1), len(seq2)) // sample_size)
+    
+    matches = 0
+    comparisons = 0
+    
+    for i in range(0, min(len(seq1), len(seq2)), step):
+        if i < len(seq1) and i < len(seq2):
+            comparisons += 1
+            if seq1[i].upper() == seq2[i].upper() or seq1[i] == 'N' or seq2[i] == 'N':
+                matches += 1
+    
+    return matches / comparisons if comparisons > 0 else 0.0
 
 
 

@@ -2,12 +2,61 @@ import logging
 from typing import Dict, List, Any
 import numpy as np
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+import multiprocessing
 
 from config import PipelineConfig
 from utils.cache_utils import cache_result
 from utils.robust_runner import RobustRunner
 
 logger = logging.getLogger(__name__)
+
+def _calculate_single_complexity_parallel(seq_data, dust_window, dust_threshold):
+    """独立的进程级函数，用于并行计算单个序列的复杂度分数"""
+    from utils.complexity_utils import calculate_dust_score, calculate_shannon_entropy
+    
+    try:
+        seq = seq_data['sequence']
+        seq_id = seq_data['id']
+        
+        # DUST分数
+        dust_score = calculate_dust_score(
+            seq, 
+            window=dust_window,
+            threshold=dust_threshold
+        )
+        
+        # Shannon熵
+        h_mono = calculate_shannon_entropy(seq, k=1)
+        h_di = calculate_shannon_entropy(seq, k=2)
+        
+        # 基于TE特征的复杂度评分
+        if dust_score > 0.9:
+            complexity_score = 0.3  # 过于简单，可能是tandem repeat
+        elif dust_score > 0.6:
+            complexity_score = 0.8  # 典型的TE重复模式
+        elif dust_score > 0.3:
+            complexity_score = 1.0  # 理想的复杂度
+        else:
+            complexity_score = 0.7  # 过于复杂
+        
+        # 使用熵值进行微调
+        entropy_factor = (h_mono / 2.0 + h_di / 4.0) / 2
+        
+        if entropy_factor > 0.5:
+            complexity_score = min(1.0, complexity_score * 1.1)
+        elif entropy_factor < 0.3:
+            complexity_score = max(0.2, complexity_score * 0.9)
+        
+        return {
+            'seq_id': seq_id,
+            'complexity': complexity_score,
+            'dust_score': dust_score
+        }
+    except Exception as e:
+        print(f"Error processing sequence {seq_data.get('id', 'unknown')}: {e}")
+        return None
 
 class SequenceScreenerOptimized:
     """Phase 1: 智能筛选与多维度评分"""
@@ -19,6 +68,55 @@ class SequenceScreenerOptimized:
         self.rm_detailed_results = {}  # 保存详细的RepeatMasker结果
         self.runner = RobustRunner(config)
         
+        # 基于基因组大小自动设置RepeatMasker快速模式
+        self._configure_repeatmasker_mode()
+        
+    def _configure_repeatmasker_mode(self):
+        """基于基因组大小自动配置RepeatMasker模式"""
+        import os
+        
+        try:
+            # 获取基因组文件大小
+            genome_size = os.path.getsize(self.config.genome_file)
+            
+            # 如果基因组大于1GB，启用快速模式
+            if genome_size > self.config.large_genome_threshold:
+                self.config.repeatmasker_quick = True
+                logger.info(f"Large genome detected ({genome_size / 1024**3:.2f} GB > "
+                           f"{self.config.large_genome_threshold / 1024**3:.1f} GB). "
+                           f"Enabling RepeatMasker quick mode for faster processing.")
+            else:
+                logger.info(f"Standard genome size ({genome_size / 1024**3:.2f} GB). "
+                           f"Using RepeatMasker sensitive mode for higher accuracy.")
+                
+        except (OSError, IOError) as e:
+            logger.warning(f"Could not determine genome file size: {e}. "
+                          f"Using default RepeatMasker settings.")
+    
+    def _get_repeatmasker_params(self) -> Dict:
+        """获取基于基因组大小优化的RepeatMasker参数"""
+        if self.config.repeatmasker_quick:
+            # 大基因组快速模式：去掉敏感模式，使用更宽松的参数
+            params = {
+                'no_is': True,
+                'nolow': True,
+                'cutoff': 250,  # 稍微提高cutoff，减少低质量匹配
+                'pa': max(1, self.config.threads // 2)
+            }
+            logger.info("Using RepeatMasker quick mode parameters (no -s, higher cutoff)")
+        else:
+            # 小基因组敏感模式：保持原有的高精度参数
+            params = {
+                's': True,  # 敏感模式，适合Phase 2重用
+                'no_is': True,
+                'nolow': True,
+                'cutoff': 200,  # 降低cutoff以获得更多hits
+                'pa': max(1, self.config.threads // 2)
+            }
+            logger.info("Using RepeatMasker sensitive mode parameters (-s, lower cutoff)")
+        
+        return params
+    
     def run(self) -> Dict[str, Any]:
         """执行Phase 1"""
         # 使用lambda包装整个Phase 1流程，实现完整的checkpoint
@@ -91,78 +189,52 @@ class SequenceScreenerOptimized:
         return sequences
     
     def calculate_complexity_scores(self):
-        """计算复杂度分数 - 基于TE生物学特征"""
-        from utils.complexity_utils import calculate_dust_score, calculate_shannon_entropy
+        """计算复杂度分数 - 基于TE生物学特征（多进程并行版本）"""
+        logger.info(f"Calculating complexity scores for {len(self.sequences)} sequences using {self.config.threads} processes...")
         
-        logger.info(f"Calculating complexity scores for {len(self.sequences)} sequences...")
+        # 准备参数
+        dust_window = self.config.dust_window
+        dust_threshold = self.config.dust_threshold
         
-        for seq_data in self.sequences:
-            seq = seq_data['sequence']
-            seq_id = seq_data['id']
+        # 使用ProcessPoolExecutor进行真正的并行处理
+        with ProcessPoolExecutor(max_workers=self.config.threads) as executor:
+            # 使用partial固定配置参数
+            calc_func = partial(_calculate_single_complexity_parallel, 
+                               dust_window=dust_window,
+                               dust_threshold=dust_threshold)
             
-            # DUST分数
-            dust_score = calculate_dust_score(
-                seq, 
-                window=self.config.dust_window,
-                threshold=self.config.dust_threshold
-            )
-            
-            # Shannon熵
-            h_mono = calculate_shannon_entropy(seq, k=1)
-            h_di = calculate_shannon_entropy(seq, k=2)
-            
-            # 基于TE特征的复杂度评分
-            # TE应该有一定复杂度，但不应过度惩罚重复
-            if dust_score > 0.9:
-                # 过于简单，可能是tandem repeat
-                complexity_score = 0.3
-            elif dust_score > 0.6:
-                # 典型的TE重复模式，这是理想的
-                complexity_score = 0.8
-            elif dust_score > 0.3:
-                # 理想的复杂度
-                complexity_score = 1.0
-            else:
-                # 过于复杂，可能不是典型TE
-                complexity_score = 0.7
-            
-            # 使用熵值进行微调（但不应占主导）
-            entropy_factor = (h_mono / 2.0 + h_di / 4.0) / 2  # 归一化熵
-            
-            # 熵只作为微调因子（±10%）
-            if entropy_factor > 0.5:
-                complexity_score = min(1.0, complexity_score * 1.1)
-            elif entropy_factor < 0.3:
-                complexity_score = max(0.2, complexity_score * 0.9)
-            
-            if seq_id not in self.scores:
-                self.scores[seq_id] = {}
-            self.scores[seq_id]['complexity'] = complexity_score
-            self.scores[seq_id]['dust_score'] = dust_score
+            # 批量提交并获取结果
+            results = list(executor.map(calc_func, self.sequences))
+        
+        # 收集结果到scores字典
+        for result in results:
+            if result:  # 确保结果有效
+                seq_id = result['seq_id']
+                if seq_id not in self.scores:
+                    self.scores[seq_id] = {}
+                self.scores[seq_id]['complexity'] = result['complexity']
+                self.scores[seq_id]['dust_score'] = result['dust_score']
         
         # 输出复杂度分数统计
-        complexity_scores = [self.scores[seq['id']]['complexity'] for seq in self.sequences]
-        logger.info(f"Complexity scores - Min: {min(complexity_scores):.3f}, "
-                   f"Max: {max(complexity_scores):.3f}, "
-                   f"Mean: {np.mean(complexity_scores):.3f}")
+        complexity_scores = [self.scores[seq['id']]['complexity'] for seq in self.sequences if seq['id'] in self.scores]
+        if complexity_scores:
+            logger.info(f"Complexity scores - Min: {min(complexity_scores):.3f}, "
+                       f"Max: {max(complexity_scores):.3f}, "
+                       f"Mean: {np.mean(complexity_scores):.3f}")
     
     def calculate_coverage_scores(self):
         """使用RepeatMasker计算覆盖度分数 - 基于TE生物学特征"""
         from utils.alignment_utils import run_repeatmasker_batch_detailed
+        
+        # 基于基因组大小动态调整RepeatMasker参数
+        rm_params = self._get_repeatmasker_params()
         
         # 批量运行RepeatMasker，获取详细结果
         rm_results = self.runner.run_with_retry(
             lambda: run_repeatmasker_batch_detailed(
                 self.sequences,
                 self.config.genome_file,
-                params={
-                    's': True,  # 敏感模式，适合Phase 2重用
-                    'no_is': True,
-                    'nolow': True,
-                    'div': 40,  # 降低到25%以捕获更多拷贝供Phase 2使用
-                    'cutoff': 200,  # 降低cutoff以获得更多hits
-                    'pa': max(1, self.config.threads // 4)
-                },
+                params=rm_params,
                 config=self.config
             )
         )
@@ -293,16 +365,10 @@ class SequenceScreenerOptimized:
             final_score = self.scores[seq_id]['final']
             
             if final_score >= A_THRESHOLD:
-                # A类：高置信度的TE
-                # 通常有≥5个拷贝，≥65%一致性，合理的复杂度
                 a_sequences.append(seq_data)
             elif final_score >= B_THRESHOLD:
-                # B类：中等置信度的TE
-                # 通常有3-5个拷贝，50-65%一致性
                 b_sequences.append(seq_data)
             else:
-                # C类：低置信度序列
-                # 拷贝数过少或一致性过低，可能不是真正的TE
                 c_sequences.append(seq_data)
         
         # 计算分数分布用于日志
@@ -431,10 +497,10 @@ class SequenceScreenerOptimized:
         
         logger.info(f"Running CD-HIT with 90% threshold on {len(sorted_sequences)} sequences")
         
-        # 运行CD-HIT去冗余（95%阈值）
+        # 运行CD-HIT去冗余（80%阈值）
         deduplicated = run_cdhit_optimized(
             sorted_sequences,
-            threshold=0.90,  # 使用phase3的masking阈值
+            threshold=0.80,  # 使用phase3的masking阈值
             threads=self.config.threads,
             config=self.config,
             label="phase1_prefilter"

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import logging
 import argparse
 import json
@@ -149,6 +150,8 @@ def main():
                        help='Resume from checkpoints if available')
     parser.add_argument('--clear-cache', action='store_true',
                        help='Clear cache before running')
+    parser.add_argument('--repeatmasker-quick', action='store_true',
+                       help='Enable RepeatMasker quick mode (-q flag)')
     
     args = parser.parse_args()
     
@@ -171,6 +174,7 @@ def main():
     # 添加额外的配置选项
     config.__dict__['keep_temp'] = args.keep_temp
     config.__dict__['keep_checkpoints'] = args.keep_checkpoints
+    config.__dict__['repeatmasker_quick'] = args.repeatmasker_quick
     
     # 确保输出目录存在
     output_dir = Path(args.output)

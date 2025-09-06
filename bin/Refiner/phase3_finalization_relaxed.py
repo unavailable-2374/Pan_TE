@@ -42,9 +42,9 @@ class ConsensusFilterRelaxed:
         self.cdhit_workers = min(8, max(2, self.n_threads // 4))  # 2-8个CD-HIT进程
         self.threads_per_cdhit = max(1, self.n_threads // self.cdhit_workers)
         
-        # 动态调整嵌合检测参数
+        # 动态调整嵌合检测参数 - 修改为50bp最小长度
         self.chimera_distance_threshold = getattr(config, 'chimera_segment_distance', 20000)
-        self.chimera_min_length = getattr(config, 'chimera_min_seq_length', 150)
+        self.chimera_min_length = 50  # 统一使用50bp最小长度
         self.chimera_strict_mode = getattr(config, 'chimera_detection_strict', False)
         
         logger.info(f"Phase 3 optimized: {self.n_threads} threads total, "
@@ -96,9 +96,9 @@ class ConsensusFilterRelaxed:
         for seq_data in consensus_list:
             sequence = seq_data.get('sequence', '')
             
-            # 基本过滤条件
-            if (len(sequence) >= self.chimera_min_length and
-                len(sequence) <= 50000 and  # 过长序列可能有问题
+            # 基本过滤条件 - 修改为50bp最小长度
+            if (len(sequence) >= 50 and  # 统一使用50bp最小长度
+                len(sequence) <= 100000 and  # 增大最大长度限制到100kb
                 sequence.count('N') / len(sequence) < 0.3):  # N含量过滤
                 filtered.append(seq_data)
         
@@ -116,8 +116,8 @@ class ConsensusFilterRelaxed:
         p50 = np.percentile(copy_numbers, 50)
         p25 = np.percentile(copy_numbers, 25)
         
-        # 动态阈值：在配置最小值和P25之间
-        dynamic_threshold = max(self.config.min_copy_number, int(p25 * 0.5))
+        # 固定阈值：最低5个拷贝要求，不再使用动态阈值
+        dynamic_threshold = 5  # 固定为5个拷贝
         
         logger.info(f"Copy number statistics: P25={p25:.1f}, P50={p50:.1f}, "
                    f"threshold={dynamic_threshold}")
@@ -357,6 +357,44 @@ def filter_batch_by_copy_number(batch: List[Dict], threshold: int) -> List[Dict]
     return [seq for seq in batch if seq.get('num_copies', 1) >= threshold]
 
 
+def simple_redundancy_removal(sequences: List[Dict], threshold: float) -> List[Dict]:
+    """简单的冗余去除备用方案"""
+    if not sequences:
+        return []
+    
+    # Sort by length (longest first)
+    sorted_seqs = sorted(sequences, key=lambda x: len(x['sequence']), reverse=True)
+    
+    # Keep representatives
+    representatives = []
+    for seq in sorted_seqs:
+        is_redundant = False
+        seq_str = seq['sequence'].upper()
+        
+        # Check against existing representatives
+        for rep in representatives:
+            rep_str = rep['sequence'].upper()
+            
+            # Simple similarity check (containment)
+            if len(seq_str) <= len(rep_str):
+                if seq_str in rep_str:
+                    is_redundant = True
+                    break
+            else:
+                if rep_str in seq_str:
+                    # Replace shorter representative with longer sequence
+                    representatives.remove(rep)
+                    representatives.append(seq)
+                    is_redundant = True
+                    break
+        
+        if not is_redundant:
+            representatives.append(seq)
+    
+    logger.info(f"Simple redundancy removal: {len(sequences)} -> {len(representatives)}")
+    return representatives
+
+
 def run_cdhit_optimized(sequences: List[Dict], threshold: float, threads: int, 
                        config, label: str) -> List[Dict]:
     """优化的CD-HIT运行"""
@@ -371,7 +409,7 @@ def run_cdhit_optimized(sequences: List[Dict], threshold: float, threads: int,
         return []
     
     # 创建临时输入文件
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as input_file:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False, dir=config.temp_dir) as input_file:
         records = []
         for seq_data in sequences:
             record = SeqRecord(
@@ -384,20 +422,30 @@ def run_cdhit_optimized(sequences: List[Dict], threshold: float, threads: int,
         SeqIO.write(records, input_file, "fasta")
         input_path = input_file.name
     
+    # Ensure file is readable
+    os.chmod(input_path, 0o644)
+    
     # 创建临时输出文件
     output_path = input_path + ".cdhit"
     
     try:
+        # 检查cd-hit-est是否存在
+        import shutil
+        if not shutil.which(config.cdhit_exe):
+            logger.error(f"CD-HIT executable not found: {config.cdhit_exe}")
+            logger.error("Please install CD-HIT or specify correct path")
+            raise FileNotFoundError(f"CD-HIT not found: {config.cdhit_exe}")
+        
         # 构建CD-HIT命令
         cmd = [
             config.cdhit_exe,
             '-i', input_path,
             '-o', output_path,
-            '-c', '0.8',  # 80% sequence identity threshold
+            '-c', str(threshold),  # Use the provided threshold parameter
             '-aS', '0.8',  # 80% coverage of shorter sequence
             '-aL', '0.8',  # 80% coverage of longer sequence
             '-G', '0',  # local alignment mode
-            '-n', '8',  # word size for 80% identity
+            '-n', '8' if threshold >= 0.8 else '5',  # word size based on threshold
             '-r', '1',  # compare both strands
             '-mask', 'NX',  # mask low-complexity regions
             '-M', '0',  # no memory limit
@@ -405,14 +453,26 @@ def run_cdhit_optimized(sequences: List[Dict], threshold: float, threads: int,
             '-d', '0'  # keep full sequence names
         ]
         
-        logger.debug(f"Running CD-HIT {label} with {threads} threads")
+        # Log file information
+        input_size = os.path.getsize(input_path)
+        logger.info(f"Running CD-HIT {label} with threshold {threshold} and {threads} threads")
+        logger.info(f"Input file: {input_path} ({input_size} bytes, {len(sequences)} sequences)")
+        logger.debug(f"CD-HIT command: {' '.join(cmd)}")
         
-        # 运行CD-HIT
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        # 运行CD-HIT (无timeout限制)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Check output
+        if os.path.exists(output_path):
+            output_size = os.path.getsize(output_path)
+            logger.info(f"CD-HIT output: {output_path} ({output_size} bytes)")
         
         if result.returncode != 0:
-            logger.error(f"CD-HIT {label} failed: {result.stderr}")
-            return sequences  # 返回原始序列
+            logger.error(f"CD-HIT {label} failed with return code {result.returncode}")
+            logger.error(f"CD-HIT stderr: {result.stderr}")
+            logger.error(f"CD-HIT stdout: {result.stdout}")
+            # Don't silently continue - raise an exception
+            raise RuntimeError(f"CD-HIT failed: {result.stderr}")
         
         # 解析结果
         representatives = []
@@ -427,8 +487,18 @@ def run_cdhit_optimized(sequences: List[Dict], threshold: float, threads: int,
         logger.debug(f"CD-HIT {label}: {len(sequences)} -> {len(representatives)}")
         return representatives
         
+    except FileNotFoundError as e:
+        logger.error(f"CD-HIT {label} not found: {e}")
+        logger.warning("Skipping CD-HIT redundancy removal - returning all sequences")
+        return sequences  # CD-HIT not available, return original
+    except RuntimeError as e:
+        logger.error(f"CD-HIT {label} execution failed: {e}")
+        logger.warning("CD-HIT failed - attempting simple redundancy removal fallback")
+        # Simple fallback: sort by length and remove very similar sequences
+        return simple_redundancy_removal(sequences, threshold)
     except Exception as e:
-        logger.error(f"CD-HIT {label} error: {e}")
+        logger.error(f"CD-HIT {label} unexpected error: {e}")
+        logger.warning("Unexpected error - returning original sequences")
         return sequences  # 出错时返回原始序列
     finally:
         # 清理临时文件

@@ -1,9 +1,10 @@
 """
-Phase 4: 高质量基因组Masking
-两步策略：
-1. 使用Phase 1的高可信度RepeatMasker结果生成初步masked genome
-2. 使用最终consensus序列进行第二轮精细masking
-目标：低假阳性、低假阴性
+Phase 4: 高质量基因组软屏蔽 (High-Quality Genome Soft Masking)
+新策略：
+1. 只使用高质量的共识序列(consensus)运行RepeatMasker
+2. 采用软屏蔽(soft masking)模式，保留原始序列信息
+3. 不再依赖Phase 1结果，完全基于Phase 3的高质量共识序列
+目标：基于最终高质量consensus的精准软屏蔽
 """
 
 import logging
@@ -23,98 +24,403 @@ from utils.robust_runner import RobustRunner
 logger = logging.getLogger(__name__)
 
 class GenomeMasker:
-    """Phase 4: 高质量基因组Masking"""
+    """Phase 4: 高质量基因组软屏蔽"""
     
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.runner = RobustRunner(config)
         
-        # Masking参数
-        self.min_rm_score = 225  # RepeatMasker最小分数（高可信度）
-        self.min_identity = 80.0  # 最小相似度
-        self.min_length = 50  # 最小mask长度
+        # 软屏蔽参数 (优化用于高质量consensus)
+        self.min_rm_score = 200  # RepeatMasker最小分数（适中，避免过于严格）
+        self.min_identity = 70.0  # 较低阈值，捕获更多diverged copies
+        self.min_length = 50     # 最小mask长度
+        self.soft_mask = True    # 强制软屏蔽模式
         
-        # 第二轮masking参数（为RECON优化：平衡假阳性和假阴性）
-        self.round2_min_identity = 75.0  # 略微降低，保留更多潜在重复元素供RECON发现
-        self.round2_min_coverage = 0.7   # 适度放宽，避免漏掉部分重复
-        self.round2_strict_mode = False  # RECON友好模式：保留边界区域
+        # 高质量consensus参数
+        self.min_consensus_quality = 0.8  # 只使用高质量consensus (80%以上)
+        self.min_consensus_copies = 3     # 至少基于3个拷贝的consensus
+        self.exclude_low_complexity = True  # 排除低复杂度sequences
         
-        logger.info(f"Phase 4 initialized: min_score={self.min_rm_score}, "
-                   f"min_identity={self.min_identity}%")
+        logger.info(f"Phase 4 initialized (Consensus-only soft masking): "
+                   f"min_score={self.min_rm_score}, min_identity={self.min_identity}%")
     
     def run(self, phase1_output: Dict, phase3_output: Dict) -> Dict[str, any]:
-        """执行Phase 4完整流程"""
+        """执行Phase 4完整流程（仅基于高质量consensus的软屏蔽）"""
         logger.info("="*60)
-        logger.info("Phase 4: Genome Masking")
+        logger.info("Phase 4: High-Quality Consensus Soft Masking")
         logger.info("="*60)
         
-        # 步骤1：收集高质量序列ID
-        high_quality_ids = self._collect_high_quality_ids(phase1_output, phase3_output)
-        logger.info(f"Collected {len(high_quality_ids)} high-quality sequence IDs")
+        # 步骤1：从Phase 3获取并过滤高质量consensus序列
+        high_quality_consensus = self._extract_high_quality_consensus(phase3_output)
+        logger.info(f"Extracted {len(high_quality_consensus)} high-quality consensus sequences")
         
-        # 步骤2：过滤Phase 1的RepeatMasker结果
-        filtered_rm_results = self._filter_repeatmasker_results(
-            phase1_output.get('rm_detailed_results', {}),
-            high_quality_ids
-        )
-        logger.info(f"Filtered RepeatMasker results: {self._count_total_hits(filtered_rm_results)} high-confidence hits")
+        # 步骤2：创建高质量consensus库文件
+        consensus_library_file = self._create_consensus_library(high_quality_consensus)
+        logger.info(f"Created consensus library: {consensus_library_file}")
         
-        # 步骤3：生成初步masked genome
-        preliminary_masked = self._generate_preliminary_mask(
+        # 步骤3：使用高质量consensus运行RepeatMasker软屏蔽
+        soft_masked_genome = self._run_repeatmasker_soft_masking(
             self.config.genome_file,
-            filtered_rm_results
+            consensus_library_file
         )
-        logger.info(f"Generated preliminary masked genome: {preliminary_masked}")
+        logger.info(f"Generated soft-masked genome: {soft_masked_genome}")
         
-        # 步骤4：准备最终consensus库
-        consensus_library = self._prepare_consensus_library(phase3_output)
-        logger.info(f"Prepared consensus library with {len(consensus_library)} sequences")
-        
-        # 步骤5：第二轮精细masking
-        final_masked = self._perform_second_round_masking(
-            preliminary_masked,
-            consensus_library
-        )
-        logger.info(f"Generated final masked genome: {final_masked}")
-        
-        # 步骤6：计算masking统计
-        stats = self._calculate_masking_stats(
+        # 步骤4：验证软屏蔽质量
+        masking_stats = self._analyze_masking_quality(
             self.config.genome_file,
-            preliminary_masked,
-            final_masked
+            soft_masked_genome,
+            high_quality_consensus
+        )
+        logger.info(f"Masking quality analysis completed")
+        
+        # 步骤5：计算masking统计和报告
+        final_stats = self._calculate_final_stats(
+            self.config.genome_file,
+            soft_masked_genome,
+            masking_stats,
+            high_quality_consensus
         )
         
-        # 步骤7：生成输出文件
+        # 步骤6：生成输出文件
         output_files = self._generate_output_files(
-            preliminary_masked,
-            final_masked,
-            stats
+            soft_masked_genome,
+            final_stats,
+            consensus_library_file
         )
         
         # 计算注释比例并写入文件供RECON使用
-        annotation_ratio = stats['final_masked_percent'] / 100.0  # 转换为0-1范围
+        annotation_ratio = final_stats['soft_masked_percent'] / 100.0  # 转换为0-1范围
         annotation_file = Path(self.config.output_dir) / "annotation_ratio.txt"
         
         with open(annotation_file, 'w') as f:
             f.write(f"{annotation_ratio:.6f}\n")
-            f.write(f"# Annotation ratio: {stats['final_masked_percent']:.2f}%\n")
-            f.write(f"# Masked bases: {stats['final_masked_bp']:,}\n")
-            f.write(f"# Total bases: {stats['genome_size']:,}\n")
-            f.write(f"# Generated by Phase 4 Genome Masking\n")
+            f.write(f"# Annotation ratio: {final_stats['soft_masked_percent']:.2f}%\n")
+            f.write(f"# Masked bases: {final_stats['soft_masked_bp']:,}\n")
+            f.write(f"# Total bases: {final_stats['genome_size']:,}\n")
+            f.write(f"# Generated by Phase 4 Consensus-only Soft Masking\n")
         
         logger.info(f"Annotation ratio ({annotation_ratio:.4f}) written to {annotation_file}")
         
         return {
-            'preliminary_masked': preliminary_masked,
-            'final_masked': final_masked,
-            'statistics': stats,
+            'soft_masked_genome': soft_masked_genome,
+            'consensus_library': consensus_library_file,
+            'masking_stats': masking_stats,
+            'final_stats': final_stats,
             'annotation_ratio': annotation_ratio,
             'annotation_file': str(annotation_file),
             'output_files': output_files,
-            'summary': f"Hard-masked {stats['final_masked_percent']:.2f}% of genome (annotation ratio: {annotation_ratio:.4f})"
+            'high_quality_consensus_count': len(high_quality_consensus),
+            'summary': f"Soft-masked {final_stats['soft_masked_percent']:.2f}% of genome using {len(high_quality_consensus)} high-quality consensus sequences (annotation ratio: {annotation_ratio:.4f})"
         }
     
-    def _collect_high_quality_ids(self, phase1_output: Dict, phase3_output: Dict) -> Set[str]:
+    def _extract_high_quality_consensus(self, phase3_output: Dict) -> List[Dict]:
+        """从Phase 3输出中提取高质量consensus序列"""
+        high_quality_consensus = []
+        
+        # 检查phase3_output结构
+        if 'families' not in phase3_output:
+            logger.warning("No families found in phase3_output")
+            return high_quality_consensus
+        
+        families = phase3_output['families']
+        logger.info(f"Processing {len(families)} families from Phase 3")
+        
+        for family_id, family_data in families.items():
+            # 检查family_data结构
+            if not isinstance(family_data, dict):
+                logger.warning(f"Invalid family data for {family_id}")
+                continue
+            
+            # 获取consensus序列
+            consensus_seq = family_data.get('consensus')
+            if not consensus_seq:
+                logger.debug(f"No consensus sequence for family {family_id}")
+                continue
+            
+            # 获取质量评分
+            quality_score = family_data.get('quality_score', 0.0)
+            copy_number = family_data.get('copy_number', 0)
+            boundary_score = family_data.get('boundary_score', 0.0)
+            
+            # 应用高质量过滤条件
+            if (quality_score >= self.min_consensus_quality and
+                copy_number >= self.min_consensus_copies):
+                
+                # 检查低复杂度（如果启用）
+                if self.exclude_low_complexity:
+                    complexity_score = self._calculate_sequence_complexity(consensus_seq)
+                    if complexity_score < 0.3:  # 排除低复杂度序列
+                        logger.debug(f"Excluded low complexity family {family_id} (complexity: {complexity_score:.3f})")
+                        continue
+                
+                high_quality_consensus.append({
+                    'id': family_id,
+                    'sequence': consensus_seq,
+                    'quality_score': quality_score,
+                    'copy_number': copy_number,
+                    'boundary_score': boundary_score,
+                    'length': len(consensus_seq),
+                    'description': f"High-quality consensus from {copy_number} copies, quality={quality_score:.3f}"
+                })
+                
+                logger.debug(f"Included high-quality consensus {family_id}: "
+                           f"quality={quality_score:.3f}, copies={copy_number}, length={len(consensus_seq)}")
+            else:
+                logger.debug(f"Excluded family {family_id}: quality={quality_score:.3f}, copies={copy_number}")
+        
+        logger.info(f"Selected {len(high_quality_consensus)} high-quality consensus sequences")
+        return high_quality_consensus
+    
+    def _calculate_sequence_complexity(self, sequence: str) -> float:
+        """计算序列复杂度（基于DUST算法的简化版本）"""
+        if len(sequence) < 10:
+            return 0.0
+        
+        # 统计k-mer频率 (k=3)
+        kmer_counts = {}
+        k = 3
+        total_kmers = len(sequence) - k + 1
+        
+        if total_kmers <= 0:
+            return 0.0
+        
+        for i in range(total_kmers):
+            kmer = sequence[i:i+k].upper()
+            if 'N' not in kmer:  # 排除含N的kmer
+                kmer_counts[kmer] = kmer_counts.get(kmer, 0) + 1
+        
+        if not kmer_counts:
+            return 0.0
+        
+        # 计算Shannon熵
+        entropy = 0.0
+        for count in kmer_counts.values():
+            freq = count / total_kmers
+            entropy -= freq * np.log2(freq)
+        
+        # 标准化到0-1范围（3-mer的最大熵约为6）
+        max_entropy = np.log2(min(64, total_kmers))  # 4^3 = 64种可能的3-mer
+        complexity = entropy / max_entropy if max_entropy > 0 else 0.0
+        
+        return min(1.0, complexity)
+    
+    def _create_consensus_library(self, high_quality_consensus: List[Dict]) -> str:
+        """创建高质量consensus库文件"""
+        library_file = Path(self.config.output_dir) / "high_quality_consensus.fasta"
+        
+        with open(library_file, 'w') as f:
+            for consensus in high_quality_consensus:
+                header = f">{consensus['id']} {consensus['description']}"
+                f.write(header + '\n')
+                f.write(consensus['sequence'] + '\n')
+        
+        logger.info(f"Created consensus library with {len(high_quality_consensus)} sequences: {library_file}")
+        return str(library_file)
+    
+    def _run_repeatmasker_soft_masking(self, genome_file: str, consensus_library: str) -> str:
+        """使用高质量consensus运行RepeatMasker软屏蔽"""
+        output_dir = Path(self.config.output_dir)
+        soft_masked_file = output_dir / "genome_soft_masked.fa"
+        
+        # RepeatMasker软屏蔽参数
+        cmd = [
+            'RepeatMasker',
+            '-lib', consensus_library,    # 使用自定义consensus库
+            '-xsmall',                    # 软屏蔽模式（小写字母）
+            '-nolow',                     # 不屏蔽低复杂度区域
+            '-no_is',                     # 不搜索interspersed repeats
+            '-norna',                     # 不搜索RNA genes
+            '-parallel', str(self.config.threads),  # 并行线程数
+            '-dir', str(output_dir),      # 输出目录
+            '-cutoff', str(int(self.min_rm_score)),  # 最小分数阈值
+            genome_file
+        ]
+        
+        logger.info(f"Running RepeatMasker soft masking with command: {' '.join(cmd)}")
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=output_dir,
+                capture_output=True,
+                text=True,
+                timeout=7200  # 2小时超时
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"RepeatMasker failed with return code {result.returncode}")
+                logger.error(f"STDERR: {result.stderr}")
+                raise RuntimeError(f"RepeatMasker execution failed")
+            
+            # RepeatMasker生成的文件名
+            genome_basename = Path(genome_file).stem
+            rm_output = output_dir / f"{genome_basename}.masked"
+            
+            if rm_output.exists():
+                # 重命名为标准名称
+                import shutil
+                shutil.move(str(rm_output), str(soft_masked_file))
+                logger.info(f"RepeatMasker soft masking completed: {soft_masked_file}")
+            else:
+                raise RuntimeError(f"RepeatMasker output not found: {rm_output}")
+            
+        except subprocess.TimeoutExpired:
+            logger.error("RepeatMasker timeout (2 hours)")
+            raise RuntimeError("RepeatMasker execution timeout")
+        except Exception as e:
+            logger.error(f"RepeatMasker execution error: {e}")
+            raise
+        
+        return str(soft_masked_file)
+    
+    def _analyze_masking_quality(self, original_genome: str, soft_masked_genome: str, 
+                                high_quality_consensus: List[Dict]) -> Dict:
+        """分析软屏蔽质量"""
+        logger.info("Analyzing soft masking quality...")
+        
+        # 计算屏蔽统计
+        original_stats = self._get_sequence_stats(original_genome)
+        masked_stats = self._get_sequence_stats(soft_masked_genome)
+        
+        # 计算软屏蔽比例
+        masked_bases = masked_stats['lowercase_count']
+        total_bases = original_stats['total_bases']
+        masked_percent = (masked_bases / total_bases * 100) if total_bases > 0 else 0
+        
+        quality_stats = {
+            'total_consensus_used': len(high_quality_consensus),
+            'avg_consensus_quality': np.mean([c['quality_score'] for c in high_quality_consensus]) if high_quality_consensus else 0,
+            'avg_consensus_copies': np.mean([c['copy_number'] for c in high_quality_consensus]) if high_quality_consensus else 0,
+            'avg_consensus_length': np.mean([c['length'] for c in high_quality_consensus]) if high_quality_consensus else 0,
+            'masked_bases': masked_bases,
+            'total_bases': total_bases,
+            'masked_percent': masked_percent,
+            'original_stats': original_stats,
+            'masked_stats': masked_stats
+        }
+        
+        logger.info(f"Soft masking quality: {masked_percent:.2f}% of genome masked using {len(high_quality_consensus)} consensus sequences")
+        
+        return quality_stats
+    
+    def _get_sequence_stats(self, fasta_file: str) -> Dict:
+        """获取FASTA文件的序列统计信息"""
+        stats = {
+            'total_bases': 0,
+            'uppercase_count': 0,
+            'lowercase_count': 0,
+            'n_count': 0,
+            'gc_count': 0
+        }
+        
+        for record in SeqIO.parse(fasta_file, 'fasta'):
+            seq_str = str(record.seq)
+            stats['total_bases'] += len(seq_str)
+            
+            for char in seq_str:
+                if char.isupper():
+                    stats['uppercase_count'] += 1
+                elif char.islower():
+                    stats['lowercase_count'] += 1
+                
+                char_upper = char.upper()
+                if char_upper == 'N':
+                    stats['n_count'] += 1
+                elif char_upper in 'GC':
+                    stats['gc_count'] += 1
+        
+        # 计算比例
+        if stats['total_bases'] > 0:
+            stats['gc_percent'] = stats['gc_count'] / stats['total_bases'] * 100
+            stats['n_percent'] = stats['n_count'] / stats['total_bases'] * 100
+            stats['masked_percent'] = stats['lowercase_count'] / stats['total_bases'] * 100
+        
+        return stats
+    
+    def _calculate_final_stats(self, original_genome: str, soft_masked_genome: str,
+                             masking_stats: Dict, consensus_list: List[Dict]) -> Dict:
+        """计算最终统计信息"""
+        
+        stats = {
+            'genome_size': masking_stats['total_bases'],
+            'soft_masked_bp': masking_stats['masked_bases'],
+            'soft_masked_percent': masking_stats['masked_percent'],
+            'consensus_used': len(consensus_list),
+            'avg_consensus_quality': masking_stats['avg_consensus_quality'],
+            'avg_consensus_copies': masking_stats['avg_consensus_copies'],
+            'avg_consensus_length': masking_stats['avg_consensus_length'],
+            'masking_method': 'soft_masking',
+            'masking_tool': 'RepeatMasker_with_consensus'
+        }
+        
+        return stats
+    
+    def _generate_output_files(self, soft_masked_genome: str, stats: Dict, consensus_library: str) -> Dict:
+        """生成输出文件"""
+        output_dir = Path(self.config.output_dir)
+        
+        # 创建最终输出文件（genome_final_masked.fa用于RECON）
+        final_genome_file = output_dir / "genome_final_masked.fa"
+        import shutil
+        shutil.copy2(soft_masked_genome, final_genome_file)
+        
+        # 生成统计报告
+        stats_file = output_dir / "phase4_masking_stats.txt"
+        with open(stats_file, 'w') as f:
+            f.write("# Phase 4: High-Quality Consensus Soft Masking Statistics\n")
+            f.write(f"# Generated: {Path().absolute()}\n\n")
+            
+            f.write("## Masking Overview\n")
+            f.write(f"Genome size: {stats['genome_size']:,} bp\n")
+            f.write(f"Masked bases: {stats['soft_masked_bp']:,} bp\n")
+            f.write(f"Masked percentage: {stats['soft_masked_percent']:.2f}%\n")
+            f.write(f"Masking method: {stats['masking_method']}\n\n")
+            
+            f.write("## Consensus Library Used\n")
+            f.write(f"Total consensus sequences: {stats['consensus_used']}\n")
+            f.write(f"Average quality score: {stats['avg_consensus_quality']:.3f}\n")
+            f.write(f"Average copy number: {stats['avg_consensus_copies']:.1f}\n")
+            f.write(f"Average consensus length: {stats['avg_consensus_length']:.0f} bp\n\n")
+            
+            f.write("## Output Files\n")
+            f.write(f"Soft-masked genome: {soft_masked_genome}\n")
+            f.write(f"Final masked genome: {final_genome_file}\n")
+            f.write(f"Consensus library: {consensus_library}\n")
+        
+        output_files = {
+            'soft_masked_genome': soft_masked_genome,
+            'final_masked_genome': str(final_genome_file),
+            'consensus_library': consensus_library,
+            'stats_file': str(stats_file)
+        }
+        
+        logger.info(f"Generated output files: {list(output_files.keys())}")
+        return output_files
+
+# ==============================================================================
+# END OF UPDATED PHASE 4: CONSENSUS-ONLY SOFT MASKING
+# ==============================================================================
+
+# The GenomeMasker class has been completely rewritten to use only high-quality
+# consensus sequences from Phase 3, with soft masking via RepeatMasker.
+# 
+# Key changes:
+# 1. No longer depends on Phase 1 RepeatMasker results
+# 2. Uses only high-quality consensus sequences (quality >= 0.8, copies >= 3)  
+# 3. Performs soft masking (-xsmall) instead of hard masking
+# 4. Filters consensus by complexity to exclude low-complexity sequences
+# 5. Generates genome_final_masked.fa for downstream RECON usage
+# 
+# All methods below this line are DEPRECATED and should not be used.
+
+# ==============================================================================
+# DEPRECATED METHODS (Phase 1 dependent - no longer used in consensus-only mode)
+# ==============================================================================
+
+# The following methods are deprecated and not used in the new consensus-only
+# soft masking approach. They are retained for reference but should not be called.
+
+    def _collect_high_quality_ids_deprecated(self, phase1_output: Dict, phase3_output: Dict) -> Set[str]:
         """收集高质量序列的ID"""
         high_quality_ids = set()
         
@@ -288,11 +594,10 @@ class GenomeMasker:
                 '-lib', lib_file_path,
                 '-no_is',  # 不搜索细菌插入序列
                 '-nolow',  # 不mask低复杂度区域，让RECON处理
-                '-div', str(100 - self.round2_min_identity),  # 允许25%分歧，保留古老TEs
                 '-cutoff', '200',  # 降低cutoff，保留更多候选
                 '-s',      # 慢速但更敏感的搜索
                 '-small',  # 返回较短的匹配，保留RECON发现机会
-                '-pa', str(self.config.threads),
+                '-pa', str(max(1, self.config.threads // 2)),
                 '-dir', str(Path(self.config.output_dir) / 'round2_rm'),
                 preliminary_masked
             ]

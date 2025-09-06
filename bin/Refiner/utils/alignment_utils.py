@@ -26,6 +26,10 @@ def run_repeatmasker_batch_detailed(sequences: List[Dict], genome_file: str,
         # 构建RepeatMasker命令
         cmd = [config.repeatmasker_exe]
         
+        # 添加快速模式参数（如果启用）
+        if getattr(config, 'repeatmasker_quick', False):
+            cmd.append('-q')
+        
         # 添加参数
         if params.get('s'):
             cmd.append('-s')
@@ -132,6 +136,10 @@ def run_repeatmasker_batch(sequences: List[Dict], genome_file: str,
         # 构建RepeatMasker命令
         cmd = [config.repeatmasker_exe]
         
+        # 添加快速模式参数（如果启用）
+        if getattr(config, 'repeatmasker_quick', False):
+            cmd.append('-q')
+        
         # 添加参数
         if params.get('s'):
             cmd.append('-s')
@@ -189,6 +197,10 @@ def run_repeatmasker_single(sequence: Dict, genome_file: str,
     try:
         # 构建RepeatMasker命令
         cmd = [config.repeatmasker_exe]
+        
+        # 添加快速模式参数（如果启用）
+        if getattr(config, 'repeatmasker_quick', False):
+            cmd.append('-q')
         
         # 添加参数
         if params.get('s'):
