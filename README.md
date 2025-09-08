@@ -18,7 +18,7 @@ Design for linear or graph genome TE detection and annotation
     cd submodule/ClassifyTE
     conda env create -f environment.yml
     cd submodule/Inpactor2
-    conda env create -f Inpactor2/Inpactor2.yml
+    conda env create -f Inpactor2.yml
 
 
 ### [ClassifyTE](https://github.com/manisa/ClassifyTE/tree/master) database download:
