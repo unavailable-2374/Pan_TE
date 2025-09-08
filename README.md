@@ -16,7 +16,7 @@ Design for linear or graph genome TE detection and annotation
     echo 'export PERL5LIB=/home/tool/Pan_TE/share:/home/tool/miniconda3/envs/PGTA/share/RepeatMasker:$PERL5LIB"' >> ~/.bashrc
     conda activate PGTA
     cd submodule/ClassifyTE
-    conda env create -f environment.yml python==3.7
+    conda env create -f environment.yml
     cd submodule/Inpactor2
     conda env create -f Inpactor2/Inpactor2.yml
 
