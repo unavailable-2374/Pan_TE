@@ -17,8 +17,11 @@ Design for linear or graph genome TE detection and annotation
     conda activate PGTA
     cd submodule/ClassifyTE
     conda env create -f environment.yml
-    cd submodule/Inpactor2
-    conda env create -f Inpactor2.yml
+    cd submodule/LookLTRs
+    mkdir bin
+    cd bin
+    cmake ..
+    make look4ltrs
 
 
 ### [ClassifyTE](https://github.com/manisa/ClassifyTE/tree/master) database download:

@@ -27,3 +27,5 @@ dependencies:
  - mash
  - psutil
  - minimap2
+ - cmake=3.10.3
+ - gcc=11.1.0
