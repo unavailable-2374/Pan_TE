@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 import numpy as np
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
@@ -59,7 +59,14 @@ def _calculate_single_complexity_parallel(seq_data, dust_window, dust_threshold)
         return None
 
 class SequenceScreenerOptimized:
-    """Phase 1: 智能筛选与多维度评分"""
+    """Phase 1: 序列筛选与共识候选识别
+    
+    主要功能：
+    1. 对RepeatScout输出进行质量评分
+    2. 识别需要构建共识的候选序列
+    3. 为候选序列收集RepeatMasker信息
+    4. 将候选序列传递给Phase2进行嵌合体分析
+    """
     
     def __init__(self, config: PipelineConfig):
         self.config = config
@@ -242,34 +249,45 @@ class SequenceScreenerOptimized:
         # 保存详细结果供Phase 2使用
         self.rm_detailed_results = rm_results
         
+        # 初始化自适应评分器
+        try:
+            import os
+            genome_size = os.path.getsize(self.config.genome_file)
+        except:
+            genome_size = 1e9  # 默认1Gb
+        
+        from adaptive_scoring import AdaptiveTEScorer
+        adaptive_scorer = AdaptiveTEScorer(genome_size)
+        
         # 基于TE生物学特征的覆盖度评分
         for seq_id, rm_data in rm_results.items():
             copy_number = rm_data.get('copy_number', 0)
             avg_identity = rm_data.get('avg_identity', 0)
             
-            # 拷贝数评分 - TE的核心特征是多拷贝
-            if copy_number >= 10:
-                copy_score = 1.0      # 明确的TE家族
-            elif copy_number >= 5:
-                copy_score = 0.8      # 良好的TE家族
-            elif copy_number >= 3:
-                copy_score = 0.6      # 最低可接受的TE
-            elif copy_number >= 2:
-                copy_score = 0.3      # 可疑，可能是segmental duplication
-            else:
-                copy_score = 0.1      # 不太可能是真正的TE
+            # 找到对应序列的长度
+            seq_length = None
+            for seq_data in self.sequences:
+                if seq_data['id'] == seq_id:
+                    seq_length = len(seq_data['sequence'])
+                    break
             
-            # 序列一致性评分 - 反映TE家族的进化年龄和活性
-            if avg_identity >= 75:
-                identity_score = 1.0      # 年轻/活跃的TE
-            elif avg_identity >= 65:
-                identity_score = 0.8      # 中等年龄的TE
-            elif avg_identity >= 55:
-                identity_score = 0.6      # 古老但仍可识别的TE
-            elif avg_identity >= 45:
-                identity_score = 0.3      # 高度退化的TE
+            if seq_length is None:
+                logger.warning(f"Could not find sequence length for {seq_id}")
+                seq_length = 1000  # 默认长度
+            
+            # 处理低拷贝数序列 - 小于3个拷贝的全部当成噪音
+            if copy_number < 3:
+                logger.debug(f"{seq_id}: Low copy number ({copy_number}) sequence treated as noise")
+                copy_score = 0.01  # 极低分数，基本排除
+                identity_score = 0.01
             else:
-                identity_score = 0.1      # 可能不是同一TE家族
+                # 使用自适应拷贝数评分（限制最大期望为15）
+                copy_score = adaptive_scorer.calculate_adaptive_copy_score(copy_number, seq_length)
+                
+                # 使用自适应一致性评分
+                identity_score = adaptive_scorer.calculate_adaptive_identity_score(
+                    avg_identity, seq_length, copy_number
+                )
             
             if seq_id not in self.scores:
                 self.scores[seq_id] = {}
@@ -283,63 +301,57 @@ class SequenceScreenerOptimized:
         # 输出拷贝数和一致性统计
         copy_numbers = [self.scores[seq_id]['copy_number'] for seq_id in self.scores]
         identities = [self.scores[seq_id]['avg_identity'] for seq_id in self.scores]
+        
+        # 统计噪音序列
+        noise_sequences = [seq_id for seq_id in self.scores if self.scores[seq_id]['copy_number'] < 3]
+        valid_sequences = [seq_id for seq_id in self.scores if self.scores[seq_id]['copy_number'] >= 3]
+        
+        logger.info(f"Copy number filtering results:")
+        logger.info(f"  Valid sequences (≥3 copies): {len(valid_sequences)}")
+        logger.info(f"  Noise sequences (<3 copies): {len(noise_sequences)}")
+        logger.info(f"  Noise ratio: {len(noise_sequences)/len(self.scores)*100:.1f}%")
+        
         if copy_numbers:
             logger.info(f"Copy numbers - Min: {min(copy_numbers)}, Max: {max(copy_numbers)}, "
                        f"Mean: {np.mean(copy_numbers):.1f}")
             logger.info(f"Identities - Min: {min(identities):.1f}%, Max: {max(identities):.1f}%, "
                        f"Mean: {np.mean(identities):.1f}%")
+        
+        if valid_sequences:
+            valid_copy_numbers = [self.scores[seq_id]['copy_number'] for seq_id in valid_sequences]
+            logger.info(f"Valid sequences copy numbers - Min: {min(valid_copy_numbers)}, "
+                       f"Max: {max(valid_copy_numbers)}, Mean: {np.mean(valid_copy_numbers):.1f}")
     
     def calculate_final_scores(self):
-        """计算综合分数 - 基于TE生物学特征的固定权重系统"""
-        logger.info("Calculating final scores based on TE biological features...")
+        """计算自适应综合分数"""
+        logger.info("Calculating adaptive final scores based on sequence characteristics...")
+        
+        # 初始化自适应评分器
+        try:
+            import os
+            genome_size = os.path.getsize(self.config.genome_file)
+        except:
+            genome_size = 1e9  # 默认1Gb
+        
+        from adaptive_scoring import AdaptiveTEScorer
+        adaptive_scorer = AdaptiveTEScorer(genome_size)
         
         for seq_data in self.sequences:
             seq_id = seq_data['id']
-            sequence_length = seq_data['length']
             
-            # 获取各项分数
-            copy_score = self.scores[seq_id].get('copy_score', 0)
-            identity_score = self.scores[seq_id].get('identity_score', 0)
-            complexity_score = self.scores[seq_id].get('complexity', 0)
-            
-            # 长度合理性评分（不同TE类型有不同长度特征）
-            if 100 <= sequence_length <= 500:
-                # SINE/MITE的典型长度
-                length_score = 1.0
-            elif 500 < sequence_length <= 3000:
-                # 大多数TE的理想长度范围
-                length_score = 1.0
-            elif 3000 < sequence_length <= 7000:
-                # LINE/LTR的典型长度
-                length_score = 0.9
-            elif 7000 < sequence_length <= 15000:
-                # 较长但仍合理
-                length_score = 0.7
-            else:
-                # 过短（<100）或过长（>15000）
-                length_score = 0.5
-            
-            # 边界质量（简化版）
-            boundary_quality = self._calculate_boundary_quality(seq_data)
-            
-            # 基于TE生物学特征的权重分配
-            # 拷贝数是最重要的TE特征（40%）
-            # 一致性反映家族保守性（25%）
-            # 复杂度排除简单重复（20%）
-            # 长度合理性（10%）
-            # 边界质量（5%）
-            final_score = (
-                0.40 * copy_score +
-                0.25 * identity_score +
-                0.20 * complexity_score +
-                0.10 * length_score +
-                0.05 * boundary_quality
+            # 使用自适应评分器计算最终分数
+            final_score, reason = adaptive_scorer.calculate_adaptive_final_score(
+                seq_data, self.scores[seq_id]
             )
             
-            # 保存所有分数用于调试
+            # 保存分数和分类原因
             self.scores[seq_id]['final'] = final_score
-            self.scores[seq_id]['length_score'] = length_score
-            self.scores[seq_id]['boundary_quality'] = boundary_quality
+            self.scores[seq_id]['classification_reason'] = reason
+            
+            # 保留原有的边界质量计算用于兼容性
+            if 'boundary_quality' not in self.scores[seq_id]:
+                boundary_quality = self._calculate_boundary_quality(seq_data)
+                self.scores[seq_id]['boundary_quality'] = boundary_quality
             
         # 输出最终分数统计
         final_scores = [self.scores[seq['id']]['final'] for seq in self.sequences]
@@ -349,16 +361,23 @@ class SequenceScreenerOptimized:
                    f"Median: {np.median(final_scores):.3f}")
     
     def categorize_sequences(self):
-        """将序列分类为A/B/C三类 - 基于TE生物学特征的固定阈值"""
+        """将序列分类为A/B/C三类 - 使用自适应阈值"""
         a_sequences = []
         b_sequences = []
         c_sequences = []
         
-        # 基于TE生物学特征的固定阈值
-        # 这些阈值基于TE序列的质量标准，而不是数据分布
-        # 调整阈值以获得更合理的分布
-        A_THRESHOLD = 0.65  # 明确的高质量TE（多拷贝、高一致性、合理复杂度）
-        B_THRESHOLD = 0.45  # 可能的TE，需要进一步验证
+        # 初始化自适应评分器获取动态阈值
+        try:
+            import os
+            genome_size = os.path.getsize(self.config.genome_file)
+        except:
+            genome_size = 1e9  # 默认1Gb
+        
+        from adaptive_scoring import AdaptiveTEScorer
+        adaptive_scorer = AdaptiveTEScorer(genome_size)
+        
+        # 获取自适应阈值
+        A_THRESHOLD, B_THRESHOLD = adaptive_scorer.get_adaptive_thresholds(self.sequences)
         
         for seq_data in self.sequences:
             seq_id = seq_data['id']
@@ -379,21 +398,44 @@ class SequenceScreenerOptimized:
         
         # 输出分类统计
         logger.info(f"Score distribution - P25: {score_p25:.3f}, P50: {score_p50:.3f}, P75: {score_p75:.3f}")
-        logger.info(f"Classification thresholds (fixed) - A: >={A_THRESHOLD:.2f}, B: >={B_THRESHOLD:.2f}")
+        logger.info(f"Classification thresholds (adaptive) - A: >={A_THRESHOLD:.2f}, B: >={B_THRESHOLD:.2f}")
         logger.info(f"Score range: {min(all_final_scores):.3f} - {max(all_final_scores):.3f}")
+        
+        # 统计分类原因
+        classification_stats = {}
+        for seq_data in self.sequences:
+            reason = self.scores[seq_data['id']].get('classification_reason', 'unknown')
+            if reason not in classification_stats:
+                classification_stats[reason] = {'A': 0, 'B': 0, 'C': 0}
+            
+            final_score = self.scores[seq_data['id']]['final']
+            if final_score >= A_THRESHOLD:
+                classification_stats[reason]['A'] += 1
+            elif final_score >= B_THRESHOLD:
+                classification_stats[reason]['B'] += 1
+            else:
+                classification_stats[reason]['C'] += 1
+        
+        # 输出分类原因统计
+        logger.info("Top classification reasons:")
+        for reason, counts in sorted(classification_stats.items(), 
+                                    key=lambda x: sum(x[1].values()), reverse=True)[:6]:
+            total_count = sum(counts.values())
+            logger.info(f"  {reason}: A={counts['A']}, B={counts['B']}, C={counts['C']} (total={total_count})")
         
         # 输出前几个高分序列的详细信息
         top_sequences = sorted(self.sequences, 
                               key=lambda x: self.scores[x['id']]['final'], 
                               reverse=True)[:5]
-        logger.info("Top 5 sequences (by final score):")
+        logger.info("Top 5 sequences (by adaptive final score):")
         for seq in top_sequences:
             sid = seq['id']
             s = self.scores[sid]
-            logger.info(f"  {sid}: final={s['final']:.3f}, "
-                       f"copy_score={s.get('copy_score', 0):.2f}(n={s.get('copy_number', 0)}), "
-                       f"identity={s.get('identity_score', 0):.2f}({s.get('avg_identity', 0):.1f}%), "
-                       f"complexity={s['complexity']:.2f}")
+            seq_len = len(seq['sequence'])
+            logger.info(f"  {sid} ({seq_len}bp): final={s['final']:.3f}, "
+                       f"adaptive_copy={s.get('adaptive_copy_score', s.get('copy_score', 0)):.2f}(n={s.get('copy_number', 0)}), "
+                       f"adaptive_identity={s.get('adaptive_identity_score', s.get('identity_score', 0)):.2f}({s.get('avg_identity', 0):.1f}%), "
+                       f"reason={s.get('classification_reason', 'unknown')}")
         
         logger.info(f"Categorization: A={len(a_sequences)}, B={len(b_sequences)}, C={len(c_sequences)}")
         
@@ -420,13 +462,69 @@ class SequenceScreenerOptimized:
             logger.info(f"A-class stats: Copy number {np.mean(a_copy_numbers):.1f}±{np.std(a_copy_numbers):.1f}, "
                        f"Identity {np.mean(a_identities):.1f}±{np.std(a_identities):.1f}%")
         
+        # 步骤7: 识别需要构建共识的候选序列
+        # 策略：A类和B类序列都是共识构建的候选，C类序列质量太低跳过
+        consensus_candidates = a_sequences + b_sequences
+        
+        # 为候选序列添加质量分类标记
+        for seq in consensus_candidates:
+            seq_score = self.scores[seq['id']]['final']
+            if seq_score >= A_THRESHOLD:
+                seq['quality_class'] = 'A'
+            elif seq_score >= B_THRESHOLD:
+                seq['quality_class'] = 'B'
+            else:
+                seq['quality_class'] = 'C'
+        
+        # 过滤掉质量过低的序列
+        filtered_candidates = []
+        filtered_out_sequences = []
+        
+        for seq in consensus_candidates:
+            seq_id = seq['id']
+            score_data = self.scores[seq_id]
+            
+            # 基本过滤条件
+            copy_number = score_data.get('copy_number', 0)
+            avg_identity = score_data.get('avg_identity', 0)
+            seq_length = len(seq['sequence'])
+            
+            # 过滤条件：拷贝数太少、相似度太低或序列太短的不适合构建共识
+            if (copy_number < 2 and seq['quality_class'] != 'A') or avg_identity < 50 or seq_length < self.config.min_length:
+                seq['filter_reason'] = f"copy_num={copy_number}, identity={avg_identity:.1f}%, length={seq_length}bp"
+                filtered_out_sequences.append(seq)
+            else:
+                # 添加RepeatMasker结果以供Phase2使用
+                if seq_id in self.rm_detailed_results:
+                    seq['rm_hits'] = self.rm_detailed_results[seq_id].get('hits', [])
+                    seq['rm_coverage'] = self.rm_detailed_results[seq_id].get('coverage', 0)
+                else:
+                    seq['rm_hits'] = []
+                    seq['rm_coverage'] = 0
+                
+                filtered_candidates.append(seq)
+        
+        logger.info(f"Consensus candidate selection:")
+        logger.info(f"  - A-class candidates: {len([s for s in filtered_candidates if s['quality_class'] == 'A'])}")
+        logger.info(f"  - B-class candidates: {len([s for s in filtered_candidates if s['quality_class'] == 'B'])}")
+        logger.info(f"  - Total candidates for Phase2: {len(filtered_candidates)}")
+        logger.info(f"  - Filtered out (too low quality): {len(filtered_out_sequences)}")
+        logger.info(f"  - C-class sequences (skipped): {len(c_sequences)}")
+        
+        # 候选序列统计
+        if filtered_candidates:
+            candidate_copy_numbers = [self.scores[seq['id']]['copy_number'] for seq in filtered_candidates]
+            candidate_identities = [self.scores[seq['id']]['avg_identity'] for seq in filtered_candidates]
+            logger.info(f"Candidate stats: Copy number {np.mean(candidate_copy_numbers):.1f}±{np.std(candidate_copy_numbers):.1f}, "
+                       f"Identity {np.mean(candidate_identities):.1f}±{np.std(candidate_identities):.1f}%")
+        
         return {
-            'a_sequences': a_sequences,
-            'b_sequences': b_sequences,
-            'c_sequences': c_sequences,
+            'consensus_candidates': filtered_candidates,  # 所有需要Phase2处理的序列
+            'filtered_out_sequences': filtered_out_sequences,  # 过滤掉的低质量序列
+            'c_class_sequences': c_sequences,  # C类序列（仅记录，不处理）
             'scores': self.scores,
-            'rm_detailed_results': self.rm_detailed_results,  # 传递给Phase 2
-            'summary': f"A:{len(a_sequences)}, B:{len(b_sequences)}, C:{len(c_sequences)}"
+            'rm_detailed_results': self.rm_detailed_results,  # 传递给Phase 2重用
+            'summary': f"Candidates:{len(filtered_candidates)} (A:{len([s for s in filtered_candidates if s['quality_class'] == 'A'])}, B:{len([s for s in filtered_candidates if s['quality_class'] == 'B'])}), Filtered:{len(filtered_out_sequences)}, C-class:{len(c_sequences)}"
         }
     
     def _calculate_boundary_quality(self, seq_data):
@@ -475,10 +573,10 @@ class SequenceScreenerOptimized:
         if not self.sequences:
             return []
         
-        # 使用phase3的去冗余函数（95%阈值）
-        from phase3_finalization_relaxed import run_cdhit_optimized
+        # 使用phase1专用的CD-HIT去冗余函数（80%阈值）
+        logger.info("Starting CD-HIT pre-RepeatMasker deduplication using phase1 standards")
         
-        # 转换序列格式为phase3期望的格式
+        # 转换序列格式为CD-HIT期望的格式
         formatted_sequences = []
         for seq in self.sequences:
             formatted_sequences.append({
@@ -495,12 +593,12 @@ class SequenceScreenerOptimized:
             reverse=True
         )
         
-        logger.info(f"Running CD-HIT with 90% threshold on {len(sorted_sequences)} sequences")
+        logger.info(f"Running CD-HIT with 70% threshold on {len(sorted_sequences)} sequences")
         
-        # 运行CD-HIT去冗余（80%阈值）
-        deduplicated = run_cdhit_optimized(
+        # 运行CD-HIT去冗余（70%阈值 - 更激进的去冗余）
+        deduplicated = run_cdhit_optimized_phase1(
             sorted_sequences,
-            threshold=0.80,  # 使用phase3的masking阈值
+            threshold=0.80,  # 降低到70%阈值，更激进的去冗余
             threads=self.config.threads,
             config=self.config,
             label="phase1_prefilter"
@@ -530,3 +628,231 @@ class SequenceScreenerOptimized:
                    f"(removed {len(self.sequences) - len(result_sequences)} redundant sequences)")
         
         return result_sequences
+    
+    def identify_potential_chimeras(self, sequences: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """识别潜在的嵌合体序列"""
+        regular_seqs = []
+        potential_chimeras = []
+        
+        logger.info(f"Starting chimera identification for {len(sequences)} sequences")
+        
+        for seq_data in sequences:
+            if self._is_potential_chimera(seq_data):
+                potential_chimeras.append(seq_data)
+            else:
+                regular_seqs.append(seq_data)
+        
+        logger.debug(f"Identified {len(potential_chimeras)} potential chimeras, {len(regular_seqs)} regular sequences")
+        
+        return regular_seqs, potential_chimeras
+    
+    def _is_potential_chimera(self, seq_data: Dict) -> bool:
+        """判断序列是否可能是嵌合体"""
+        sequence = seq_data['sequence']
+        seq_len = len(sequence)
+        seq_id = seq_data['id']
+        
+        # 标准1: 异常长度（>10kb或者>15kb根据基因组大小调整）
+        length_threshold = 15000 if hasattr(self.config, 'large_genome_threshold') and \
+                          getattr(self.config, 'genome_size', 0) > self.config.large_genome_threshold else 10000
+        
+        if seq_len > length_threshold:
+            logger.debug(f"{seq_id}: Potential chimera - excessive length ({seq_len}bp > {length_threshold}bp)")
+            return True
+        
+        # 标准2: 内部复杂度变化过大
+        if seq_len > 2000:  # 只对足够长的序列进行复杂度分析
+            complexity_variance = self._calculate_complexity_variance(sequence)
+            if complexity_variance > 0.3:  # 复杂度变异系数>30%
+                logger.debug(f"{seq_id}: Potential chimera - high complexity variance ({complexity_variance:.3f})")
+                return True
+        
+        # 标准3: GC含量波动异常
+        if seq_len > 1500:
+            gc_variance = self._calculate_gc_variance(sequence)
+            if gc_variance > 0.08:  # GC变异>8%
+                logger.debug(f"{seq_id}: Potential chimera - high GC variance ({gc_variance:.3f})")
+                return True
+        
+        # 标准4: RepeatMasker结果显示多个不同家族
+        if seq_id in self.rm_detailed_results:
+            rm_data = self.rm_detailed_results[seq_id]
+            if self._has_multiple_te_families_in_hits(rm_data.get('hits', [])):
+                logger.debug(f"{seq_id}: Potential chimera - multiple TE families detected")
+                return True
+        
+        return False
+    
+    def _calculate_complexity_variance(self, sequence: str, window_size: int = 500) -> float:
+        """计算序列复杂度方差"""
+        from utils.complexity_utils import calculate_dust_score
+        
+        if len(sequence) < window_size * 2:
+            return 0.0
+        
+        complexities = []
+        step = window_size // 2
+        
+        for i in range(0, len(sequence) - window_size + 1, step):
+            window = sequence[i:i+window_size]
+            complexity = calculate_dust_score(window)
+            complexities.append(complexity)
+        
+        if len(complexities) < 2:
+            return 0.0
+        
+        # 计算变异系数
+        mean_complexity = np.mean(complexities)
+        std_complexity = np.std(complexities)
+        
+        return std_complexity / mean_complexity if mean_complexity > 0 else 0.0
+    
+    def _calculate_gc_variance(self, sequence: str, window_size: int = 500) -> float:
+        """计算GC含量方差"""
+        if len(sequence) < window_size * 2:
+            return 0.0
+        
+        gc_contents = []
+        step = window_size // 2
+        
+        for i in range(0, len(sequence) - window_size + 1, step):
+            window = sequence[i:i+window_size]
+            gc_count = window.count('G') + window.count('C')
+            gc_content = gc_count / len(window) if len(window) > 0 else 0
+            gc_contents.append(gc_content)
+        
+        return np.std(gc_contents) if len(gc_contents) > 1 else 0.0
+    
+    def _has_multiple_te_families_in_hits(self, hits: List[Dict]) -> bool:
+        """检查RepeatMasker hits是否涉及多个TE家族"""
+        if len(hits) < 2:
+            return False
+        
+        # 模拟检查：如果有多个高质量hits且相互不重叠，可能是嵌合体
+        # 实际实现中需要分析hits的family信息
+        high_quality_hits = [hit for hit in hits if hit.get('score', 0) > 200]
+        
+        if len(high_quality_hits) >= 2:
+            # 检查hits是否相互不重叠（简化版本）
+            sorted_hits = sorted(high_quality_hits, key=lambda x: x.get('start', 0))
+            for i in range(len(sorted_hits) - 1):
+                if sorted_hits[i].get('end', 0) < sorted_hits[i+1].get('start', 0):
+                    return True  # 发现不重叠的高质量hits
+        
+        return False
+
+
+def run_cdhit_optimized_phase1(sequences: List[Dict], threshold: float, threads: int, 
+                       config, label: str) -> List[Dict]:
+    """Phase1专用的CD-HIT运行函数"""
+    import tempfile
+    import subprocess
+    import os
+    import shutil
+    from Bio import SeqIO
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    
+    if not sequences:
+        return []
+    
+    # 创建临时输入文件
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False, dir=config.temp_dir) as input_file:
+        records = []
+        for seq_data in sequences:
+            record = SeqRecord(
+                Seq(seq_data['sequence']),
+                id=seq_data.get('id', f"seq_{len(records)}"),
+                description=""
+            )
+            records.append(record)
+        
+        SeqIO.write(records, input_file, "fasta")
+        input_path = input_file.name
+    
+    # Ensure file is readable
+    os.chmod(input_path, 0o644)
+    
+    # 创建临时输出文件
+    output_path = input_path + ".cdhit"
+    
+    try:
+        # 检查cd-hit-est是否存在
+        if not shutil.which(config.cdhit_exe):
+            logger.error(f"CD-HIT executable not found: {config.cdhit_exe}")
+            logger.error("Please install CD-HIT or specify correct path")
+            raise FileNotFoundError(f"CD-HIT not found: {config.cdhit_exe}")
+        
+        # 构建CD-HIT命令 - 优化参数以平衡去冗余和保留多样性
+        cmd = [
+            config.cdhit_exe,
+            '-i', input_path,
+            '-o', output_path,
+            '-c', str(threshold),  # Use the provided threshold parameter
+            '-aS', '0.7',  # 70% coverage of shorter sequence - 更宽松以保留部分TE
+            # 移除 -aL 参数，允许长序列部分匹配（处理嵌套TE）
+            '-G', '0',  # local alignment mode
+            '-n', '8' if threshold >= 0.9 else ('5' if threshold >= 0.8 else '4'),  # word size: 90%+=8, 80-89%=5, 70-79%=4
+            '-r', '1',  # compare both strands
+            '-mask', 'NX',  # mask low-complexity regions
+            '-M', '0',  # no memory limit
+            '-T', str(threads),  # use all available threads
+            '-d', '0',  # keep full sequence names
+            '-g', '1'  # 最精确的聚类模式，确保质量
+        ]
+        
+        # Log file information
+        input_size = os.path.getsize(input_path)
+        logger.info(f"Running CD-HIT {label} with threshold {threshold} and {threads} threads")
+        logger.info(f"Input file: {input_path} ({input_size} bytes, {len(sequences)} sequences)")
+        logger.debug(f"CD-HIT command: {' '.join(cmd)}")
+        
+        # 运行CD-HIT (无timeout限制)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Check output
+        if os.path.exists(output_path):
+            output_size = os.path.getsize(output_path)
+            logger.info(f"CD-HIT output: {output_path} ({output_size} bytes)")
+        
+        if result.returncode != 0:
+            logger.error(f"CD-HIT {label} failed with return code {result.returncode}")
+            logger.error(f"CD-HIT stderr: {result.stderr}")
+            logger.error(f"CD-HIT stdout: {result.stdout}")
+            # Don't silently continue - raise an exception
+            raise RuntimeError(f"CD-HIT failed: {result.stderr}")
+        
+        # 解析结果
+        representatives = []
+        if os.path.exists(output_path):
+            for record in SeqIO.parse(output_path, "fasta"):
+                # 找到对应的原始序列数据
+                for seq_data in sequences:
+                    if seq_data.get('id') == record.id:
+                        representatives.append(seq_data)
+                        break
+        
+        logger.debug(f"CD-HIT {label}: {len(sequences)} -> {len(representatives)}")
+        return representatives
+        
+    except FileNotFoundError as e:
+        logger.error(f"CD-HIT {label} not found: {e}")
+        logger.warning("Skipping CD-HIT redundancy removal - returning all sequences")
+        return sequences  # CD-HIT not available, return original
+    except RuntimeError as e:
+        logger.error(f"CD-HIT {label} execution failed: {e}")
+        logger.warning("CD-HIT failed - attempting simple redundancy removal fallback")
+        # Simple fallback: return original sequences
+        return sequences
+    except Exception as e:
+        logger.error(f"CD-HIT {label} unexpected error: {e}")
+        logger.warning("Unexpected error - returning original sequences")
+        return sequences  # 出错时返回原始序列
+    finally:
+        # 清理临时文件
+        for temp_file in [input_path, output_path, output_path + ".clstr"]:
+            try:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except Exception:
+                pass

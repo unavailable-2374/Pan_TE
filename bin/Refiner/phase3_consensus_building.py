@@ -1,7 +1,8 @@
 """
-Phase 2: 共识序列扩展和改进（优化并行版本）
-目标：提高每个候选序列的质量和代表性，使基因组注释更全面
-优化：使用动态工作队列，避免批处理等待
+Phase 3: 共识序列构建和优化（重构版本）
+专注功能：基于Phase 2处理后的序列构建高质量共识序列
+输入：Phase 2输出的拆分序列、非嵌合体序列和未拆分序列
+输出：高质量共识序列库，准备用于基因组屏蔽
 """
 
 import logging
@@ -10,7 +11,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Any, Optional
 from pathlib import Path
 from collections import defaultdict, Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing as mp
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
@@ -26,8 +27,15 @@ from utils.robust_runner import RobustRunner
 logger = logging.getLogger(__name__)
 
 
-class ConsensusExpansionBuilder:
-    """Phase 2: 扩展和改进候选序列，提高代表性（优化并行版本）"""
+class ConsensusBuilder:
+    """Phase 3: 全面的共识序列构建器（重构版本）
+    
+    主要功能：
+    1. 接收Phase 2处理后的所有序列（拆分片段、非嵌合体、未拆分序列）
+    2. 对每个序列进行共识构建和优化
+    3. 生成高质量的共识序列库
+    4. 为Phase 4基因组屏蔽做准备
+    """
     
     def __init__(self, config: PipelineConfig):
         self.config = config
@@ -47,33 +55,34 @@ class ConsensusExpansionBuilder:
         # 设置并行处理workers - 基于内存和CPU数量
         cpu_count = mp.cpu_count()
         
-        # 估算每个worker需要的内存（经验值：约1-2GB per worker）
-        memory_per_worker = 1.5  # GB
+        # 估算每个worker需要的内存（降低估算值以允许更多并行）
+        # 实际上大部分序列处理不需要太多内存
+        memory_per_worker = 0.5  # GB (降低到0.5GB per worker)
         max_workers_by_memory = max(1, int(available_memory_gb / memory_per_worker))
         
-        # 基于线程数的workers计算
-        if config.threads >= 32:
-            max_workers_by_cpu = min(config.threads, cpu_count * 2)
-        elif config.threads >= 16:
-            max_workers_by_cpu = min(config.threads, max(cpu_count, 16))
-        else:
-            max_workers_by_cpu = max(4, min(config.threads, cpu_count))
+        # 优化：直接使用config.threads作为并行度
+        # 让系统充分利用所有指定的线程数
+        max_workers_by_cpu = config.threads
         
         # 取内存和CPU限制的较小值
         self.max_workers = min(max_workers_by_memory, max_workers_by_cpu)
-        self.max_workers = max(1, min(self.max_workers, 128))  # 至少1个worker
+        self.max_workers = max(1, min(self.max_workers, 128))  # 至少1个worker，最多128个
         
         # 如果内存限制了workers数量，记录警告
         if max_workers_by_memory < max_workers_by_cpu:
             logger.warning(f"Memory constraints: reducing workers from {max_workers_by_cpu} to {self.max_workers}")
         
-        # 计算每个子进程应该使用的线程数（避免线程爆炸）
-        # 总线程数 / 工作进程数 = 每个进程的线程数
-        self.threads_per_worker = max(1, config.threads // self.max_workers)
-        # 限制每个MAFFT最多使用4个线程（避免单个任务占用过多资源）
-        self.mafft_threads = min(self.threads_per_worker, 4)
+        # 计算每个子进程应该使用的线程数
+        # 如果使用多进程，每个进程只使用1个线程（因为进程本身就是并行单位）
+        if self.max_workers > 1:
+            self.threads_per_worker = 1
+            self.mafft_threads = 1  # 多进程模式下，每个MAFFT使用1个线程
+        else:
+            # 单进程模式，可以使用多个线程
+            self.threads_per_worker = config.threads
+            self.mafft_threads = min(config.threads, 4)  # 限制MAFFT最多使用4个线程
         
-        logger.info(f"Phase 2 Consensus Expansion initialized:")
+        logger.info(f"Phase 3 Consensus Builder initialized:")
         logger.info(f"  - Workers: {self.max_workers} (memory-aware)")
         logger.info(f"  - Threads per worker: {self.threads_per_worker}")
         logger.info(f"  - MAFFT threads: {self.mafft_threads}")
@@ -131,63 +140,66 @@ class ConsensusExpansionBuilder:
         
         return sorted_sequences
     
-    def run(self, phase1_output: Dict) -> List[Dict]:
-        """执行Phase 2主流程 - 优化的动态并行处理"""
-        candidate_sequences = self._select_candidate_sequences(phase1_output)
-        logger.info(f"Processing {len(candidate_sequences)} candidate sequences for expansion")
+    def run(self, phase2_output: Dict) -> Dict[str, Any]:
+        """执行Phase 3主流程 - 专注于所有序列的共识构建"""
         
-        all_consensus = []
+        # 获取Phase 2处理后的所有序列
+        input_sequences = self._extract_sequences_from_phase2(phase2_output)
+        
+        logger.info(f"Phase 3 input: {len(input_sequences)} sequences for consensus building")
+        
+        # 分类输入序列
+        sequence_categories = self._categorize_input_sequences(input_sequences)
+        logger.info(f"Input sequence categories:")
+        logger.info(f"  - Non-chimeric: {len(sequence_categories['non_chimeric'])}")
+        logger.info(f"  - Chimera segments: {len(sequence_categories['chimera_segments'])}")
+        logger.info(f"  - Unsplit chimeras: {len(sequence_categories['unsplit_chimeras'])}")
+        logger.info(f"  - Processing failures: {len(sequence_categories['failed_sequences'])}")
         
         # 统计信息
         stats = {
+            'input_sequences': len(input_sequences),
+            'processed_sequences': 0,
+            'processed': 0,
             'single_consensus': 0,
             'multiple_consensus': 0,
             'failed': 0,
+            'failed_sequences': 0,
             'total_consensus': 0,
-            'processed': 0
+            'high_quality_consensus': 0,
+            'medium_quality_consensus': 0,
+            'low_quality_consensus': 0
         }
         
-        # 使用动态工作队列，不再按批次处理
-        all_consensus = self._process_sequences_dynamic(candidate_sequences, stats)
+        # 所有输入序列都是共识构建的候选（Phase 1已经筛选过）
+        candidate_sequences = input_sequences
+        logger.info(f"Processing {len(candidate_sequences)} sequences for consensus building")
         
-        logger.info(f"Phase 2 complete: Generated {len(all_consensus)} consensus sequences from {len(candidate_sequences)} inputs")
-        logger.info(f"Expansion ratio: {len(all_consensus)/len(candidate_sequences):.2f}x")
-        logger.info(f"Statistics - Single: {stats['single_consensus']}, Multiple: {stats['multiple_consensus']}, Failed: {stats['failed']}")
+        # 按复杂度排序优化处理顺序
+        sorted_candidates = self._sort_sequences_by_complexity(candidate_sequences)
         
-        return all_consensus
+        # 并行构建共识序列
+        all_consensus = []
+        
+        if sorted_candidates:
+            all_consensus = self._build_consensus_parallel(sorted_candidates, stats)
+        
+        # 质量过滤、分级和去重
+        filtered_consensus = self._filter_and_grade_consensus(all_consensus, stats)
+        deduplicated_consensus = self._deduplicate_consensus_sequences(filtered_consensus, stats)
+        
+        # 生成Phase 4兼容的输出结果
+        result = self._generate_phase4_compatible_output(deduplicated_consensus, stats, sequence_categories)
+        
+        logger.info(f"Phase 3 complete:")
+        logger.info(f"  - Input: {stats['input_sequences']} sequences")
+        logger.info(f"  - Processed: {stats['processed_sequences']} candidates")
+        logger.info(f"  - Generated: {stats['total_consensus']} consensus sequences")
+        logger.info(f"  - Quality distribution: High={stats['high_quality_consensus']}, "
+                   f"Medium={stats['medium_quality_consensus']}, Low={stats['low_quality_consensus']}")
+        
+        return result
     
-    def _select_candidate_sequences(self, phase1_output: Dict) -> List[Dict]:
-        """选择候选序列并附加Phase 1的信息"""
-        candidates = []
-        rm_results = phase1_output.get('rm_detailed_results', {})
-        scores = phase1_output.get('scores', {})
-        
-        # 处理所有A类序列
-        for seq in phase1_output['a_sequences']:
-            # 直接使用Phase 1的RepeatMasker结果
-            seq['rm_hits'] = rm_results.get(seq['id'], {}).get('hits', [])
-            seq['phase1_scores'] = scores.get(seq['id'], {})
-            seq['quality_class'] = 'A'
-            candidates.append(seq)
-        
-        # 处理高质量的B类序列
-        for seq in phase1_output['b_sequences']:
-            seq_id = seq['id']
-            final_score = scores.get(seq_id, {}).get('final', 0)
-            if final_score >= 0.50:  # B类上半部分
-                seq['rm_hits'] = rm_results.get(seq['id'], {}).get('hits', [])
-                seq['phase1_scores'] = scores.get(seq_id, {})
-                seq['quality_class'] = 'B'
-                candidates.append(seq)
-        
-        # 统计使用Phase 1结果的比例
-        with_hits = sum(1 for c in candidates if c.get('rm_hits'))
-        logger.info(f"Selected {len(candidates)} sequences: "
-                   f"{len(phase1_output['a_sequences'])} A-class, "
-                   f"{len([s for s in phase1_output['b_sequences'] if scores.get(s['id'], {}).get('final', 0) >= 0.50])} B-class")
-        logger.info(f"  {with_hits}/{len(candidates)} sequences have RepeatMasker results from Phase 1")
-        
-        return candidates
     
     def _process_sequences_dynamic(self, sequences: List[Dict], stats: Dict) -> List[Dict]:
         """动态并行处理序列 - 内存优化版本"""
@@ -290,74 +302,86 @@ class ConsensusExpansionBuilder:
                 if stats['processed'] % 10 == 0:
                     gc.collect()
         else:
-            # 并行处理 - 使用spawn方法避免fork内存复制
-            try:
-                # 设置multiprocessing使用spawn方法（避免fork的内存问题）
-                original_method = mp.get_start_method()
-                if original_method != 'spawn':
-                    logger.info(f"Switching multiprocessing from '{original_method}' to 'spawn' method for memory efficiency")
-                    mp.set_start_method('spawn', force=True)
-            except RuntimeError:
-                # 已经设置过start method，忽略
-                pass
-            except ValueError:
-                # 平台不支持spawn，继续使用默认方法
-                logger.warning("Platform does not support 'spawn' method, using default")
+            # 并行处理 - 根据任务特性选择合适的执行器
+            # 如果主要是I/O密集型（如调用外部工具），使用ThreadPoolExecutor
+            # 如果是CPU密集型（如序列处理），使用ProcessPoolExecutor
             
-            # 使用ProcessPoolExecutor进行并行处理
-            with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-                # 批量提交以减少内存压力
-                batch_size = min(self.max_workers * 2, 20)  # 每批最多20个任务
-                futures = []
+            # 判断是否主要是I/O密集型（基于经验判断）
+            cpu_count = mp.cpu_count()
+            use_thread_pool = self.max_workers > cpu_count * 2  # 如果workers远超CPU数，说明期望更多并发
+            
+            if use_thread_pool:
+                logger.info(f"Using ThreadPoolExecutor with {self.max_workers} workers (I/O-bound optimization)")
+                executor_class = ThreadPoolExecutor
+            else:
+                logger.info(f"Using ProcessPoolExecutor with {self.max_workers} workers (CPU-bound optimization)")
+                executor_class = ProcessPoolExecutor
                 
-                for i in range(0, len(sorted_sequences), batch_size):
-                    batch = sorted_sequences[i:i+batch_size]
-                    batch_futures = {}
+                # 对于ProcessPoolExecutor，尝试使用spawn方法
+                try:
+                    original_method = mp.get_start_method()
+                    if original_method != 'spawn':
+                        logger.info(f"Switching multiprocessing from '{original_method}' to 'spawn' method")
+                        mp.set_start_method('spawn', force=True)
+                except (RuntimeError, ValueError) as e:
+                    logger.debug(f"Could not set spawn method: {e}")
+            
+            # 使用选定的执行器进行并行处理
+            with executor_class(max_workers=self.max_workers) as executor:
+                # 优化：提交所有任务到线程池，充分利用所有workers
+                futures_to_seq = {}
+                
+                logger.info(f"Submitting {len(sorted_sequences)} sequences to {self.max_workers} workers for parallel processing")
+                
+                # 一次性提交所有任务，让executor的内部队列管理任务分配
+                # 这样可以确保所有workers始终有任务执行，最大化并行效率
+                for seq in sorted_sequences:
+                    future = executor.submit(
+                        expand_and_improve_sequence,
+                        seq,
+                        self.config,
+                        self.mafft_threads
+                    )
+                    futures_to_seq[future] = seq
+                
+                logger.info(f"All {len(sorted_sequences)} tasks submitted successfully")
+                
+                # 使用as_completed处理完成的任务，这样可以立即处理完成的结果
+                # 而不需要等待整个批次完成
+                completed_count = 0
+                memory_check_interval = max(10, len(sorted_sequences) // 20)  # 每5%检查一次内存
+                
+                for future in as_completed(futures_to_seq):
+                    seq = futures_to_seq[future]
+                    completed_count += 1
                     
-                    # 提交一批任务
-                    for seq in batch:
-                        future = executor.submit(
-                            expand_and_improve_sequence,
-                            seq,
-                            self.config,
-                            self.mafft_threads
-                        )
-                        batch_futures[future] = seq
-                    
-                    logger.info(f"Submitted batch {i//batch_size + 1}/{(len(sorted_sequences) + batch_size - 1)//batch_size} " +
-                              f"({len(batch)} sequences)")
-                    
-                    # 等待这批任务完成
-                    for future in as_completed(batch_futures):
-                        seq = batch_futures[future]
-                        try:
-                            expansion_result = future.result(timeout=300)
-                            update_progress(expansion_result, seq['id'])
-                            
-                            if expansion_result['consensus_count'] > 1:
-                                logger.debug(f"{seq['id']}: generated {expansion_result['consensus_count']} consensus sequences")
-                        
-                        except Exception as e:
-                            logger.error(f"Failed processing {seq['id']}: {e}")
-                            failed_result = {
-                                'source_id': seq['id'],
-                                'consensus_count': 0,
-                                'consensus_list': []
-                            }
-                            update_progress(failed_result, seq['id'])
-                    
-                    # 批次之间进行垃圾回收
-                    gc.collect()
-                    
-                    # 检查内存使用，如果过高则暂停
                     try:
-                        mem = psutil.virtual_memory()
-                        if mem.percent > 90:
-                            logger.warning(f"High memory usage ({mem.percent}%), pausing for garbage collection")
-                            time.sleep(2)
-                            gc.collect()
-                    except:
-                        pass
+                        expansion_result = future.result(timeout=300)
+                        update_progress(expansion_result, seq['id'])
+                        
+                        if expansion_result['consensus_count'] > 1:
+                            logger.debug(f"{seq['id']}: generated {expansion_result['consensus_count']} consensus sequences")
+                    
+                    except Exception as e:
+                        logger.error(f"Failed processing {seq['id']}: {e}")
+                        failed_result = {
+                            'source_id': seq['id'],
+                            'consensus_count': 0,
+                            'consensus_list': []
+                        }
+                        update_progress(failed_result, seq['id'])
+                    
+                    # 定期检查内存和进行垃圾回收
+                    if completed_count % memory_check_interval == 0:
+                        gc.collect()
+                        try:
+                            mem = psutil.virtual_memory()
+                            if mem.percent > 85:
+                                logger.warning(f"High memory usage ({mem.percent:.1f}%), triggering aggressive GC")
+                                gc.collect(2)  # Full collection
+                                time.sleep(1)  # Brief pause to allow memory reclamation
+                        except:
+                            pass
         
         # 最终统计
         total_time = time.time() - self.start_time
@@ -365,6 +389,55 @@ class ConsensusExpansionBuilder:
         logger.info(f"Average processing rate: {total_sequences/(total_time+0.001):.1f} sequences/second")
         
         return all_consensus
+
+    def _extract_sequences_from_phase2(self, phase2_output: Dict) -> List[Dict]:
+        """从Phase 2输出中提取所有序列"""
+        sequences = []
+        
+        # 获取所有类型的序列
+        if isinstance(phase2_output, dict):
+            # 首先检查新的统一格式 (Phase 2重构版本)
+            if 'sequences' in phase2_output:
+                # 新格式：所有序列都在'sequences'键下
+                all_sequences = phase2_output.get('sequences', [])
+                for seq in all_sequences:
+                    if 'source' not in seq:
+                        seq['source'] = 'unknown'
+                    sequences.append(seq)
+            else:
+                # 处理旧格式的嵌合体拆分结果
+                split_sequences = phase2_output.get('split_sequences', [])
+                non_chimeric = phase2_output.get('non_chimeric_sequences', [])
+                unsplit_chimeras = phase2_output.get('unsplit_chimeras', [])
+                failed_sequences = phase2_output.get('failed_sequences', [])
+                
+                # 为每个序列标记来源
+                for seq in split_sequences:
+                    seq['source'] = 'chimera_split'
+                    sequences.append(seq)
+                
+                for seq in non_chimeric:
+                    seq['source'] = 'non_chimeric'
+                    sequences.append(seq)
+                
+                for seq in unsplit_chimeras:
+                    seq['source'] = 'unsplit_chimera'
+                    sequences.append(seq)
+                
+                for seq in failed_sequences:
+                    seq['source'] = 'processing_failed'
+                    sequences.append(seq)
+                    
+        elif isinstance(phase2_output, list):
+            # 兼容列表格式的输入
+            for seq in phase2_output:
+                if 'source' not in seq:
+                    seq['source'] = 'unknown'
+                sequences.append(seq)
+        
+        logger.info(f"Extracted {len(sequences)} sequences from Phase 2 output")
+        
+        return sequences
 
 
 def expand_and_improve_sequence(seed_seq: Dict, config: PipelineConfig, mafft_threads: int = 1) -> Dict:
@@ -1003,3 +1076,290 @@ def create_default_consensus(seed_seq: Dict) -> Dict:
         'quality_score': 0.2,  # 最低质量
         'note': 'no_copies_found'
     }
+
+
+# Phase 3 特有方法 - 添加在文件末尾
+
+def _categorize_input_sequences(self, sequences: List[Dict]) -> Dict[str, List[Dict]]:
+    """对输入序列进行分类"""
+    categories = {
+        'non_chimeric': [],
+        'chimera_segments': [],
+        'unsplit_chimeras': [],
+        'failed_sequences': []
+    }
+    
+    for seq in sequences:
+        source = seq.get('source', 'unknown')
+        
+        if source == 'non_chimeric':
+            categories['non_chimeric'].append(seq)
+        elif source == 'chimera_split':
+            if seq.get('split_from'):
+                # 这是一个拆分片段
+                categories['chimera_segments'].append(seq)
+            else:
+                # 这是一个未拆分的嵌合体
+                categories['unsplit_chimeras'].append(seq)
+        elif source == 'unsplit_chimera':
+            categories['unsplit_chimeras'].append(seq)
+        elif source == 'processing_failed':
+            categories['failed_sequences'].append(seq)
+        else:
+            # 其他来源，默认作为普通序列处理
+            categories['non_chimeric'].append(seq)
+    
+    return categories
+
+
+def _build_consensus_parallel(self, sequences: List[Dict], stats: Dict) -> List[Dict]:
+    """并行构建共识序列"""
+    all_consensus = []
+    
+    if self.max_workers <= 1 or len(sequences) <= 1:
+        logger.info("Using sequential consensus building")
+        all_consensus = self._build_consensus_sequential(sequences, stats)
+    else:
+        logger.info(f"Using parallel consensus building with {self.max_workers} workers")
+        # 复用原有的并行处理逻辑
+        all_consensus = self._process_sequences_dynamic(sequences, stats)
+    
+    return all_consensus
+
+
+def _build_consensus_sequential(self, sequences: List[Dict], stats: Dict) -> List[Dict]:
+    """串行构建共识序列"""
+    all_consensus = []
+    
+    for i, seq in enumerate(sequences, 1):
+        logger.debug(f"Processing sequence {i}/{len(sequences)}: {seq['id']}")
+        
+        consensus_result = self._process_single_sequence_for_consensus(seq)
+        
+        if consensus_result:
+            all_consensus.extend(consensus_result['consensus_sequences'])
+            stats['processed_sequences'] += 1
+            stats['single_consensus'] += len([c for c in consensus_result['consensus_sequences'] 
+                                            if c.get('subfamily_count', 1) == 1])
+            stats['multiple_consensus'] += len([c for c in consensus_result['consensus_sequences'] 
+                                              if c.get('subfamily_count', 1) > 1])
+        else:
+            stats['failed_sequences'] += 1
+        
+        # 定期报告进度
+        if i % 50 == 0 or i == len(sequences):
+            logger.info(f"Progress: {i}/{len(sequences)} sequences processed, "
+                       f"{len(all_consensus)} consensus generated")
+    
+    stats['total_consensus'] = len(all_consensus)
+    return all_consensus
+
+
+def _process_single_sequence_for_consensus(self, sequence: Dict) -> Optional[Dict]:
+    """处理单个序列进行共识构建"""
+    try:
+        seq_id = sequence.get('id', 'unknown')
+        seq_data = sequence.get('sequence', '')
+        
+        if not seq_data:
+            logger.warning(f"Empty sequence for {seq_id}")
+            return None
+        
+        # 使用扩展和改进方法（复用现有实现）
+        result = expand_and_improve_sequence(sequence, self.config, self.mafft_threads)
+        
+        if result and result['consensus_count'] > 0:
+            return {
+                'consensus_sequences': result['consensus_list'],
+                'method': f"expanded_{result['consensus_count']}_consensus"
+            }
+        else:
+            # 回退到原序列
+            logger.debug(f"Expansion failed for {seq_id}, using original sequence")
+            consensus = self._create_single_consensus(sequence)
+            return {
+                'consensus_sequences': [consensus],
+                'method': 'fallback_single'
+            }
+        
+    except Exception as e:
+        logger.error(f"Error processing sequence {sequence.get('id', 'unknown')} for consensus: {e}")
+        return None
+
+
+def _create_single_consensus(self, sequence: Dict) -> Dict:
+    """创建单一共识序列"""
+    consensus = {
+        'id': f"{sequence['id']}_consensus",
+        'sequence': sequence['sequence'],
+        'subfamily_id': 1,
+        'subfamily_count': 1,
+        'avg_identity': 100.0,
+        'avg_length': len(sequence['sequence']),
+        'source_sequence': sequence['id'],
+        'consensus_method': 'single_sequence',
+        'quality_score': self._calculate_consensus_quality_score(100.0, 1)
+    }
+    
+    return consensus
+
+
+def _calculate_consensus_quality_score(self, avg_identity: float, copy_count: int) -> float:
+    """计算共识序列质量分数"""
+    # 基于平均相似性和拷贝数的综合评分
+    identity_score = avg_identity / 100.0
+    copy_score = min(1.0, np.log1p(copy_count) / np.log1p(10))  # 10个拷贝为满分
+    
+    # 加权平均
+    quality_score = identity_score * 0.7 + copy_score * 0.3
+    
+    return quality_score
+
+
+def _filter_and_grade_consensus(self, consensus_list: List[Dict], stats: Dict) -> List[Dict]:
+    """过滤和分级共识序列"""
+    filtered_consensus = []
+    
+    for consensus in consensus_list:
+        quality_score = consensus.get('quality_score', 0)
+        seq_length = len(consensus.get('sequence', ''))
+        
+        # 基本过滤
+        if seq_length < self.config.min_length:
+            continue
+        
+        # 质量分级
+        if quality_score >= 0.8:
+            consensus['quality_grade'] = 'high'
+            stats['high_quality_consensus'] += 1
+        elif quality_score >= 0.6:
+            consensus['quality_grade'] = 'medium'
+            stats['medium_quality_consensus'] += 1
+        else:
+            consensus['quality_grade'] = 'low'
+            stats['low_quality_consensus'] += 1
+        
+        filtered_consensus.append(consensus)
+    
+    # 按质量分数排序
+    filtered_consensus.sort(key=lambda x: x.get('quality_score', 0), reverse=True)
+    
+    logger.info(f"Filtered and graded {len(filtered_consensus)} consensus sequences")
+    return filtered_consensus
+
+
+def _deduplicate_consensus_sequences(self, consensus_sequences: List[Dict], stats: Dict) -> List[Dict]:
+    """去除重复的共识序列"""
+    if len(consensus_sequences) <= 1:
+        return consensus_sequences
+    
+    logger.info(f"Deduplicating {len(consensus_sequences)} consensus sequences")
+    
+    # 按质量分数排序（高到低）
+    sorted_consensus = sorted(consensus_sequences, 
+                            key=lambda x: x.get('quality_score', 0), 
+                            reverse=True)
+    
+    deduplicated = []
+    processed_sequences = set()
+    
+    for consensus in sorted_consensus:
+        seq_id = consensus['id']
+        sequence = consensus['sequence']
+        
+        # 检查是否与已有序列重复
+        is_duplicate = False
+        
+        for existing in deduplicated:
+            similarity = self._calculate_sequence_similarity(
+                sequence, existing['sequence']
+            )
+            
+            # 如果相似度过高，认为是重复
+            if similarity > 0.95:  # 95%相似度阈值
+                is_duplicate = True
+                logger.debug(f"Removing duplicate: {seq_id} (similarity {similarity:.3f} with {existing['id']})")
+                break
+        
+        if not is_duplicate:
+            deduplicated.append(consensus)
+            processed_sequences.add(seq_id)
+    
+    removed_count = len(consensus_sequences) - len(deduplicated)
+    stats['deduplicated_sequences'] = removed_count
+    
+    logger.info(f"Deduplication complete: removed {removed_count} duplicate sequences, "
+               f"kept {len(deduplicated)} unique sequences")
+    
+    return deduplicated
+
+
+def _calculate_sequence_similarity(self, seq1: str, seq2: str) -> float:
+    """计算序列相似度"""
+    if not seq1 or not seq2:
+        return 0.0
+    
+    # 使用较短序列的长度
+    min_len = min(len(seq1), len(seq2))
+    max_len = max(len(seq1), len(seq2))
+    
+    # 长度差异太大，不认为是重复
+    if max_len / min_len > 1.2:
+        return 0.0
+    
+    # 计算对齐的相似度
+    matches = sum(1 for i in range(min_len) if seq1[i] == seq2[i])
+    
+    # 考虑长度差异的惩罚
+    length_penalty = min_len / max_len
+    
+    return (matches / min_len) * length_penalty
+
+
+def _generate_phase4_compatible_output(self, consensus_sequences: List[Dict], 
+                                      stats: Dict, sequence_categories: Dict) -> Dict[str, Any]:
+    """生成Phase 4兼容的输出格式"""
+    
+    # 按质量分级分离序列
+    high_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'high']
+    medium_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'medium']
+    low_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'low']
+    
+    # 生成masking library（95%去重，用于基因组屏蔽）
+    masking_library = high_quality + medium_quality[:len(medium_quality)//2]  # 取一半medium质量
+    
+    # 生成analysis library（90%去重，包含更多序列用于分析）
+    analysis_library = consensus_sequences
+    
+    result = {
+        'masking_library': masking_library,
+        'analysis_library': analysis_library,
+        'statistics': stats,
+        'phase3_complete': True,
+        'sequence_categories': sequence_categories,  # 传递给Phase 4作参考
+        'quality_distribution': {
+            'high': len(high_quality),
+            'medium': len(medium_quality),
+            'low': len(low_quality)
+        }
+    }
+    
+    logger.info(f"Generated Phase 4 compatible output:")
+    logger.info(f"  - Masking library: {len(masking_library)} sequences")
+    logger.info(f"  - Analysis library: {len(analysis_library)} sequences")
+    
+    return result
+
+
+# 为ConsensusBuilder类添加这些方法 - 在类定义后绑定
+# _extract_sequences_from_phase2 already defined inside the class
+ConsensusBuilder._categorize_input_sequences = _categorize_input_sequences
+ConsensusBuilder._build_consensus_parallel = _build_consensus_parallel
+ConsensusBuilder._build_consensus_sequential = _build_consensus_sequential
+ConsensusBuilder._process_single_sequence_for_consensus = _process_single_sequence_for_consensus
+ConsensusBuilder._create_single_consensus = _create_single_consensus
+ConsensusBuilder._calculate_consensus_quality_score = _calculate_consensus_quality_score
+ConsensusBuilder._filter_and_grade_consensus = _filter_and_grade_consensus
+ConsensusBuilder._deduplicate_consensus_sequences = _deduplicate_consensus_sequences
+ConsensusBuilder._calculate_sequence_similarity = _calculate_sequence_similarity
+ConsensusBuilder._generate_phase4_compatible_output = _generate_phase4_compatible_output

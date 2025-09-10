@@ -209,7 +209,7 @@ sub determine_strategy {
     my ($genome_size) = @_;
     
     my $mb_200 = 200 * 1024 * 1024;    # 200MB
-    my $mb_800 = 800 * 1024 * 1024;   # 800MB  
+    my $mb_800 = 400 * 1024 * 1024;   # 400MB  
     my $gb_1 = 1 * 1024 * 1024 * 1024; # 1GB
     my $gb_2 = 2 * 1024 * 1024 * 1024; # 2GB
     my $gb_3 = 3 * 1024 * 1024 * 1024; # 3GB
@@ -412,19 +412,13 @@ sub create_genome_sample {
     $logger->info("Generated BED file: $sample_bed");
     
     # Check if BED file was actually created
-    if (-s $sample_bed) {
-        my $bed_regions = `wc -l < '$sample_bed'`;
-        chomp($bed_regions);
-        $logger->info("BED file contains $bed_regions regions");
-    } else {
+    unless (-s $sample_bed) {
         $logger->error("BED file is empty or missing: $sample_bed");
         die "BED file creation failed\n";
     }
     
     # Extract sequences using bedtools
     my $sample_file = "$config{tmp_dir}/genome_sample.fa";
-    $logger->info("Extracting sequences to: $sample_file");
-    $logger->info("Using BED file: $sample_bed");
     my $extraction_success = extract_sequences_from_bed($sample_bed, $sample_file);
     
     unless ($extraction_success) {
@@ -482,18 +476,12 @@ sub create_non_overlapping_genome_samples {
         $logger->info("Processing sample $sample_id with BED file: $sample_bed");
         
         # Check BED file before extraction
-        if (-s $sample_bed) {
-            my $bed_regions = `wc -l < '$sample_bed'`;
-            chomp($bed_regions);
-            $logger->info("Sample $sample_id BED file contains $bed_regions regions");
-        } else {
+        unless (-s $sample_bed) {
             $logger->error("Sample $sample_id BED file is empty or missing: $sample_bed");
             next;
         }
         
         my $sample_file = "$config{tmp_dir}/genome_sample_${sample_id}.fa";
-        $logger->info("Extracting sequences for sample $sample_id to: $sample_file");
-        $logger->info("Using BED file for sample $sample_id: $sample_bed");
         my $extraction_success = extract_sequences_from_bed($sample_bed, $sample_file);
         
         if ($extraction_success) {
@@ -813,7 +801,6 @@ sub validate_bed_file {
 sub extract_sequences_from_bed {
     my ($bed_file, $output_fasta) = @_;
     
-    $logger->info("Extracting sequences from BED file: $bed_file");
     
     # Check if BED file exists
     unless (-s $bed_file) {
@@ -847,7 +834,6 @@ sub extract_sequences_from_bed {
         $logger->error("Genome file does not appear to be in FASTA format: $first_header");
         return 0;
     }
-    $logger->info("Genome file format check passed: $first_header");
     
     # Validate and clean the BED file first
     my $valid_regions = validate_bed_file($bed_file);
@@ -856,46 +842,14 @@ sub extract_sequences_from_bed {
         return 0;
     }
     
-    # Test bedtools with the first BED region before full extraction
-    my $test_bed = "$bed_file.test.$$";  # Add process ID to avoid conflicts
-    my $test_output = "$output_fasta.test.$$";
-    
-    # Create a test BED file with just the first region
-    my $first_region = `head -1 '$bed_file'`;
-    chomp($first_region);
-    
-    if ($first_region) {
-        open(my $test_fh, '>', $test_bed) or die "Cannot create test BED: $!";
-        print $test_fh "$first_region\n";
-        close($test_fh);
-        
-        my $test_cmd = "bedtools getfasta -fi '$config{genome_file}' -bed '$test_bed' -fo '$test_output'";
-        $logger->info("Testing bedtools with first region: $first_region");
-        
-        eval {
-            run_cmd($test_cmd);
-        };
-        
-        if ($@ || !-s $test_output) {
-            $logger->error("bedtools test extraction failed: $@");
-            $logger->error("Test command: $test_cmd");
-            # safe_unlink($test_bed, $test_output);  # DISABLED - keeping temp files
-            return 0;
-        } else {
-            $logger->info("bedtools test extraction successful");
-            # safe_unlink($test_bed, $test_output);  # DISABLED - keeping temp files
-        }
-    }
     
     # Use bedtools getfasta to extract sequences
     my $cmd = "bedtools getfasta -fi '$config{genome_file}' -bed '$bed_file' -fo '$output_fasta'";
     
-    $logger->info("Running bedtools command: $cmd");
     
-    # Check all file paths before running bedtools
-    $logger->info("Genome file: $config{genome_file} (size: " . (-s $config{genome_file}) . " bytes)");
-    $logger->info("BED file: $bed_file (size: " . (-s $bed_file) . " bytes)");
-    $logger->info("Output file: $output_fasta");
+    
+    # Ensure output file doesn't exist before running bedtools
+    unlink($output_fasta) if -f $output_fasta;
     
     # Check if bedtools is available
     my $bedtools_check = `which bedtools 2>/dev/null`;
@@ -911,6 +865,12 @@ sub extract_sequences_from_bed {
     if ($@) {
         $logger->error("bedtools getfasta failed: $@");
         $logger->error("Command that failed: $cmd");
+        
+        # If there's a corrupted output file, remove it
+        if (-f $output_fasta) {
+            $logger->warn("Removing potentially corrupted output file: $output_fasta");
+            unlink($output_fasta);
+        }
         return 0;
     }
     
@@ -920,38 +880,109 @@ sub extract_sequences_from_bed {
         return 0;
     }
     
-    # Log extraction results
-    my $seq_count = `grep -c '^>' '$output_fasta' 2>/dev/null || echo 0`;
-    chomp($seq_count);
-    my $file_size = -s $output_fasta;
-    $logger->info("Extracted $seq_count sequences (" . sprintf("%.1f MB", $file_size/1e6) . ") to $output_fasta");
+    # Validate that the output file is actually in FASTA format
+    my $first_line = `head -1 '$output_fasta'`;
+    chomp($first_line);
+    unless ($first_line =~ /^>/) {
+        $logger->error("Output file is not in FASTA format. First line: $first_line");
+        $logger->error("This suggests bedtools getfasta failed silently. Attempting alternative extraction...");
+        
+        # Try alternative extraction method
+        my $alt_success = extract_sequences_alternative($bed_file, $output_fasta);
+        return $alt_success;
+    }
+    
     
     return 1;  # Success
+}
+
+sub extract_sequences_alternative {
+    my ($bed_file, $output_fasta) = @_;
+    
+    
+    # Remove potentially corrupted output file
+    unlink($output_fasta) if -f $output_fasta;
+    
+    # Use samtools faidx for extraction
+    open(my $bed_fh, '<', $bed_file) or die "Cannot open BED file: $!";
+    open(my $out_fh, '>', $output_fasta) or die "Cannot create output FASTA: $!";
+    
+    my $seq_count = 0;
+    while (my $line = <$bed_fh>) {
+        chomp $line;
+        next if $line =~ /^\s*$/;
+        
+        my ($chr, $start, $end) = split(/\t/, $line);
+        next unless defined $chr && defined $start && defined $end;
+        
+        # Convert to 1-based coordinates for samtools
+        my $region = "${chr}:" . ($start + 1) . "-${end}";
+        
+        # Extract sequence using samtools
+        my $faidx_cmd = "samtools faidx '$config{genome_file}' '$region'";
+        my $seq_output = `$faidx_cmd 2>/dev/null`;
+        
+        if ($seq_output && $seq_output =~ /^>/) {
+            # Rename header to include region info
+            $seq_output =~ s/^>[^\n]+/>${chr}_${start}_${end}/;
+            print $out_fh $seq_output;
+            $seq_count++;
+        } else {
+            $logger->warn("Failed to extract sequence for region: $region");
+        }
+    }
+    
+    close($bed_fh);
+    close($out_fh);
+    
+    return ($seq_count > 0) ? 1 : 0;
 }
 
 sub apply_soft_masking_to_samples {
     my (@sample_files) = @_;
     
-    $logger->info("Applying dust and TRF soft masking to " . scalar(@sample_files) . " samples with thread-based splitting");
+    $logger->info("Applying masking to " . scalar(@sample_files) . " samples");
     
     # Calculate optimal splitting strategy
     my ($dust_threads_per_sample, $total_dust_jobs) = calculate_dust_parallelization(scalar(@sample_files));
     
-    $logger->info("Dust parallelization: $dust_threads_per_sample threads per sample, $total_dust_jobs total jobs");
     
     my @all_masked_files;
     
-    # Process each sample with its own thread allocation
+    # Use parallel processing for samples
+    my $pm = Parallel::ForkManager->new(scalar(@sample_files));
+    
+    # Collect results from parallel processes
+    $pm->run_on_finish(sub {
+        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_structure_reference) = @_;
+        if ($data_structure_reference && $data_structure_reference->{masked_file}) {
+            push @all_masked_files, $data_structure_reference->{masked_file};
+        }
+    });
+    
+    # Process each sample in parallel
     for my $sample_file (@sample_files) {
+        $pm->start and next;
+        
+        # Child process
+        # Validate sample file format before processing
+        unless (validate_fasta_format($sample_file)) {
+            $logger->error("Skipping invalid sample file: $sample_file");
+            $pm->finish(1);
+        }
+        
         my $masked_file = apply_soft_masking_with_splitting($sample_file, $dust_threads_per_sample);
         if ($masked_file && -s $masked_file) {
-            push @all_masked_files, $masked_file;
+            $pm->finish(0, { masked_file => $masked_file });
         } else {
             $logger->error("Masking failed for sample: $sample_file");
+            $pm->finish(1);
         }
     }
     
-    $logger->info("Soft masking completed for all samples");
+    $pm->wait_all_children;
+    
+    $logger->info("Masking completed");
     
     # Create checkpoint after successful masking (checkpoint name is fixed)
     if (@all_masked_files == @sample_files) {
@@ -996,30 +1027,26 @@ sub apply_soft_masking_with_splitting {
     my $sample_basename = basename($sample_file, '.fa');
     my $working_dir = dirname($sample_file);
     
-    $logger->info("Applying soft masking directly to: $sample_basename");
     
     # Step 1: Apply dust masking directly to the whole sample
     my $dust_masked = "$working_dir/${sample_basename}_dust.fa";
-    $logger->info("Applying dust masking to: $sample_basename");
-    apply_dust_masking($sample_file, $dust_masked);
+    my $dust_success = apply_dust_masking($sample_file, $dust_masked);
     
-    unless (-s $dust_masked) {
+    unless ($dust_success && -s $dust_masked) {
         $logger->error("Dust masking failed for: $sample_basename");
         return undef;
     }
     
     # Step 2: Apply TRF masking directly to the dust-masked file
     my $final_masked = "$working_dir/${sample_basename}_masked.fa";
-    $logger->info("Applying TRF masking to dust-masked file: $sample_basename");
-    apply_trf_masking($dust_masked, $final_masked);
+    my $trf_success = apply_trf_masking($dust_masked, $final_masked);
     
-    unless (-s $final_masked) {
+    unless ($trf_success && -s $final_masked) {
         $logger->error("TRF masking failed for: $sample_basename");
         return undef;
     }
     
     # Clean up temporary files after TRF completion
-    $logger->info("Cleaning up temporary files in $working_dir");
     
     # Clean up HTML files generated by TRF
     my @html_files = glob("$working_dir/*.html");
@@ -1372,42 +1399,148 @@ sub merge_fasta_files {
 sub apply_dust_masking {
     my ($input_file, $output_file) = @_;
     
-    $logger->info("Applying dust masking to: " . basename($input_file));
+    $logger->info("Applying dust hard masking to: " . basename($input_file));
     
-    # Use dustmasker from BLAST+ suite for low-complexity region masking
-    my $cmd = "dustmasker -in $input_file -out $output_file -outfmt fasta -parse_seqids";
+    # Validate input file format first
+    unless (validate_fasta_format($input_file)) {
+        $logger->error("Input file is not in valid FASTA format: $input_file");
+        return 0;
+    }
+    
+    # Use simple dustmasker approach
+    
+    my $simple_cmd = "dustmasker -in '$input_file' -outfmt fasta -hard_masking > '$output_file'";
     
     eval {
-        run_cmd($cmd);
+        run_cmd($simple_cmd);
     };
     
-    if ($@ || !-s $output_file) {
-        $logger->warn("dustmasker failed, trying alternative dust implementation");
-        # Fallback: try sdust if available
-        eval {
-            my $alt_cmd = "sdust $input_file > $output_file";
-            run_cmd($alt_cmd);
-        };
+    if ($@ || !-s $output_file || !validate_fasta_format($output_file)) {
+        $logger->error("dustmasker failed or produced invalid output: $@");
+        return 0;
+    }
+    
+    
+    # Convert soft masking to hard masking (N characters) if dustmasker used soft masking
+    my $conversion_success = convert_soft_to_hard_masking($output_file);
+    unless ($conversion_success) {
+        $logger->error("Hard masking conversion failed for: $output_file");
+        return 0;
+    }
+    
+    return 1;
+}
+
+sub validate_fasta_format {
+    my ($file) = @_;
+    
+    unless (-s $file) {
+        $logger->error("File does not exist or is empty: $file");
+        return 0;
+    }
+    
+    open(my $fh, '<', $file) or do {
+        $logger->error("Cannot open file for validation: $file ($!)");
+        return 0;
+    };
+    
+    my $first_line = <$fh>;
+    close($fh);
+    
+    unless ($first_line) {
+        $logger->error("File is empty: $file");
+        return 0;
+    }
+    
+    chomp($first_line);
+    unless ($first_line =~ /^>/) {
+        $logger->error("File is not in FASTA format - first line: '$first_line' (file: $file)");
         
-        if ($@ || !-s $output_file) {
-            $logger->warn("All dust implementations failed, copying original file");
-            run_cmd("cp $input_file $output_file");
+        # Log first few lines for debugging
+        open(my $debug_fh, '<', $file) or return 0;
+        my @debug_lines;
+        for my $i (0..4) {
+            my $line = <$debug_fh>;
+            last unless defined $line;
+            chomp($line);
+            push @debug_lines, $line;
+        }
+        close($debug_fh);
+        
+        $logger->error("First 5 lines of invalid file:");
+        for my $i (0..$#debug_lines) {
+            $logger->error("  Line " . ($i+1) . ": '$debug_lines[$i]'");
+        }
+        
+        return 0;
+    }
+    
+    return 1;
+}
+
+sub convert_soft_to_hard_masking {
+    my ($file) = @_;
+    
+    
+    # Validate input before conversion
+    unless (validate_fasta_format($file)) {
+        $logger->error("Input file for hard masking conversion is not valid FASTA: $file");
+        return 0;
+    }
+    
+    # Create a temporary file for the conversion
+    my $temp_file = "$file.hard_mask_tmp";
+    
+    open(my $in_fh, '<', $file) or die "Cannot open input file $file: $!";
+    open(my $out_fh, '>', $temp_file) or die "Cannot create temp file $temp_file: $!";
+    
+    my $converted_bases = 0;
+    while (my $line = <$in_fh>) {
+        if ($line =~ /^>/) {
+            # Header line - copy as is
+            print $out_fh $line;
+        } else {
+            # Sequence line - convert lowercase letters to N
+            chomp $line;
+            my $original_line = $line;
+            $line =~ s/[actgn]/N/g;  # Convert lowercase nucleotides to N
+            $converted_bases += ($original_line =~ tr/actgn//);
+            print $out_fh "$line\n";
         }
     }
     
-    $logger->info("Dust masking completed for: " . basename($input_file));
+    close($in_fh);
+    close($out_fh);
+    
+    # Replace original file with hard-masked version
+    run_cmd("mv $temp_file $file");
+    
+    # Validate the final result
+    unless (validate_fasta_format($file)) {
+        $logger->error("Hard masking conversion corrupted the file: $file");
+        return 0;
+    }
+    
+    
+    return 1;
 }
 
 sub apply_trf_masking {
     my ($input_file, $output_file) = @_;
     
-    $logger->info("Applying TRF masking to: " . basename($input_file));
+    
+    # Validate input file format first
+    unless (validate_fasta_format($input_file)) {
+        $logger->error("Input file is not in valid FASTA format for TRF: $input_file");
+        return 0;
+    }
     
     my $working_dir = dirname($input_file);
     my $input_basename = basename($input_file, '.fa');
     
     # TRF parameters: match=2, mismatch=7, delta=7, PM=80, PI=10, minscore=50, maxperiod=500
-    my $cmd = "trf $input_file 2 7 7 80 10 50 500 -d -m";
+    # -h option enables hard masking (N characters instead of soft masking)
+    my $cmd = "trf $input_file 2 7 7 80 10 50 500 -d -m -h";
     
     my $original_dir = getcwd();
     eval {
@@ -1415,17 +1548,9 @@ sub apply_trf_masking {
         chdir($working_dir) or die "Cannot change to $working_dir: $!";
         
         # Run TRF - capture output but don't fail on non-zero exit code
-        $logger->info("Running TRF command: $cmd");
         my $trf_output = `$cmd 2>&1`;
         my $trf_exit_code = $? >> 8;
         
-        # Log TRF output for debugging
-        if ($trf_output) {
-            $logger->debug("TRF output: $trf_output");
-        }
-        if ($trf_exit_code != 0) {
-            $logger->warn("TRF exited with code: $trf_exit_code");
-        }
         
         # Wait a moment for TRF to finish writing files
         sleep(2);
@@ -1441,34 +1566,24 @@ sub apply_trf_masking {
         
         # Also check for any TRF output files in the directory
         my @trf_mask_files = glob("*.2.7.7.80.10.50.500.mask");
-        if (@trf_mask_files) {
-            $logger->info("Found TRF mask files: " . join(", ", @trf_mask_files));
-            push @possible_mask_files, @trf_mask_files;
-        }
+        push @possible_mask_files, @trf_mask_files;
         
         my $found_mask = 0;
         for my $trf_mask_file (@possible_mask_files) {
             if (-s $trf_mask_file) {
                 # Move the masked file to desired output location
                 run_cmd("mv $trf_mask_file $output_file");
-                $logger->info("Moved TRF mask file: $trf_mask_file -> $output_file");
                 $found_mask = 1;
                 last;
             }
         }
         
         if ($found_mask) {
-            $logger->info("TRF masking successful");
+            # Convert soft masking to hard masking if TRF still used soft masking
+            convert_soft_to_hard_masking($output_file);
         } else {
             $logger->warn("TRF mask file not found, copying input file");
             run_cmd("cp $input_file $output_file");
-        }
-        
-        # Clean up all TRF intermediate files in the specific working directory  
-        # Note: These are cleaned up later in cleanup_tmp_directory() for better control
-        my @trf_files = glob("$working_dir/*.2.7.7.80.10.50.500.*");
-        if (@trf_files) {
-            $logger->info("Found " . scalar(@trf_files) . " TRF intermediate files (will be cleaned later)");
         }
     };
     
@@ -1481,7 +1596,7 @@ sub apply_trf_masking {
         run_cmd("cp $input_file $output_file");
     }
     
-    $logger->info("TRF masking completed for: " . basename($input_file));
+    return 1;
 }
 
 sub run_single_repeatscout_job {
@@ -1784,22 +1899,53 @@ sub refine_consensus {
 
 sub determine_genome_for_refiner {
     # Priority order:
-    # 1. First masked sample (sample 1) if it exists
-    # 2. Single masked sample if it exists  
-    # 3. Original genome file as fallback
+    # 1. Merged samples if multiple exist (up to 2)
+    # 2. Single sample if only one exists
+    # 3. Full genome masked if available
+    # 4. Original genome file as fallback
     
-    # Check for sample 1 (multi-sample case)
-    my $sample1_masked = "$config{tmp_dir}/genome_sample_1_masked.fa";
-    if (-s $sample1_masked) {
-        $logger->info("Using sample 1 masked genome for Refiner (multi-sample strategy)");
-        return $sample1_masked;
+    # Find all available genome samples
+    my @sample_files;
+    
+    # Check for numbered samples (multi-sample case)
+    for my $sample_id (1..10) {  # Check up to 10 samples
+        my $sample_masked = "$config{tmp_dir}/genome_sample_${sample_id}_masked.fa";
+        if (-s $sample_masked) {
+            push @sample_files, $sample_masked;
+        }
     }
     
     # Check for single sample (single-sample case)
     my $single_sample_masked = "$config{tmp_dir}/genome_sample_masked.fa";
     if (-s $single_sample_masked) {
-        $logger->info("Using single masked sample for Refiner (single-sample strategy)");
-        return $single_sample_masked;
+        push @sample_files, $single_sample_masked;
+    }
+    
+    # Determine what to use based on number of samples found
+    if (@sample_files >= 2) {
+        # Multiple samples found - merge the first 2
+        my $merged_file = "$config{tmp_dir}/genome_merged_for_refiner.fa";
+        $logger->info("Found " . scalar(@sample_files) . " genome samples, merging first 2 for Refiner");
+        $logger->info("Samples to merge: $sample_files[0], $sample_files[1]");
+        
+        # Merge the first two samples
+        my $merge_cmd = "cat '$sample_files[0]' '$sample_files[1]' > '$merged_file'";
+        eval {
+            run_cmd($merge_cmd);
+        };
+        
+        if ($@ || !-s $merged_file) {
+            $logger->warn("Failed to merge samples, using first sample: $sample_files[0]");
+            return $sample_files[0];
+        } else {
+            my $merged_size = -s $merged_file;
+            $logger->info("Successfully merged 2 samples for Refiner: " . sprintf("%.1f MB", $merged_size/1e6));
+            return $merged_file;
+        }
+    } elsif (@sample_files == 1) {
+        # Single sample found
+        $logger->info("Using single masked sample for Refiner: $sample_files[0]");
+        return $sample_files[0];
     }
     
     # Check for full genome masked (small genome case)

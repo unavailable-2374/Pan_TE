@@ -461,12 +461,10 @@ def run_repeatmasker_single(seed_seq: Dict, genome_file: str, config: PipelineCo
                 cmd.append('-no_is')
             if params.get('nolow'):
                 cmd.append('-nolow')
-            if params.get('div'):
-                cmd.extend(['-div', str(params['div'])])
             if params.get('cutoff'):
                 cmd.extend(['-cutoff', str(params['cutoff'])])
         else:
-            cmd.extend(['-nolow', '-no_is', '-norna', '-div', '25'])
+            cmd.extend(['-nolow', '-no_is', '-norna'])
         
         cmd.append(temp_genome.name)
         
@@ -532,7 +530,6 @@ def run_repeatmasker_batch(sequences: List[Dict], genome_file: str, config: Pipe
             '-lib', temp_lib.name,
             '-pa', str(config.threads),
             '-nolow', '-no_is', '-norna',
-            '-div', '25',
             genome_file
         ]
         

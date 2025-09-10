@@ -123,7 +123,7 @@ class PanTEPipeline:
         
         # Calculate chunk count for dynamic thread allocation
         self.chunk_count = self.calculate_chunk_count()
-        self.ltr_threads = max(1, threads - self.chunk_count)
+        self.ltr_threads = max(1, threads - (self.chunk_count * 3))  # Each RS chunk uses 3 threads
         self.rs_threads = max(1, threads)
         
         logger.info(f"Thread allocation: Total={threads}, Chunks={self.chunk_count}, LTR={self.ltr_threads}, RS={self.rs_threads}")
@@ -361,8 +361,6 @@ class PanTEPipeline:
             
         logger.info("Starting RECON processing")
         recon_dir = os.path.join(self.output_dir, 'RECON')
-        
-        self.run_cmd(f"cat ../RepeatScout/consensi.fa ../Inpactor2/consensi.fa > raw.fa", recon_dir)
         
         # Always use Refiner-generated masked genome (simplifies workflow)  
         masked_genome = os.path.join(self.output_dir, 'RepeatScout', 'refiner_output', 'genome_final_masked.fa')

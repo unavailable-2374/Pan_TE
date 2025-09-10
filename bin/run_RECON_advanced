@@ -7,6 +7,7 @@ use File::Basename qw(dirname basename);
 use Cwd qw(getcwd abs_path);
 use Parallel::ForkManager;
 use POSIX qw(ceil);
+use List::Util qw(min max sum);  # Import min/max functions from List::Util
 use constant {
     MIN_THREADS => 1,
     DEFAULT_EVALUE => '1e-5',
@@ -17,10 +18,6 @@ use constant {
     INITIAL_SAMPLE => 30,      # Initial 30Mb sampling
     SAMPLE_MULTIPLIER => 3,    # X3 increment for each round
 };
-
-# Utility functions
-sub min { return $_[0] < $_[1] ? $_[0] : $_[1]; }
-sub max { return $_[0] > $_[1] ? $_[0] : $_[1]; }
 
 die "Usage: $0 round_num threads genome_file genome_size\n"
     unless @ARGV == 4;
@@ -59,27 +56,44 @@ if ($use_full_genome) {
     print "Using Refiner masked genome: $masked_genome\n";
     run_full_genome_track($masked_genome, $threads, $cpu_threads);
 } else {
-    print "\n=== Running dual-track RECON with sampling ===\n";
+    print "\n=== Running sequential dual-track RECON ===\n";
     print "Masked genome: $masked_genome\n";
+    print "Original genome: $abs_genome_file\n";
     print "BED files to exclude: " . join(", ", @bed_files) . "\n";
     
-    # Track 1: Process masked genome
+    # Track 1: Process masked genome first
     print "\n--- Track 1: Processing masked genome ---\n";
     my $masked_track_dir = "masked_track";
     make_path($masked_track_dir) unless -d $masked_track_dir;
     
     my $masked_msp = run_masked_track($masked_genome, $masked_track_dir, $threads, $cpu_threads);
     
-    # Track 2: Multi-round sampling on full genome
-    print "\n--- Track 2: Multi-round sampling on full genome ---\n";
+    # Collect all MSP files for progressive masking
+    my @all_msp_files;
+    push @all_msp_files, $masked_msp if $masked_msp && -s $masked_msp;
+    
+    # Track 2: Multi-round sampling with progressive masking
+    print "\n--- Track 2: Multi-round sampling with progressive masking ---\n";
     my $sampling_track_dir = "sampling_track";
     make_path($sampling_track_dir) unless -d $sampling_track_dir;
     
-    my $sampling_msp = run_sampling_track($abs_genome_file, \@bed_files, $sampling_track_dir, $threads, $cpu_threads);
+    my $sampling_msp;
+    eval {
+        # Pass masked_msp result for progressive masking
+        $sampling_msp = run_sampling_track_progressive($abs_genome_file, \@bed_files, 
+                                                      $masked_msp, $sampling_track_dir, 
+                                                      $threads, $cpu_threads);
+    };
+    if ($@) {
+        print "Warning: Sampling track failed with error: $@\n";
+        print "Continuing with masked track only...\n";
+        $sampling_msp = undef;
+    }
     
-    # Merge results from both tracks
-    print "\n--- Merging dual-track results ---\n";
-    merge_dual_track_results($masked_msp, $sampling_msp, $masked_genome, $threads);
+    # Merge all results
+    print "\n--- Merging all track results ---\n";
+    push @all_msp_files, $sampling_msp if $sampling_msp && -s $sampling_msp;
+    merge_all_track_results(\@all_msp_files, $masked_genome, $threads);
 }
 
 # Build final output
@@ -104,7 +118,17 @@ exit 0;
 sub find_input_files {
     my ($original_genome) = @_;
     
-    my $base_dir = dirname(dirname($original_genome));
+    # Determine base_dir based on the genome path
+    # If the genome is already in refiner_output, adjust the base_dir accordingly
+    my $base_dir;
+    if ($original_genome =~ m{/RepeatScout/refiner_output/}) {
+        # Genome is already the masked genome from Refiner
+        $base_dir = $original_genome;
+        $base_dir =~ s{/RepeatScout/refiner_output/.*$}{};
+    } else {
+        # Original logic for regular genome files
+        $base_dir = dirname(dirname($original_genome));
+    }
     
     # Get Refiner masked genome (guaranteed to exist from RepeatScout phase)
     my @possible_masked = (
@@ -125,14 +149,29 @@ sub find_input_files {
     
     # Check for BED files to determine processing mode
     my $repeatscout_dir = "$base_dir/RepeatScout";
-    my @bed_files = glob("$repeatscout_dir/*.bed $repeatscout_dir/tmp/*.bed");
+    my @bed_files = glob("$repeatscout_dir/tmp/*.bed $repeatscout_dir/refiner_output/*.bed");
+    
+    # Filter to include sampling bed files from RepeatScout
+    @bed_files = grep { 
+        $_ =~ /sample_\d+\.bed(\.validated)?$/ ||  # Sample regions (validated or not)
+        $_ =~ /progressive_mask\.bed$/ ||         # Progressive masking regions
+        $_ =~ /sampling_regions\.bed$/ ||         # General sampling regions
+        $_ =~ /temp_merged_mask_\d+\.bed$/        # Temporary merged masks
+    } @bed_files;
+    
+    print "Found sampling BED files from RepeatScout: " . scalar(@bed_files) . "\n";
+    for my $bed_file (@bed_files) {
+        print "  - $bed_file\n";
+    }
     
     # Decision logic: BED files determine the processing mode
     if (!@bed_files) {
         # No BED files: use full masked genome mode
+        print "No sampling BED files found, using full masked genome mode\n";
         return ($masked_genome, [], 1);  # Use full genome mode
     } else {
         # BED files found: use dual-track mode
+        print "Using dual-track mode with " . scalar(@bed_files) . " exclusion BED files\n";
         return ($masked_genome, \@bed_files, 0);  # Use dual-track mode
     }
 }
@@ -140,38 +179,51 @@ sub find_input_files {
 sub run_full_genome_track {
     my ($masked_genome, $threads, $cpu_threads) = @_;
     
-    # Extract unmasked regions
-    print "Extracting unmasked regions from masked genome...\n";
-    my $unmasked_file = extract_unmasked_regions($masked_genome);
+    print "Processing full masked genome track (using entire phase4 result directly)...\n";
     
-    if (!-s $unmasked_file || -s $unmasked_file < 1000) {
-        die "ERROR: No significant unmasked regions found in $masked_genome\n";
+    # Use the entire masked genome directly
+    my $genome_file = "masked_genome.fa";
+    run_cmd("ln -sf $masked_genome $genome_file");
+    
+    if (!-s $genome_file) {
+        die "ERROR: Masked genome file is empty or missing: $masked_genome\n";
     }
     
-    # Split into chunks for parallel processing
-    print "Splitting unmasked regions into chunks...\n";
-    my $chunks_dir = "unmasked_chunks";
-    my @chunk_files = split_unmasked_into_chunks($unmasked_file, $chunks_dir);
-    print "Created " . scalar(@chunk_files) . " unmasked region chunks\n";
+    # Create BLAST database from the entire masked genome
+    if (!-f "genome_db.nhr") {
+        print "Creating BLAST database from entire masked genome...\n";
+        run_cmd("makeblastdb -in $genome_file -dbtype nucl -parse_seqids -out genome_db");
+    } else {
+        print "BLAST database already exists, skipping creation...\n";
+    }
     
-    # Create BLAST database
-    print "Creating BLAST database from unmasked regions...\n";
-    create_blast_database_from_unmasked($unmasked_file);
+    # Run self-alignment with rmblastn on the entire masked genome
+    my $blast_output = "masked_self_alignment.blast";
+    my $blast_checkpoint = "rmblastn.ok";
     
-    # Run parallel rmblastn
-    print "Running parallel rmblastn (using $threads threads)...\n";
-    my @blast_outputs = run_parallel_rmblastn(\@chunk_files, $threads, $cpu_threads, 0);
+    if (!-f $blast_checkpoint || !-f $blast_output) {
+        print "Running rmblastn self-alignment on entire masked genome...\n";
+        run_rmblastn_self_alignment($genome_file, $blast_output, $threads, "genome_db");
+        # Create checkpoint after successful BLAST
+        open(my $fh, '>', $blast_checkpoint) or die "Cannot create $blast_checkpoint: $!\n";
+        print $fh "rmblastn completed at " . localtime() . "\n";
+        close($fh);
+    } else {
+        print "rmblastn already completed (checkpoint found), skipping...\n";
+    }
     
-    # Convert to MSP and merge
-    print "Converting BLAST outputs to MSP format and merging...\n";
-    my $merged_msp = merge_blast_to_msp(\@blast_outputs);
+    # The blast output is already in MSP format, use it directly for RECON
+    if (!-f "msp.out") {
+        print "Setting up MSP file for RECON...\n";
+        run_cmd("ln -sf $blast_output msp.out");
+    }
     
     # Determine K parameter based on MSP size
-    my $k_param = determine_k_parameter($merged_msp);
+    my $k_param = determine_k_parameter("msp.out");
     
     # Run RECON pipeline
     print "Running RECON pipeline with K=$k_param...\n";
-    run_recon_pipeline_with_k($merged_msp, $masked_genome, $threads, $k_param);
+    run_recon_pipeline_with_k("msp.out", $masked_genome, $threads, $k_param);
 }
 
 sub run_masked_track {
@@ -180,33 +232,302 @@ sub run_masked_track {
     my $current_dir = getcwd();
     chdir $output_dir or die "Cannot change to $output_dir: $!\n";
     
-    print "Processing masked genome track...\n";
+    # Check if masked track already completed
+    my $checkpoint_file = "masked_track.ok";
+    my $msp_file = "masked_track.msp";
     
-    # Extract unmasked regions
-    my $unmasked_file = extract_unmasked_regions($masked_genome);
+    if (-f $checkpoint_file && -f $msp_file) {
+        print "Masked track already completed (checkpoint found), skipping...\n";
+        my $abs_msp = abs_path($msp_file);
+        chdir $current_dir;
+        return $abs_msp;
+    }
     
-    if (!-s $unmasked_file || -s $unmasked_file < 1000) {
-        print "Warning: No significant unmasked regions in masked track\n";
+    # Extract unmasked regions from the masked genome with 30bp gap filtering
+    my $genome_file = "unmasked_regions.fa";
+    if (!-f $genome_file) {
+        print "Processing masked genome track (extracting unmasked regions)...\n";
+        extract_unmasked_regions($masked_genome, $genome_file, 30);
+        
+        if (!-s $genome_file) {
+            print "Warning: Unmasked regions extraction failed or produced empty file\n";
+            chdir $current_dir;
+            return undef;
+        }
+    } else {
+        print "Unmasked regions file already exists, skipping extraction...\n";
+    }
+    
+    # Create BLAST database from the unmasked regions
+    if (!-f "genome_db.nhr") {
+        print "Creating BLAST database from unmasked regions...\n";
+        run_cmd("makeblastdb -in $genome_file -dbtype nucl -parse_seqids -out genome_db");
+    } else {
+        print "BLAST database already exists, skipping creation...\n";
+    }
+    
+    # Run self-alignment with rmblastn on the entire masked genome
+    my $blast_output = "masked_self_alignment.blast";
+    my $blast_checkpoint = "rmblastn.ok";
+    
+    if (!-f $blast_checkpoint || !-f $blast_output) {
+        print "Running rmblastn self-alignment on entire masked genome...\n";
+        run_rmblastn_self_alignment($genome_file, $blast_output, $threads, "genome_db");
+        # Create checkpoint after successful BLAST
+        open(my $fh, '>', $blast_checkpoint) or die "Cannot create $blast_checkpoint: $!\n";
+        print $fh "rmblastn completed at " . localtime() . "\n";
+        close($fh);
+    } else {
+        print "rmblastn already completed (checkpoint found), skipping...\n";
+    }
+    
+    # Convert BLAST output to MSP format with self-hit filtering
+    if (!-f $msp_file) {
+        print "Converting BLAST output to MSP format with self-hit filtering...\n";
+        my $msp_temp = "masked_self_alignment_temp.msp";
+        
+        # First convert to MSP
+        run_cmd("MSPCollect.pl $blast_output > $msp_temp");
+        
+        # Filter out self-hits
+        if (-f $msp_temp && -s $msp_temp) {
+            print "MSP temp file size: " . (-s $msp_temp) . " bytes\n";
+            filter_self_hits($msp_temp, $msp_file);
+            
+            # Check if filtering removed all content
+            if (-s $msp_file) {
+                print "Filtered MSP file size: " . (-s $msp_file) . " bytes\n";
+                unlink $msp_temp;
+            } else {
+                print "Warning: Self-hit filtering removed all content, using unfiltered MSP\n";
+                run_cmd("mv $msp_temp $msp_file");
+            }
+        } else {
+            # Fallback - just copy if MSPCollect failed or produced empty file
+            print "Warning: MSPCollect.pl failed or produced empty output, using BLAST output directly\n";
+            run_cmd("cp $blast_output $msp_file");
+        }
+    }
+    
+    # Check if we have valid MSP data to proceed with RECON
+    if (!-s $msp_file) {
+        print "Warning: No valid MSP data generated. Skipping RECON for masked track.\n";
         chdir $current_dir;
         return undef;
     }
     
-    # Create BLAST database
-    create_blast_database_from_unmasked($unmasked_file);
+    # Run RECON on masked track MSP
+    print "Running RECON on masked track MSP...\n";
     
-    # Run self-alignment with rmblastn (outfmt 0 for RECON compatibility)
-    print "Running rmblastn self-alignment...\n";
-    my $blast_output = "masked_self_alignment.blast";
-    run_rmblastn_self_alignment($unmasked_file, $blast_output, $threads);
+    # Create symlink for RECON
+    run_cmd("ln -sf $msp_file msp.out");
     
-    # Convert to MSP format
-    my $msp_file = "masked_track.msp";
-    run_cmd("MSPCollect.pl $blast_output > $msp_file");
+    # Determine K parameter
+    my $k_param = determine_k_parameter("msp.out");
+    
+    # Create seq_name.list
+    create_seq_name_list($genome_file);
+    
+    # Run RECON pipeline
+    eval {
+        run_recon_pipeline($k_param);
+    };
+    if ($@) {
+        print "ERROR: RECON failed on masked track: $@\n";
+        chdir $current_dir;
+        die "Masked track RECON failure. Cannot proceed.\n";
+    } else {
+        print "Masked track RECON completed successfully.\n";
+        
+        # Build consensi if families found
+        if (-d "summary" && -s "summary/families") {
+            print "Building consensi for masked track...\n";
+            run_cmd("build_for_RECON ./ $masked_genome $cpu_threads");
+        }
+    }
+    
+    # Create masked track completion checkpoint
+    open(my $fh, '>', $checkpoint_file) or die "Cannot create $checkpoint_file: $!\n";
+    print $fh "Masked track completed at " . localtime() . "\n";
+    print $fh "MSP file: $msp_file\n";
+    print $fh "K parameter: $k_param\n" if defined $k_param;
+    close($fh);
     
     my $abs_msp = abs_path($msp_file);
     chdir $current_dir;
     
     return $abs_msp;
+}
+
+sub run_sampling_track_progressive {
+    my ($genome_file, $bed_files_ref, $masked_msp, $output_dir, $threads, $cpu_threads) = @_;
+    my @bed_files = @$bed_files_ref;
+    
+    my $current_dir = getcwd();
+    chdir $output_dir or die "Cannot change to $output_dir: $!\n";
+    
+    # Initialize progressive masking list with masked_track results
+    my @progressive_msp_files;
+    push @progressive_msp_files, $masked_msp if $masked_msp && -s $masked_msp;
+    
+    # Convert MSP to consensi for masking if available
+    my $initial_consensi;
+    if ($masked_msp && -s $masked_msp) {
+        print "Converting masked_track MSP to consensi for progressive masking...\n";
+        $initial_consensi = "masked_track_consensi.fa";
+        # Extract unique sequences from MSP and build consensi
+        convert_msp_to_consensi($masked_msp, $initial_consensi, $genome_file);
+    }
+    
+    # Merge all bed files to create initial exclusion mask
+    my $exclusion_mask = "initial_exclusion_mask.bed";
+    if (@bed_files) {
+        print "Creating initial exclusion mask from " . scalar(@bed_files) . " BED files...\n";
+        for my $bed_file (@bed_files) {
+            my $count = `wc -l < '$bed_file'`;
+            chomp $count;
+            print "  - $bed_file: $count regions\n";
+        }
+        my $bed_list = join(" ", @bed_files);
+        run_cmd("cat $bed_list | bedtools sort | bedtools merge > $exclusion_mask");
+        
+        # Show merged result
+        my $merged_count = `wc -l < '$exclusion_mask'`;
+        chomp $merged_count;
+        print "  - Merged exclusion mask: $merged_count regions\n";
+    } else {
+        open(my $fh, '>', $exclusion_mask) or die "Cannot create $exclusion_mask: $!\n";
+        close($fh);
+        print "No BED files found, created empty exclusion mask\n";
+    }
+    
+    # Multi-round sampling with progressive masking
+    my @round_msps;
+    my @round_consensi;
+    my $round = 1;
+    my $sample_size_mb = INITIAL_SAMPLE;  # Start with 30Mb
+    my $previous_families = 0;
+    my $continue_sampling = 1;
+    my $accumulated_mask = $exclusion_mask;
+    
+    # Create cumulative consensi file for progressive masking
+    my $cumulative_consensi = "cumulative_consensi.fa";
+    if ($initial_consensi && -s $initial_consensi) {
+        run_cmd("cp $initial_consensi $cumulative_consensi");
+    }
+    
+    while ($continue_sampling && $round <= 5) {  # Max 5 rounds for safety
+        print "\n=== Progressive Sampling Round $round (${sample_size_mb}Mb) ===\n";
+        
+        my $round_dir = "round_$round";
+        make_path($round_dir) unless -d $round_dir;
+        
+        # Check available genome space
+        my $available_size = calculate_available_size($genome_file, $accumulated_mask);
+        my $required_size = $sample_size_mb * 1000000;
+        
+        if ($available_size < $required_size * 2) {
+            print "Available genome space (${available_size} bp) less than 2X required (${required_size} bp)\n";
+            print "Insufficient genome space for next round. Stopping sampling.\n";
+            last;
+        }
+        
+        # Sample genome (prefer unsampled regions)
+        my $sample_file = "$round_dir/sample.fa";
+        perform_adaptive_sampling($genome_file, $exclusion_mask, $accumulated_mask, $sample_file, $sample_size_mb, FRAGMENT_SIZE);
+        
+        # Progressive masking: TRF + cumulative consensi from all previous rounds
+        my $masked_sample = "$round_dir/sample_trf_masked.fa";
+        run_trf_masking($sample_file, $masked_sample);
+        
+        # Apply cumulative masking with all previous consensi
+        if (-s $cumulative_consensi) {
+            print "Applying progressive masking with cumulative consensi...\n";
+            my $progressive_masked = "$round_dir/sample_progressive_masked.fa";
+            run_repeatmasker($masked_sample, $cumulative_consensi, $progressive_masked, $cpu_threads);
+            $masked_sample = $progressive_masked if -s $progressive_masked;
+        }
+        
+        # Run BLAST self-alignment
+        print "Running BLAST self-alignment for round $round...\n";
+        my $blast_output = "$round_dir/self_alignment.blast";
+        create_blast_database($masked_sample, "$round_dir/sample_db");
+        run_rmblastn_self_alignment($masked_sample, $blast_output, $threads, "$round_dir/sample_db");
+        
+        # Convert to MSP
+        my $round_msp = "$round_dir/round.msp";
+        run_cmd("MSPCollect.pl $blast_output > $round_msp");
+        
+        # Check if we found anything new
+        if (!-s $round_msp) {
+            print "No new repeats found in round $round. Stopping sampling.\n";
+            last;
+        }
+        
+        # Determine K parameter
+        my $k_param = determine_k_parameter($round_msp);
+        
+        # Run RECON
+        print "Running RECON with K=$k_param for round $round...\n";
+        chdir $round_dir;
+        create_seq_name_list($masked_sample);
+        run_cmd("cp round.msp msp.out");
+        run_recon_pipeline($k_param);
+        
+        # Build consensi for this round
+        my $round_consensi_file = "consensi.fa";
+        if (-d "summary" && -s "summary/families") {
+            my $main_output_dir = File::Spec->rel2abs("../../../..");
+            my $genome_path = File::Spec->catfile($main_output_dir, "genome", "genome.fa");
+            run_cmd("build_for_RECON ./ $genome_path $cpu_threads");
+        }
+        
+        chdir "..";
+        
+        # Add this round's consensi to cumulative file
+        if (-s "$round_dir/$round_consensi_file") {
+            print "Adding round $round consensi to cumulative library...\n";
+            run_cmd("cat $round_dir/$round_consensi_file >> $cumulative_consensi");
+            push @round_consensi, "$round_dir/$round_consensi_file";
+        }
+        
+        # Analyze results to decide continuation
+        my ($family_count, $should_continue) = analyze_round_results(
+            "$round_dir/summary/families", 
+            $previous_families
+        );
+        
+        if (!$should_continue) {
+            print "Convergence detected (minimal new families). Stopping sampling.\n";
+            $continue_sampling = 0;
+        } else {
+            $previous_families = $family_count;
+            push @round_msps, abs_path("$round_dir/round.msp") if -s "$round_dir/round.msp";
+            
+            # Update accumulated mask with sampled regions
+            my $round_bed = "$round_dir/sampled_regions.bed";
+            if (-f $round_bed) {
+                my $new_mask = "accumulated_mask_round_$round.bed";
+                run_cmd("cat $accumulated_mask $round_bed | bedtools sort | bedtools merge > $new_mask");
+                $accumulated_mask = $new_mask;
+            }
+            
+            # Increase sample size for next round
+            $sample_size_mb *= SAMPLE_MULTIPLIER;
+            $round++;
+        }
+    }
+    
+    # Merge all round MSPs
+    my $final_msp;
+    if (@round_msps) {
+        $final_msp = "sampling_track_final.msp";
+        print "Merging " . scalar(@round_msps) . " round MSP files...\n";
+        merge_msp_files(\@round_msps, $final_msp);
+    }
+    
+    chdir $current_dir;
+    return $final_msp ? abs_path("$output_dir/$final_msp") : undef;
 }
 
 sub run_sampling_track {
@@ -285,7 +606,9 @@ sub run_sampling_track {
         print "Running RECON with K=$k_param for round $round...\n";
         chdir $round_dir;
         create_seq_name_list($sample_file);
-        run_cmd("recon.pl seq_name.list round.msp $k_param");
+        # Copy MSP file to standard name for RECON pipeline
+        run_cmd("cp round.msp msp.out");
+        run_recon_pipeline($k_param);
         
         # Build consensi for this round
         if (-d "summary" && -s "summary/families") {
@@ -322,6 +645,15 @@ sub run_sampling_track {
         }
         
         push @round_msps, abs_path($round_msp);
+        
+        # Create round completion checkpoint
+        my $completion_checkpoint = "$round_dir/round_complete.ok";
+        open(my $fh, '>', $completion_checkpoint) or die "Cannot create $completion_checkpoint: $!\n";
+        print $fh "Round $round completed at " . localtime() . "\n";
+        print $fh "New families: $metrics->{new_families}\n";
+        print $fh "Total families: $metrics->{total_families}\n";
+        close($fh);
+        
         $round++;
     }
     
@@ -367,14 +699,36 @@ sub run_recon_pipeline_with_k {
     # Create sequence name list from genome
     create_seq_name_list($genome_file);
     
-    # Run RECON with specified K parameter
-    run_cmd("recon.pl seq_name.list $msp_file $k_param");
+    # Run RECON pipeline manually with specified K parameter
+    run_recon_pipeline($k_param);
 }
 
 sub run_rmblastn_self_alignment {
     my ($query_file, $output_file, $threads, $db_name) = @_;
     
     $db_name ||= "genome_db";
+    
+    # Check file size to decide if parallel processing is needed
+    my $file_size = -s $query_file;
+    my $size_mb = $file_size / (1024 * 1024);
+    
+    if ($size_mb <= 1 || $threads < 4) {
+        # Small file or few threads - run directly
+        print "Running single rmblastn (file size: " . sprintf("%.1f", $size_mb) . " MB)...\n";
+        run_single_rmblastn($query_file, $output_file, $threads, $db_name);
+    } else {
+        # Large file - use parallel processing
+        # Use threads/2 for parallel jobs
+        my $num_parallel = int($threads / 2);
+        $num_parallel = 2 if $num_parallel < 2;
+        
+        print "Running parallel rmblastn (file size: " . sprintf("%.1f", $size_mb) . " MB, $num_parallel parallel jobs)...\n";
+        run_parallel_rmblastn_with_msp($query_file, $output_file, $threads, $num_parallel, $db_name);
+    }
+}
+
+sub run_single_rmblastn {
+    my ($query_file, $output_file, $threads, $db_name) = @_;
     
     # Run rmblastn with outfmt 0 for RECON MSPCollect.pl compatibility
     my $cmd = "rmblastn " .
@@ -391,18 +745,222 @@ sub run_rmblastn_self_alignment {
               "-reward 2 " .
               "-dust yes " .
               "-soft_masking true " .
-              "-xdrop_ungap 20 " .
-              "-xdrop_gap 30 " .
-              "-xdrop_gap_final 100 " .
               "-no_greedy";
     
     run_cmd($cmd);
 }
 
+sub run_parallel_rmblastn_with_msp {
+    my ($query_file, $output_file, $total_threads, $num_parallel, $db_name) = @_;
+    
+    # Create temp directory for chunks
+    my $chunk_dir = "blast_chunks_$$";
+    make_path($chunk_dir) unless -d $chunk_dir;
+    
+    # Split query file into 1MB chunks
+    my @chunk_files = split_fasta_by_size($query_file, $chunk_dir, 1024 * 1024);  # 1MB chunks
+    
+    if (@chunk_files == 0) {
+        die "Failed to split query file for parallel processing\n";
+    }
+    
+    print "Split query into " . scalar(@chunk_files) . " chunks (1MB each)\n";
+    
+    # Calculate threads per job
+    my $threads_per_job = int($total_threads / $num_parallel);
+    $threads_per_job = 2 if $threads_per_job < 2;
+    
+    print "Running up to $num_parallel parallel jobs, $threads_per_job threads each\n";
+    
+    # Use Parallel::ForkManager for better job management
+    use Parallel::ForkManager;
+    my $pm = Parallel::ForkManager->new($num_parallel);
+    
+    my @msp_files;
+    my $completed = 0;
+    
+    # Setup completion handler
+    $pm->run_on_finish(sub {
+        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_ref) = @_;
+        if ($exit_code == 0 && $data_ref) {
+            my $msp_file = $$data_ref;
+            push @msp_files, $msp_file if -f $msp_file;
+            $completed++;
+            print "Completed $completed/" . scalar(@chunk_files) . " chunks\n";
+        }
+    });
+    
+    # Process all chunks - ForkManager will manage the parallelism
+    for (my $i = 0; $i < @chunk_files; $i++) {
+        my $chunk_file = $chunk_files[$i];
+        my $chunk_num = $i;
+        
+        # This will block if we've reached max processes
+        my $pid = $pm->start;
+        if ($pid) {
+            # Parent - continue to next iteration
+            next;
+        }
+        
+        # Child process
+        local $| = 1;  # Autoflush
+        print "Starting chunk " . ($chunk_num + 1) . " of " . scalar(@chunk_files) . "\n";
+        
+        # Run BLAST
+        my $blast_output = "$chunk_dir/blast_chunk_$chunk_num.out";
+        run_single_rmblastn($chunk_file, $blast_output, $threads_per_job, $db_name);
+        
+        # Convert to MSP immediately with self-hit filtering
+        my $msp_output = "$chunk_dir/msp_chunk_$chunk_num.msp";
+        my $msp_temp = "$chunk_dir/msp_chunk_$chunk_num.tmp";
+        
+        # First convert to MSP
+        system("MSPCollect.pl $blast_output > $msp_temp 2>/dev/null");
+        
+        # Filter out self-hits (where query and subject are identical)
+        if (-f $msp_temp) {
+            filter_self_hits($msp_temp, $msp_output);
+            unlink $msp_temp;
+        }
+        
+        # Delete BLAST output to save space
+        unlink $blast_output;
+        
+        # Return MSP file path to parent
+        $pm->finish(0, \$msp_output);
+    }
+    
+    # Wait for all children to complete
+    $pm->wait_all_children;
+    
+    print "All chunks processed, merging " . scalar(@msp_files) . " MSP files...\n";
+    
+    # Sort MSP files by chunk number for consistent ordering
+    @msp_files = sort {
+        my ($a_num) = $a =~ /chunk_(\d+)\.msp/;
+        my ($b_num) = $b =~ /chunk_(\d+)\.msp/;
+        $a_num <=> $b_num;
+    } @msp_files;
+    
+    # Merge all MSP files
+    merge_msp_files(\@msp_files, $output_file);
+    
+    # Clean up
+    remove_tree($chunk_dir);
+    
+    print "Parallel rmblastn with MSP conversion completed\n";
+}
+
+sub filter_self_hits {
+    my ($input_msp, $output_msp) = @_;
+    
+    open(my $in, '<', $input_msp) or return;
+    open(my $out, '>', $output_msp) or return;
+    
+    while (my $line = <$in>) {
+        # MSP format: score identity q_start q_end query s_start s_end subject
+        if ($line =~ /^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\S+)/) {
+            my ($score, $iden, $q_start, $q_end, $query, $s_start, $s_end, $subject) = 
+               ($1, $2, $3, $4, $5, $6, $7, $8);
+            
+            # Skip if this is a self-hit (same sequence, same position)
+            if ($query eq $subject && $q_start == $s_start && $q_end == $s_end) {
+                next;  # Skip trivial self-alignment
+            }
+            
+            # Also skip if the alignment is >95% overlapping with itself
+            if ($query eq $subject) {
+                my $q_len = abs($q_end - $q_start) + 1;
+                my $s_len = abs($s_end - $s_start) + 1;
+                my $overlap_start = ($q_start > $s_start) ? $q_start : $s_start;
+                my $overlap_end = ($q_end < $s_end) ? $q_end : $s_end;
+                
+                if ($overlap_end >= $overlap_start) {
+                    my $overlap = $overlap_end - $overlap_start + 1;
+                    if ($overlap > 0.95 * $q_len || $overlap > 0.95 * $s_len) {
+                        next;  # Skip near-complete self-overlaps
+                    }
+                }
+            }
+        }
+        
+        print $out $line;
+    }
+    
+    close($in);
+    close($out);
+}
+
+sub split_fasta_by_size {
+    my ($input_file, $output_dir, $max_size) = @_;
+    
+    open(my $in, '<', $input_file) or die "Cannot open $input_file: $!\n";
+    
+    my @chunk_files;
+    my $chunk_num = 0;
+    my $current_size = 0;
+    my $chunk_fh;
+    my $current_chunk_file;
+    my $in_sequence = 0;
+    my $current_seq_header = "";
+    my $current_seq = "";
+    
+    while (my $line = <$in>) {
+        if ($line =~ /^>/) {
+            # Save previous sequence if exists
+            if ($in_sequence && $current_seq_header) {
+                my $seq_size = length($current_seq_header) + length($current_seq);
+                
+                # Check if we need a new chunk
+                if ($chunk_fh && ($current_size + $seq_size) > $max_size) {
+                    # Close current chunk and start new one
+                    close($chunk_fh);
+                    $chunk_fh = undef;
+                    $current_size = 0;
+                }
+                
+                # Open new chunk if needed
+                if (!$chunk_fh) {
+                    $current_chunk_file = "$output_dir/chunk_$chunk_num.fa";
+                    push @chunk_files, $current_chunk_file;
+                    open($chunk_fh, '>', $current_chunk_file) or die "Cannot create $current_chunk_file: $!\n";
+                    $chunk_num++;
+                }
+                
+                # Write sequence to chunk
+                print $chunk_fh $current_seq_header;
+                print $chunk_fh $current_seq;
+                $current_size += $seq_size;
+            }
+            
+            # Start new sequence
+            $current_seq_header = $line;
+            $current_seq = "";
+            $in_sequence = 1;
+        } else {
+            $current_seq .= $line;
+        }
+    }
+    
+    # Write last sequence
+    if ($in_sequence && $current_seq_header && $chunk_fh) {
+        print $chunk_fh $current_seq_header;
+        print $chunk_fh $current_seq;
+    }
+    
+    close($chunk_fh) if $chunk_fh;
+    close($in);
+    
+    return @chunk_files;
+}
+
+
 sub perform_adaptive_sampling {
     my ($genome_file, $exclusion_bed, $accumulated_mask, $output_file, $size_mb, $fragment_size) = @_;
     
     print "Adaptive sampling ${size_mb}Mb from genome (${fragment_size}bp fragments)...\n";
+    print "DEBUG: Exclusion BED file: $exclusion_bed\n";
+    print "DEBUG: Accumulated mask file: $accumulated_mask\n";
     
     # Get genome index
     unless (-s "$genome_file.fai") {
@@ -413,74 +971,107 @@ sub perform_adaptive_sampling {
     my $genome_bed = "genome.bed";
     run_cmd("awk '{print \$1\"\\t0\\t\"\$2}' $genome_file.fai > $genome_bed");
     
+    # Create master exclusion file combining all exclusions
+    my $master_exclusion = "master_exclusion.bed";
+    my @exclude_files = ();
+    push @exclude_files, $exclusion_bed if -s $exclusion_bed;
+    push @exclude_files, $accumulated_mask if -s $accumulated_mask && $accumulated_mask ne $exclusion_bed;
+    
+    if (@exclude_files) {
+        print "DEBUG: Creating master exclusion from files: " . join(", ", @exclude_files) . "\n";
+        my $exclude_list = join(" ", @exclude_files);
+        run_cmd("cat $exclude_list | bedtools sort | bedtools merge > $master_exclusion");
+        
+        # Debug: show exclusion file size
+        my $exclude_count = `wc -l < $master_exclusion`;
+        chomp $exclude_count;
+        print "DEBUG: Master exclusion file has $exclude_count regions\n";
+    } else {
+        # Create empty exclusion file
+        run_cmd("touch $master_exclusion");
+        print "DEBUG: No exclusion files, created empty master exclusion\n";
+    }
+    
+    # Create available regions (genome minus all exclusions)
     my $available_bed = "available_regions.bed";
-    if (-s $exclusion_bed) {
-        run_cmd("bedtools subtract -a $genome_bed -b $exclusion_bed > $available_bed");
+    if (-s $master_exclusion) {
+        run_cmd("bedtools subtract -a $genome_bed -b $master_exclusion > $available_bed");
     } else {
         run_cmd("cp $genome_bed $available_bed");
     }
     
-    # Create unsampled regions (prefer these for sampling)
-    my $unsampled_bed = "unsampled_regions.bed";
-    if (-s $accumulated_mask && $accumulated_mask ne $exclusion_bed) {
-        run_cmd("bedtools subtract -a $available_bed -b $accumulated_mask > $unsampled_bed");
-    } else {
-        run_cmd("cp $available_bed $unsampled_bed");
-    }
-    
     # Calculate sizes
-    my $unsampled_size = calculate_bed_size($unsampled_bed);
-    my $total_available_size = calculate_bed_size($available_bed);
+    my $available_size = calculate_bed_size($available_bed);
     my $target_size = $size_mb * 1000000;
     
-    print "Unsampled regions: " . sprintf("%.1f Mb", $unsampled_size / 1000000) . "\n";
-    print "Total available: " . sprintf("%.1f Mb", $total_available_size / 1000000) . "\n";
+    print "Available genome space: " . sprintf("%.1f Mb", $available_size / 1000000) . "\n";
+    print "Target sampling size: " . sprintf("%.1f Mb", $target_size / 1000000) . "\n";
+    
+    # Check if we have enough available space
+    if ($available_size < $target_size * 0.1) {
+        print "WARNING: Very little available space for sampling!\n";
+        print "Available: " . sprintf("%.1f Mb", $available_size / 1000000) . 
+              ", Requested: " . sprintf("%.1f Mb", $target_size / 1000000) . "\n";
+    }
     
     my $sampled_bed = "sampled_regions.bed";
     my $num_fragments = ceil($target_size / $fragment_size);
     
-    if ($unsampled_size >= $target_size) {
-        # Sufficient unsampled regions - sample only from these
-        print "Sampling from unsampled regions only\n";
-        run_cmd("bedtools random -l $fragment_size -n $num_fragments -seed 42 -g $genome_file.fai | " .
-                "bedtools intersect -a - -b $unsampled_bed -wa | " .
-                "head -n $num_fragments > $sampled_bed");
-    } else {
-        # Need to resample some regions
-        my $unsampled_fragments = ceil($unsampled_size / $fragment_size);
-        my $resampling_fragments = $num_fragments - $unsampled_fragments;
-        
-        print "Need resampling: $unsampled_fragments from unsampled, $resampling_fragments from previously sampled\n";
-        
-        # Sample all unsampled regions
-        my $unsampled_sample = "unsampled_sample.bed";
-        run_cmd("bedtools random -l $fragment_size -n $unsampled_fragments -seed 42 -g $genome_file.fai | " .
-                "bedtools intersect -a - -b $unsampled_bed -wa > $unsampled_sample");
-        
-        # Sample additional regions from previously sampled areas
-        my $resampled_sample = "resampled_sample.bed";
-        if ($resampling_fragments > 0) {
-            run_cmd("bedtools random -l $fragment_size -n $resampling_fragments -seed 43 -g $genome_file.fai | " .
-                    "bedtools intersect -a - -b $available_bed -wa > $resampled_sample");
-            
-            # Combine samples
-            run_cmd("cat $unsampled_sample $resampled_sample > $sampled_bed");
+    # Sample from available regions with proper exclusion
+    print "Generating $num_fragments random fragments of ${fragment_size}bp each\n";
+    run_cmd("bedtools random -l $fragment_size -n " . ($num_fragments * 3) . " -seed 42 -g $genome_file.fai | " .
+            "bedtools intersect -a - -b $available_bed -wa | " .
+            "head -n $num_fragments > $sampled_bed");
+    
+    # Verify no overlaps with exclusions
+    if (-s $master_exclusion && -s $sampled_bed) {
+        my $overlap_check = "overlap_check.bed";
+        run_cmd("bedtools intersect -a $sampled_bed -b $master_exclusion > $overlap_check");
+        my $overlap_count = `wc -l < $overlap_check`;
+        chomp $overlap_count;
+        if ($overlap_count > 0) {
+            print "ERROR: Found $overlap_count overlaps with exclusion regions!\n";
+            print "This indicates a problem with bedtools subtract logic.\n";
+            # Show first few overlaps for debugging
+            run_cmd("head -5 $overlap_check");
         } else {
-            run_cmd("mv $unsampled_sample $sampled_bed");
+            print "DEBUG: Verified no overlaps with exclusion regions\n";
         }
-        
-        # Cleanup
-        unlink $unsampled_sample if -f $unsampled_sample;
-        unlink $resampled_sample if -f $resampled_sample;
+        unlink $overlap_check;
     }
     
-    # Extract sequences
-    run_cmd("bedtools getfasta -fi $genome_file -bed $sampled_bed -fo $output_file");
+    # Get actual sampled regions count
+    my $actual_samples = 0;
+    if (-s $sampled_bed) {
+        $actual_samples = `wc -l < $sampled_bed`;
+        chomp $actual_samples;
+    }
     
-    print "Sampled " . (-s $output_file) . " bytes of sequence\n";
+    print "Successfully sampled $actual_samples regions\n";
     
-    # Cleanup
-    unlink $unsampled_bed if -f $unsampled_bed;
+    if ($actual_samples == 0) {
+        print "WARNING: No regions were sampled! Check available space and exclusions.\n";
+        return;
+    }
+    
+    # Extract sequences from sampled regions
+    print "Extracting sequences from sampled regions...\n";
+    
+    # Extract sequences with bedtools (this will create complex IDs)
+    my $temp_fasta = "$output_file.tmp";
+    run_cmd("bedtools getfasta -fi $genome_file -bed $sampled_bed -fo $temp_fasta");
+    
+    # Rename sequence IDs to simple gi|N format
+    rename_fasta_ids($temp_fasta, $output_file);
+    unlink $temp_fasta;
+    
+    my $output_size = -s $output_file || 0;
+    print "Extracted " . sprintf("%.1f Mb", $output_size / 1000000) . " of sequence data\n";
+    
+    # Cleanup temporary files
+    unlink $genome_bed, $master_exclusion, $available_bed if $ENV{CLEANUP_TEMP};
+    
+    return $output_file;
 }
 
 sub calculate_bed_size {
@@ -497,6 +1088,32 @@ sub calculate_bed_size {
     close($fh);
     
     return $total_size;
+}
+
+sub rename_fasta_ids {
+    my ($input_file, $output_file) = @_;
+    
+    open(my $in, '<', $input_file) or die "Cannot read $input_file: $!\n";
+    open(my $out, '>', $output_file) or die "Cannot write $output_file: $!\n";
+    
+    my $seq_counter = 0;
+    
+    while (my $line = <$in>) {
+        chomp $line;
+        if ($line =~ /^>/) {
+            # Replace any existing ID with simple gi|N format
+            $seq_counter++;
+            print $out ">gi|$seq_counter\n";
+        } else {
+            # Copy sequence lines as-is
+            print $out "$line\n";
+        }
+    }
+    
+    close($in);
+    close($out);
+    
+    print "Renamed $seq_counter sequences to gi|N format\n";
 }
 
 sub perform_sampling {
@@ -545,8 +1162,13 @@ sub perform_sampling {
             "bedtools intersect -a - -b $available_bed -wa | " .
             "head -n $num_fragments > $sampled_bed");
     
-    # Extract sequences
-    run_cmd("bedtools getfasta -fi $genome_file -bed $sampled_bed -fo $output_file");
+    # Extract sequences with bedtools (this will create complex IDs)
+    my $temp_fasta = "$output_file.tmp";
+    run_cmd("bedtools getfasta -fi $genome_file -bed $sampled_bed -fo $temp_fasta");
+    
+    # Rename sequence IDs to simple gi|N format
+    rename_fasta_ids($temp_fasta, $output_file);
+    unlink $temp_fasta;
     
     print "Sampled " . (-s $output_file) . " bytes of sequence\n";
 }
@@ -754,25 +1376,125 @@ sub merge_msp_files {
     close($out_fh);
 }
 
+sub merge_all_track_results {
+    my ($msp_files_ref, $genome_file, $threads) = @_;
+    my @msp_files = @$msp_files_ref;
+    
+    if (@msp_files) {
+        print "Available MSP tracks: " . scalar(@msp_files) . "\n";
+        for my $msp_file (@msp_files) {
+            my $size = -s $msp_file;
+            print "  - $msp_file (size: $size bytes)\n";
+        }
+        
+        if (@msp_files == 1) {
+            # Only one track - use symlink to avoid copying
+            print "Only one MSP track available, using symlink...\n";
+            unlink "msp.out" if -e "msp.out";
+            run_cmd("ln -sf " . File::Spec->abs2rel($msp_files[0]) . " msp.out");
+        } else {
+            # Multiple tracks - need to merge
+            print "Merging " . scalar(@msp_files) . " MSP tracks...\n";
+            merge_msp_files(\@msp_files, "msp.out");
+        }
+        
+        # Determine K parameter
+        my $k_param = determine_k_parameter("msp.out");
+        
+        # Run RECON on merged results
+        print "Running RECON with K=$k_param on merged tracks...\n";
+        create_seq_name_list($genome_file);
+        run_recon_pipeline($k_param);
+        
+        # Create RECON completion checkpoint
+        open(my $recon_fh, '>', "recon_completed.ok") or die "Cannot create recon_completed.ok: $!\n";
+        print $recon_fh "RECON pipeline completed at " . localtime() . "\n";
+        print $recon_fh "MSP files used: " . join(", ", @msp_files) . "\n";
+        print $recon_fh "K parameter: $k_param\n";
+        close($recon_fh);
+        
+        print "RECON pipeline completed successfully.\n";
+    } else {
+        print "ERROR: No valid MSP files found from any track!\n";
+        die "Cannot proceed without MSP data.\n";
+    }
+}
+
+sub convert_msp_to_consensi {
+    my ($msp_file, $output_consensi, $genome_file) = @_;
+    
+    print "Converting MSP file to consensi sequences...\n";
+    
+    # Create temporary directory for RECON processing
+    my $temp_dir = "temp_msp_conversion_$$";
+    make_path($temp_dir);
+    
+    my $current_dir = getcwd();
+    chdir $temp_dir;
+    
+    # Copy MSP file
+    run_cmd("cp $msp_file msp.out");
+    
+    # Create seq name list
+    create_seq_name_list($genome_file);
+    
+    # Run minimal RECON to get families
+    my $k_param = determine_k_parameter("msp.out");
+    run_recon_pipeline($k_param);
+    
+    # Build consensi if families found
+    if (-d "summary" && -s "summary/families") {
+        run_cmd("build_for_RECON ./ $genome_file 1");
+        
+        if (-s "consensi.fa") {
+            run_cmd("cp consensi.fa ../$output_consensi");
+            print "Consensi sequences generated successfully\n";
+        }
+    }
+    
+    chdir $current_dir;
+    
+    # Clean up
+    remove_tree($temp_dir);
+}
+
 sub merge_dual_track_results {
     my ($masked_msp, $sampling_msp, $genome_file, $threads) = @_;
     
-    # Merge MSP files
-    my $merged_msp = "dual_track_merged.msp";
     my @msp_files;
     push @msp_files, $masked_msp if $masked_msp && -s $masked_msp;
     push @msp_files, $sampling_msp if $sampling_msp && -s $sampling_msp;
     
     if (@msp_files) {
-        merge_msp_files(\@msp_files, $merged_msp);
+        print "Available MSP tracks: " . scalar(@msp_files) . "\n";
+        for my $msp_file (@msp_files) {
+            my $size = -s $msp_file;
+            print "  - $msp_file (size: $size bytes)\n";
+        }
         
-        # Determine K parameter for merged MSP
-        my $k_param = determine_k_parameter($merged_msp);
+        if (@msp_files == 1) {
+            # Only one track - use symlink to avoid copying
+            print "Only one MSP track available, using symlink...\n";
+            unlink "msp.out" if -e "msp.out";
+            run_cmd("ln -sf " . File::Spec->abs2rel($msp_files[0]) . " msp.out");
+        } else {
+            # Multiple tracks - need to merge
+            print "Merging " . scalar(@msp_files) . " MSP tracks...\n";
+            merge_msp_files(\@msp_files, "msp.out");
+        }
         
-        # Run RECON on merged results
-        print "Running RECON on merged dual-track results with K=$k_param...\n";
+        # Determine K parameter
+        my $k_param = determine_k_parameter("msp.out");
+        
+        # Run RECON on results
+        print "Running RECON with K=$k_param...\n";
         create_seq_name_list($genome_file);
-        run_cmd("recon.pl seq_name.list $merged_msp $k_param");
+        run_recon_pipeline($k_param);
+    } else {
+        print "ERROR: No valid MSP files found from either track!\n";
+        print "Masked track MSP: " . (($masked_msp && -s $masked_msp) ? "$masked_msp (valid)" : "invalid or empty") . "\n";
+        print "Sampling track MSP: " . (($sampling_msp && -s $sampling_msp) ? "$sampling_msp (valid)" : "invalid or empty") . "\n";
+        die "Cannot proceed without MSP data.\n";
     }
 }
 
@@ -783,12 +1505,11 @@ sub create_blast_database {
 }
 
 sub extract_unmasked_regions {
-    my ($masked_genome) = @_;
-    
-    my $unmasked_file = "unmasked_regions.fa";
+    my ($masked_genome, $output_file, $min_gap_size) = @_;
+    $min_gap_size ||= 30;  # Default 30bp gap threshold
     
     open(my $in, '<', $masked_genome) or die "Cannot open $masked_genome: $!\n";
-    open(my $out, '>', $unmasked_file) or die "Cannot write to $unmasked_file: $!\n";
+    open(my $out, '>', $output_file) or die "Cannot write to $output_file: $!\n";
     
     my $current_id = "";
     my $current_seq = "";
@@ -801,7 +1522,7 @@ sub extract_unmasked_regions {
         if ($line =~ /^>(.*)/) {
             # Process previous sequence if exists
             if ($current_id && $current_seq) {
-                process_sequence_for_unmasked($current_id, $current_seq, $out, \$unmasked_count);
+                process_sequence_for_unmasked($current_id, $current_seq, $out, \$unmasked_count, $min_gap_size);
             }
             
             $current_id = (split /\s+/, $1)[0];
@@ -814,26 +1535,29 @@ sub extract_unmasked_regions {
     
     # Process last sequence
     if ($current_id && $current_seq) {
-        process_sequence_for_unmasked($current_id, $current_seq, $out, \$unmasked_count);
+        process_sequence_for_unmasked($current_id, $current_seq, $out, \$unmasked_count, $min_gap_size);
     }
     
     close($in);
     close($out);
     
-    print "Extracted $unmasked_count unmasked regions\n";
+    print "Extracted $unmasked_count unmasked regions (min gap: ${min_gap_size}bp)\n";
     
-    return $unmasked_file;
+    return $output_file;
 }
 
 sub process_sequence_for_unmasked {
-    my ($seq_id, $sequence, $out_fh, $count_ref) = @_;
+    my ($seq_id, $sequence, $out_fh, $count_ref, $min_gap_size) = @_;
+    $min_gap_size ||= 30;
     
     my $seq_length = length($sequence);
+    my @unmasked_regions = ();
     my $position = 0;
     
+    # First pass: identify all unmasked regions
     while ($position < $seq_length) {
-        # Find start of unmasked region
-        while ($position < $seq_length && substr($sequence, $position, 1) =~ /[a-z]/) {
+        # Find start of unmasked region (skip hard-masked bases)
+        while ($position < $seq_length && substr($sequence, $position, 1) =~ /[NnXx]/) {
             $position++;
         }
         
@@ -841,18 +1565,59 @@ sub process_sequence_for_unmasked {
         
         my $start = $position;
         
-        # Find end of unmasked region
-        my $unmasked_seq = "";
-        while ($position < $seq_length && substr($sequence, $position, 1) =~ /[A-Z]/) {
-            $unmasked_seq .= substr($sequence, $position, 1);
+        # Find end of unmasked region (valid nucleotides)
+        while ($position < $seq_length && substr($sequence, $position, 1) =~ /[ATCGatcg]/) {
             $position++;
         }
         
-        # Save unmasked region if significant
+        my $end = $position - 1;
+        my $length = $end - $start + 1;
+        
+        # Save region if significant length (≥100bp)
+        if ($length >= 100) {
+            push @unmasked_regions, { start => $start, end => $end, length => $length };
+        }
+    }
+    
+    # Second pass: merge regions with gaps < min_gap_size
+    my @merged_regions = ();
+    for my $region (@unmasked_regions) {
+        if (@merged_regions == 0) {
+            push @merged_regions, { %$region };  # Create a copy of the region
+        } else {
+            my $last_region = $merged_regions[-1];
+            my $gap_size = $region->{start} - $last_region->{end} - 1;
+            
+            # If gap is smaller than threshold, merge regions
+            if ($gap_size < $min_gap_size) {
+                $last_region->{end} = $region->{end};
+                $last_region->{length} = $last_region->{end} - $last_region->{start} + 1;
+            } else {
+                push @merged_regions, { %$region };  # Create a copy of the region
+            }
+        }
+    }
+    
+    # Output merged regions with simple gi| IDs (extract only unmasked characters)
+    for my $region (@merged_regions) {
+        my $start = $region->{start};
+        my $end = $region->{end};
+        
+        # Extract only unmasked characters in this range (valid nucleotides)
+        my $unmasked_seq = "";
+        for my $pos ($start..$end) {
+            my $char = substr($sequence, $pos, 1);
+            if ($char =~ /[ATCGatcg]/) {
+                $unmasked_seq .= $char;
+            }
+        }
+        
+        # Only output if we have sufficient unmasked sequence
         if (length($unmasked_seq) >= 100) {
-            print $out_fh ">${seq_id}_${start}_${position}\n";
-            print $out_fh "$unmasked_seq\n";
+            # Use simple gi|N format for sequence ID
             $$count_ref++;
+            print $out_fh ">gi|$$count_ref\n";
+            print $out_fh "$unmasked_seq\n";
         }
     }
 }
@@ -969,9 +1734,6 @@ sub run_parallel_rmblastn {
                   "-reward 2 " .
                   "-dust yes " .
                   "-soft_masking true " .
-                  "-xdrop_ungap 20 " .
-                  "-xdrop_gap 30 " .
-                  "-xdrop_gap_final 100 " .
                   "-no_greedy";
         
         system($cmd);
@@ -1031,11 +1793,10 @@ sub merge_blast_to_msp {
 sub create_seq_name_list {
     my ($genome_file) = @_;
     
-    run_cmd("ln -sf $genome_file tmp.fa");
-    run_cmd("grep -c '>' tmp.fa > seq_name.list");
+    print "Creating seq_name.list from $genome_file...\n";
     
-    open(my $in, '<', 'tmp.fa') or die "Cannot open tmp.fa: $!\n";
-    open(my $out, '>>', 'seq_name.list') or die "Cannot open seq_name.list: $!\n";
+    # Read sequence headers
+    open(my $in, '<', $genome_file) or die "Cannot open $genome_file: $!\n";
     
     my @headers;
     while (my $line = <$in>) {
@@ -1044,11 +1805,26 @@ sub create_seq_name_list {
             push @headers, $header;
         }
     }
-    
-    print $out "$_\n" for sort @headers;
-    
     close($in);
+    
+    # Check if we have any sequences
+    if (@headers == 0) {
+        die "ERROR: No sequences found in $genome_file\n";
+    }
+    
+    # Sort headers for consistency
+    @headers = sort @headers;
+    
+    # Write seq_name.list in correct format
+    open(my $out, '>', 'seq_name.list') or die "Cannot create seq_name.list: $!\n";
+    print $out scalar(@headers) . "\n";  # First line: sequence count
+    print $out "$_\n" for @headers;      # Remaining lines: sequence names
     close($out);
+    
+    # Create tmp.fa symlink for RECON
+    run_cmd("ln -sf $genome_file tmp.fa");
+    
+    print "Created seq_name.list with " . scalar(@headers) . " sequences\n";
 }
 
 sub build_final_output {
@@ -1096,6 +1872,207 @@ sub run_cmd {
     system($cmd) == 0 or die "Failed to execute: $cmd\n";
 }
 
+sub run_recon_pipeline {
+    my ($k_param) = @_;
+    
+    print "Starting RECON pipeline with K=$k_param...\n";
+    
+    # Validate input data
+    if (!-f "seq_name.list") {
+        die "ERROR: seq_name.list not found. Cannot proceed with RECON.\n";
+    }
+    
+    if (!-f "msp.out") {
+        die "ERROR: msp.out not found. Cannot proceed with RECON.\n";
+    }
+    
+    # Check if MSP file has content
+    if (!-s "msp.out") {
+        die "ERROR: msp.out is empty. No similarity data available for RECON.\n";
+    }
+    
+    # Check seq_name.list format
+    open(my $fh, '<', "seq_name.list") or die "Cannot read seq_name.list: $!\n";
+    my $first_line = <$fh>;
+    close($fh);
+    
+    if (!$first_line || $first_line !~ /^\d+$/) {
+        die "ERROR: seq_name.list format is invalid. First line should be sequence count.\n";
+    }
+    
+    chomp $first_line;
+    if ($first_line == 0) {
+        die "ERROR: seq_name.list reports 0 sequences. Cannot proceed with RECON.\n";
+    }
+    
+    print "Input validation passed: $first_line sequences, MSP file size: " . (-s "msp.out") . " bytes\n";
+    
+    # Create necessary directories
+    for my $dir ('images', 'summary') {
+        make_path($dir) unless -d $dir;
+    }
+    
+    # Run imagespread with K parameter
+    print "Running imagespread with K=$k_param...\n";
+    eval {
+        run_cmd("imagespread seq_name.list msp.out $k_param > imagespread.log 2>&1");
+    };
+    if ($@) {
+        print "ERROR: imagespread failed. Check imagespread.log for details.\n";
+        if (-f "imagespread.log") {
+            system("tail -20 imagespread.log");
+        }
+        die "RECON pipeline failed at imagespread step.\n";
+    }
+    move_gmon("imagespread");
+    
+    # Check if imagespread produced results
+    if (!-f "images/spread1" || !-s "images/spread1") {
+        print "WARNING: imagespread did not produce results. This may indicate insufficient similarity data.\n";
+        return;  # Exit gracefully instead of crashing
+    }
+    
+    # Sort images
+    run_cmd("sort -k 3,3 -k 4n,4n -k 5nr,5nr images/spread1 > images/images_sorted");
+    unlink glob "images/spread*";
+    
+    # Process element definition
+    process_element_definition();
+    
+    # Process element redefinition
+    process_element_redefinition();
+    
+    # Process edge redefinition
+    process_edge_redefinition();
+    
+    # Run famdef with improved error handling
+    my $famdef_checkpoint = "famdef.ok";
+    
+    if (-f $famdef_checkpoint) {
+        print "famdef already completed (checkpoint found), skipping...\n";
+    } else {
+        print "Running famdef...\n";
+        
+        # Check if seq_name.list still exists and is valid
+        if (!-f "seq_name.list" || !-s "seq_name.list") {
+            die "ERROR: seq_name.list missing or empty before famdef step.\n";
+        }
+        
+        eval {
+            run_cmd("famdef seq_name.list > famdef.log 2>&1");
+        };
+        if ($@) {
+            print "ERROR: famdef failed. Check famdef.log for details.\n";
+            if (-f "famdef.log") {
+                system("tail -20 famdef.log");
+            }
+            die "RECON pipeline failed at famdef step: $@\n";
+        }
+        
+        move_gmon("famdef");
+        
+        # Create checkpoint
+        open(my $fh, '>', $famdef_checkpoint) or die "Cannot create $famdef_checkpoint: $!\n";
+        print $fh "famdef completed at " . localtime() . "\n";
+        close($fh);
+    }
+}
+
+sub process_element_definition {
+    my $checkpoint = "eledef.ok";
+    
+    if (-f $checkpoint && -d 'ele_def_res') {
+        print "Element definition already completed (checkpoint found), skipping...\n";
+        return;
+    }
+    
+    print "Processing element definition...\n";
+    remove_tree('ele_def_res') if -d 'ele_def_res';
+    make_path('ele_def_res');
+    
+    run_cmd("eledef seq_name.list msp.out single > eledef.log 2>&1");
+    move_gmon("eledef");
+    
+    # Create checkpoint
+    open(my $fh, '>', $checkpoint) or die "Cannot create $checkpoint: $!\n";
+    print $fh "eledef completed at " . localtime() . "\n";
+    close($fh);
+}
+
+sub process_element_redefinition {
+    my $checkpoint = "eleredef.ok";
+    
+    if (-f $checkpoint && -d 'ele_redef_res') {
+        print "Element redefinition already completed (checkpoint found), skipping...\n";
+        return;
+    }
+    
+    print "Processing element redefinition...\n";
+    remove_tree('ele_redef_res') if -d 'ele_redef_res';
+    make_path('ele_redef_res');
+    
+    create_symlinks('ele_def_res', 'ele_redef_res');
+    run_cmd("eleredef seq_name.list > eleredef.log 2>&1");
+    move_gmon("eleredef");
+    remove_symlinks();
+    
+    # Create checkpoint
+    open(my $fh, '>', $checkpoint) or die "Cannot create $checkpoint: $!\n";
+    print $fh "eleredef completed at " . localtime() . "\n";
+    close($fh);
+}
+
+sub process_edge_redefinition {
+    my $checkpoint = "edgeredef.ok";
+    
+    if (-f $checkpoint && -d 'edge_redef_res') {
+        print "Edge redefinition already completed (checkpoint found), skipping...\n";
+        # Still need to create final symlinks
+        create_symlinks('edge_redef_res', undef);
+        return;
+    }
+    
+    print "Processing edge redefinition...\n";
+    remove_tree('edge_redef_res') if -d 'edge_redef_res';
+    make_path('edge_redef_res');
+    
+    create_symlinks('ele_redef_res', 'edge_redef_res');
+    run_cmd("edgeredef seq_name.list > edgeredef.log 2>&1");
+    move_gmon("edgeredef");
+    remove_symlinks();
+    
+    # Create final symlinks
+    create_symlinks('edge_redef_res', undef);
+    
+    # Create checkpoint
+    open(my $fh, '>', $checkpoint) or die "Cannot create $checkpoint: $!\n";
+    print $fh "edgeredef completed at " . localtime() . "\n";
+    close($fh);
+}
+
+sub move_gmon {
+    my $prefix = shift;
+    if (-f "gmon.out") {
+        rename("gmon.out", "${prefix}-gmon.out") 
+            or die "Cannot rename gmon.out: $!\n";
+    }
+}
+
+sub create_symlinks {
+    my ($src, $dst) = @_;
+    remove_tree("tmp");
+    remove_tree("tmp2");
+    symlink($src, 'tmp') or die "Cannot create symlink tmp: $!\n";
+    # Always create tmp2 - use src as default if dst is not provided
+    my $tmp2_target = $dst || $src;
+    symlink($tmp2_target, 'tmp2') or die "Cannot create symlink tmp2: $!\n";
+}
+
+sub remove_symlinks {
+    remove_tree("tmp");
+    remove_tree("tmp2");
+}
+
 ################################################################################
 # Advanced RECON Pipeline for TE Discovery with Refiner.py Integration
 # Version: 3.4
@@ -1132,7 +2109,7 @@ use File::Temp qw(tempfile tempdir);
 use Getopt::Long;
 use Pod::Usage;
 use POSIX qw(:sys_wait_h ceil floor);
-use List::Util qw(min max sum);
+# List::Util already imported at the beginning of the script
 use Log::Log4perl qw(:easy);
 use Parallel::ForkManager;
 # Removed unused thread imports - using Parallel::ForkManager throughout

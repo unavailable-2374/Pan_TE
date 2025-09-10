@@ -33,6 +33,7 @@ class PipelineConfig:
     redundancy_threshold_analysis: float = 0.90
     min_copy_number: int = 5  # 固定最低5个拷贝要求
     min_consensus_quality: float = 0.85
+    skip_phase3_redundancy_removal: bool = True  # 跳过Phase 3的CD-HIT去冗余，保留所有Phase 2序列
     
     # 性能参数
     threads: int = 8

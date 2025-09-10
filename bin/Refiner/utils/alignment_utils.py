@@ -37,8 +37,6 @@ def run_repeatmasker_batch_detailed(sequences: List[Dict], genome_file: str,
             cmd.append('-no_is')
         if params.get('nolow'):
             cmd.append('-nolow')
-        if 'div' in params:
-            cmd.extend(['-div', str(params['div'])])
         if 'cutoff' in params:
             cmd.extend(['-cutoff', str(params['cutoff'])])
         if 'pa' in params:
@@ -147,8 +145,6 @@ def run_repeatmasker_batch(sequences: List[Dict], genome_file: str,
             cmd.append('-no_is')
         if params.get('nolow'):
             cmd.append('-nolow')
-        if 'div' in params:
-            cmd.extend(['-div', str(params['div'])])
         if 'cutoff' in params:
             cmd.extend(['-cutoff', str(params['cutoff'])])
         if 'pa' in params:
@@ -209,8 +205,6 @@ def run_repeatmasker_single(sequence: Dict, genome_file: str,
             cmd.append('-no_is')
         if params.get('nolow'):
             cmd.append('-nolow')
-        if 'div' in params:
-            cmd.extend(['-div', str(params['div'])])
         if 'cutoff' in params:
             cmd.extend(['-cutoff', str(params['cutoff'])])
         
@@ -272,10 +266,15 @@ def parse_repeatmasker_output(out_file: str, sequences: List[Dict]) -> Dict[str,
                             identity = 100 - float(fields[1])  # 转换为相似度
                             length = int(fields[6]) - int(fields[5]) + 1
                             
+                            # 处理染色体名称中可能包含的坐标信息
+                            chrom = fields[4]
+                            if ':' in chrom:
+                                chrom = chrom.split(':')[0]
+                            
                             results[repeat_name]['copy_number'] += 1
                             results[repeat_name]['total_length'] += length
                             results[repeat_name]['hits'].append({
-                                'chrom': fields[4],
+                                'chrom': chrom,
                                 'start': int(fields[5]),
                                 'end': int(fields[6]),
                                 'identity': identity,
@@ -310,6 +309,12 @@ def parse_repeatmasker_hits(out_file: str) -> List[Dict]:
                     score = int(fields[0])
                     identity = 100 - float(fields[1])  # 转换为相似度
                     chrom = fields[4]
+                    
+                    # 处理染色体名称中可能包含的坐标信息
+                    # 例如 "lcl|34_8:121301-121525" 应该只提取 "lcl|34_8"
+                    if ':' in chrom:
+                        chrom = chrom.split(':')[0]
+                    
                     start = int(fields[5])
                     end = int(fields[6])
                     

@@ -77,7 +77,7 @@ RC_PID=$!
 log "Starting feature generation and evaluation"
 (
     # Generate feature file
-    if ! conda run -n ClassifyTE_env python "$CLASSIFYTE_DIR/generate_feature_file_parallel.py" -f re.fa -d sup_features -o sup.csv; then
+    if ! conda run -n ClassifyTE_env python "$CLASSIFYTE_DIR/generate_feature_file.py" -f re.fa -d sup_features -o sup.csv; then
         error "Failed to generate feature file"
     fi
 

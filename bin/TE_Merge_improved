@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""
+Improved TE_Merge with biologically-driven dynamic cluster size control
+"""
+
+import os
+import sys
+import logging
+import numpy as np
+from collections import defaultdict
+from Bio import SeqIO
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class BiologicalClusterController:
+    """
+    Biologically-driven dynamic cluster size controller for TE families
+    """
+    
+    def __init__(self, base_max_size=100, diversity_factor=2.0, quality_factor=1.5):
+        self.base_max_size = base_max_size
+        self.diversity_factor = diversity_factor  # Higher diversity allows larger clusters
+        self.quality_factor = quality_factor      # Higher quality allows larger clusters
+        
+    def calculate_cluster_diversity(self, sequences, sample_size=50):
+        """Calculate sequence diversity within cluster using k-mer analysis"""
+        if len(sequences) <= 1:
+            return 0.0
+            
+        # Sample for efficiency
+        if len(sequences) > sample_size:
+            import random
+            sampled = random.sample(sequences, sample_size)
+        else:
+            sampled = sequences
+            
+        # K-mer diversity calculation
+        kmer_size = 8
+        all_kmers = set()
+        seq_kmer_sets = []
+        
+        for seq in sampled:
+            seq_str = str(seq.seq).upper()
+            kmers = set()
+            for i in range(len(seq_str) - kmer_size + 1):
+                kmer = seq_str[i:i+kmer_size]
+                if 'N' not in kmer:
+                    kmers.add(kmer)
+                    all_kmers.add(kmer)
+            seq_kmer_sets.append(kmers)
+            
+        # Calculate average pairwise Jaccard distance
+        distances = []
+        for i in range(len(seq_kmer_sets)):
+            for j in range(i+1, len(seq_kmer_sets)):
+                if seq_kmer_sets[i] and seq_kmer_sets[j]:
+                    intersection = len(seq_kmer_sets[i] & seq_kmer_sets[j])
+                    union = len(seq_kmer_sets[i] | seq_kmer_sets[j])
+                    if union > 0:
+                        distance = 1 - (intersection / union)
+                        distances.append(distance)
+                        
+        return np.mean(distances) if distances else 0.0
+        
+    def calculate_cluster_quality(self, sequences):
+        """Calculate average sequence quality within cluster"""
+        if not sequences:
+            return 0.0
+            
+        qualities = []
+        for seq in sequences:
+            seq_str = str(seq.seq).upper()
+            seq_len = len(seq_str)
+            
+            if seq_len == 0:
+                continue
+                
+            # Quality metrics
+            n_ratio = seq_str.count('N') / seq_len
+            gc_content = (seq_str.count('G') + seq_str.count('C')) / seq_len
+            
+            # Calculate quality score (higher is better)
+            quality = 1.0
+            quality *= (1 - n_ratio)  # Penalize N content
+            quality *= (1 - abs(gc_content - 0.5) * 0.5)  # Penalize extreme GC
+            
+            qualities.append(quality)
+            
+        return np.mean(qualities) if qualities else 0.0
+        
+    def detect_te_family_type(self, sequences, sample_size=20):
+        """
+        Detect potential TE family type based on sequence characteristics
+        Returns: 'DNA_transposon', 'LTR_retrotransposon', 'LINE', 'SINE', 'unknown'
+        """
+        if len(sequences) == 0:
+            return 'unknown'
+            
+        # Sample sequences for analysis
+        sampled = sequences[:sample_size] if len(sequences) > sample_size else sequences
+        
+        # Analyze sequence characteristics
+        lengths = [len(seq.seq) for seq in sampled]
+        mean_length = np.mean(lengths)
+        length_cv = np.std(lengths) / mean_length if mean_length > 0 else 0
+        
+        # Analyze composition
+        at_contents = []
+        for seq in sampled:
+            seq_str = str(seq.seq).upper()
+            if len(seq_str) > 0:
+                at_content = (seq_str.count('A') + seq_str.count('T')) / len(seq_str)
+                at_contents.append(at_content)
+                
+        mean_at = np.mean(at_contents) if at_contents else 0.5
+        
+        # Simple heuristic classification
+        if mean_length < 500 and mean_at > 0.7:
+            return 'SINE'
+        elif mean_length > 5000 and length_cv < 0.3:
+            return 'LTR_retrotransposon'  
+        elif mean_length > 3000 and mean_at > 0.6:
+            return 'LINE'
+        elif mean_length < 3000 and length_cv < 0.5:
+            return 'DNA_transposon'
+        else:
+            return 'unknown'
+            
+    def determine_optimal_cluster_size(self, sequences, cluster_id=None):
+        """
+        Determine optimal cluster size based on biological characteristics
+        """
+        if len(sequences) <= self.base_max_size:
+            return len(sequences), "no_split_needed"
+            
+        # Calculate cluster characteristics
+        diversity = self.calculate_cluster_diversity(sequences)
+        quality = self.calculate_cluster_quality(sequences)
+        te_type = self.detect_te_family_type(sequences)
+        
+        # Base size adjustment factors
+        diversity_adjustment = 1 + (diversity * self.diversity_factor)
+        quality_adjustment = 1 + ((quality - 0.5) * self.quality_factor)
+        
+        # TE type specific adjustments
+        type_adjustments = {
+            'LTR_retrotransposon': 2.0,    # LTRs can have large families
+            'LINE': 1.8,                   # LINEs can be abundant
+            'DNA_transposon': 1.2,         # Usually smaller families
+            'SINE': 2.5,                   # SINEs can be very abundant
+            'unknown': 1.0
+        }
+        
+        type_adjustment = type_adjustments.get(te_type, 1.0)
+        
+        # Calculate optimal size
+        optimal_size = int(self.base_max_size * diversity_adjustment * 
+                          quality_adjustment * type_adjustment)
+        
+        # Apply reasonable bounds
+        optimal_size = max(50, min(optimal_size, 1000))  # Between 50-1000
+        
+        strategy = f"diversity={diversity:.3f}, quality={quality:.3f}, type={te_type}"
+        
+        if cluster_id is not None:
+            logger.info(f"Cluster {cluster_id}: optimal_size={optimal_size}, {strategy}")
+            
+        return optimal_size, strategy
+        
+    def should_split_cluster(self, sequences, cluster_id=None):
+        """
+        Determine if a cluster should be split and how
+        """
+        if len(sequences) <= self.base_max_size:
+            return False, []
+            
+        optimal_size, strategy = self.determine_optimal_cluster_size(sequences, cluster_id)
+        
+        if len(sequences) <= optimal_size:
+            logger.info(f"Cluster {cluster_id}: keeping large cluster (size={len(sequences)}, optimal={optimal_size})")
+            return False, []
+        else:
+            logger.info(f"Cluster {cluster_id}: splitting required (size={len(sequences)}, optimal={optimal_size})")
+            return True, self.intelligent_split(sequences, optimal_size)
+            
+    def intelligent_split(self, sequences, target_size):
+        """
+        Split cluster intelligently based on sequence similarity
+        """
+        if len(sequences) <= target_size:
+            return [sequences]
+            
+        # For very large clusters, use representative sampling
+        if len(sequences) > target_size * 5:
+            return self.representative_sampling(sequences, target_size)
+        else:
+            return self.similarity_based_split(sequences, target_size)
+            
+    def representative_sampling(self, sequences, target_size):
+        """
+        Sample representative sequences while maintaining diversity
+        """
+        if len(sequences) <= target_size:
+            return [sequences]
+            
+        # Calculate pairwise similarities (sample-based for efficiency)
+        sample_size = min(100, len(sequences))
+        sampled_indices = np.random.choice(len(sequences), sample_size, replace=False)
+        
+        # Greedy selection to maximize diversity
+        selected_indices = [sampled_indices[0]]  # Start with first sequence
+        
+        for _ in range(min(target_size - 1, len(sequences) - 1)):
+            best_candidate = None
+            best_min_distance = 0
+            
+            # Find sequence with maximum minimum distance to selected
+            for candidate_idx in range(len(sequences)):
+                if candidate_idx in selected_indices:
+                    continue
+                    
+                min_distance = float('inf')
+                for selected_idx in selected_indices[-10:]:  # Only check recent selections
+                    distance = self.quick_sequence_distance(
+                        sequences[candidate_idx], 
+                        sequences[selected_idx]
+                    )
+                    min_distance = min(min_distance, distance)
+                    
+                if min_distance > best_min_distance:
+                    best_min_distance = min_distance
+                    best_candidate = candidate_idx
+                    
+            if best_candidate is not None:
+                selected_indices.append(best_candidate)
+            else:
+                break
+                
+        # Return selected sequences
+        selected_sequences = [sequences[i] for i in selected_indices]
+        logger.info(f"Representative sampling: {len(sequences)} → {len(selected_sequences)} sequences")
+        
+        return [selected_sequences]
+        
+    def similarity_based_split(self, sequences, target_size):
+        """
+        Split based on sequence similarity clustering
+        """
+        # Simple length-based pre-grouping
+        length_groups = defaultdict(list)
+        
+        for seq in sequences:
+            length_bin = len(seq.seq) // 100  # Group by 100bp bins
+            length_groups[length_bin].append(seq)
+            
+        # Split each length group if needed
+        subclusters = []
+        for length_bin, group_seqs in length_groups.items():
+            if len(group_seqs) <= target_size:
+                subclusters.append(group_seqs)
+            else:
+                # Further split large groups
+                n_splits = (len(group_seqs) + target_size - 1) // target_size
+                split_size = len(group_seqs) // n_splits
+                
+                for i in range(n_splits):
+                    start = i * split_size
+                    end = start + split_size if i < n_splits - 1 else len(group_seqs)
+                    subclusters.append(group_seqs[start:end])
+                    
+        logger.info(f"Similarity-based split: {len(sequences)} → {len(subclusters)} subclusters")
+        return subclusters
+        
+    def quick_sequence_distance(self, seq1, seq2, k=8):
+        """Quick k-mer based distance calculation"""
+        kmers1 = self.extract_kmers(str(seq1.seq), k)
+        kmers2 = self.extract_kmers(str(seq2.seq), k)
+        
+        if not kmers1 or not kmers2:
+            return 1.0
+            
+        intersection = len(kmers1 & kmers2)
+        union = len(kmers1 | kmers2)
+        
+        return 1 - (intersection / union) if union > 0 else 1.0
+        
+    def extract_kmers(self, seq_str, k):
+        """Extract k-mers from sequence"""
+        kmers = set()
+        seq_str = seq_str.upper()
+        for i in range(len(seq_str) - k + 1):
+            kmer = seq_str[i:i+k]
+            if 'N' not in kmer:
+                kmers.add(kmer)
+        return kmers
+
+
+def test_biological_controller():
+    """Test the biological cluster controller"""
+    
+    # Create test sequences
+    from Bio.SeqRecord import SeqRecord
+    from Bio.Seq import Seq
+    
+    sequences = []
+    for i in range(150):
+        # Simulate TE sequences with some variation
+        base_seq = "ATCGATCGATCG" * 20  # 240bp base
+        # Add some random mutations
+        seq_list = list(base_seq)
+        for j in range(len(seq_list) // 10):  # 10% positions
+            pos = np.random.randint(0, len(seq_list))
+            seq_list[pos] = np.random.choice(['A', 'T', 'C', 'G'])
+            
+        seq_record = SeqRecord(
+            Seq(''.join(seq_list)),
+            id=f"test_seq_{i}",
+            description=f"Test TE sequence {i}"
+        )
+        sequences.append(seq_record)
+    
+    # Test controller
+    controller = BiologicalClusterController()
+    
+    print(f"Input: {len(sequences)} sequences")
+    
+    # Test optimal size calculation
+    optimal_size, strategy = controller.determine_optimal_cluster_size(sequences, "test_cluster")
+    print(f"Optimal size: {optimal_size}")
+    print(f"Strategy: {strategy}")
+    
+    # Test splitting decision
+    should_split, subclusters = controller.should_split_cluster(sequences, "test_cluster")
+    print(f"Should split: {should_split}")
+    if should_split:
+        print(f"Subclusters: {len(subclusters)}")
+        for i, subcluster in enumerate(subclusters):
+            print(f"  Subcluster {i}: {len(subcluster)} sequences")
+
+if __name__ == "__main__":
+    test_biological_controller()

@@ -7,8 +7,8 @@ from typing import Dict, Any
 
 from config import PipelineConfig
 from phase1_screening_optimized import SequenceScreenerOptimized
-from phase2_consensus_expansion import ConsensusExpansionBuilder
-from phase3_finalization_relaxed import ConsensusFilterRelaxed
+from phase2_chimera_splitting import ChimeraSplitter
+from phase3_consensus_building import ConsensusBuilder
 from phase4_genome_masking import GenomeMasker
 from utils.robust_runner import RobustRunner
 
@@ -24,17 +24,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class TEConsensusPipeline:
-    """TE共识序列构建主流程"""
+    """
+    TE共识序列构建主流程
+    
+    重构后的清晰工作流：
+    Phase 1: 识别共识构建候选序列
+    Phase 2: 嵌合体检测和拆分
+    Phase 3: 全面的共识序列构建
+    Phase 4: 基因组屏蔽为RECON做准备
+    """
     
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.runner = RobustRunner(config)
         
-        # 使用最新的优化版本（Expansion-focused pipeline）
-        logger.info("Using expansion-focused pipeline for comprehensive genome annotation")
+        logger.info("Initializing restructured TE Consensus Pipeline:")
+        logger.info("  Phase 1: Candidate identification")
+        logger.info("  Phase 2: Chimera detection & splitting")
+        logger.info("  Phase 3: Comprehensive consensus building")
+        logger.info("  Phase 4: Genome masking preparation")
+        
         self.phase1 = SequenceScreenerOptimized(config)
-        self.phase2 = ConsensusExpansionBuilder(config)
-        self.phase3 = ConsensusFilterRelaxed(config)
+        self.phase2 = ChimeraSplitter(config)
+        self.phase3 = ConsensusBuilder(config)
         self.phase4 = GenomeMasker(config)
         
         # 创建必要的目录
@@ -52,29 +64,38 @@ class TEConsensusPipeline:
         logger.info("="*60)
         
         try:
-            # Phase 1: 筛选与评分
-            logger.info("\n>>> Phase 1: Screening and Scoring")
+            # Phase 1: 候选序列识别
+            logger.info("\n>>> Phase 1: Consensus Candidate Identification")
             phase1_output = self.runner.run_with_checkpoint(
                 self.phase1.run,
                 checkpoint_name="phase1_complete"
             )
             logger.info(f"Phase 1 complete: {phase1_output['summary']}")
             
-            # Phase 2: 扩展与共识构建
-            logger.info("\n>>> Phase 2: Consensus Expansion and Building")
-            consensus_list = self.runner.run_with_checkpoint(
+            # Phase 2: 嵌合体检测和拆分
+            logger.info("\n>>> Phase 2: Chimera Detection and Splitting")
+            phase2_output = self.runner.run_with_checkpoint(
                 lambda: self.phase2.run(phase1_output),
                 checkpoint_name="phase2_complete"
             )
-            logger.info(f"Phase 2 complete: {len(consensus_list)} consensus sequences (expanded from {len(phase1_output['a_sequences'])+len([s for s in phase1_output['b_sequences'] if True])} input sequences)")
+            # Phase2统计信息
+            phase2_stats = phase2_output.get('statistics', {})
+            logger.info(f"Phase 2 complete: Processed {phase2_stats.get('input_candidates', 0)} candidate sequences")
+            logger.info(f"  - Chimeric sequences detected: {phase2_stats.get('chimeric_sequences', 0)}")
+            logger.info(f"  - Successfully split: {phase2_stats.get('split_sequences', 0)}")
+            logger.info(f"  - Output sequences for Phase 3: {phase2_stats.get('output_total', 0)}")
             
-            # Phase 3: 质量控制与输出
-            logger.info("\n>>> Phase 3: Quality Control and Output")
+            # Phase 3: 全面共识构建
+            logger.info("\n>>> Phase 3: Comprehensive Consensus Building")
             phase3_output = self.runner.run_with_checkpoint(
-                lambda: self.phase3.run(consensus_list),
+                lambda: self.phase3.run(phase2_output),
                 checkpoint_name="phase3_complete"
             )
-            logger.info(f"Phase 3 complete: {phase3_output['summary']}")
+            phase3_stats = phase3_output.get('statistics', {})
+            logger.info(f"Phase 3 complete: Generated {phase3_stats.get('total_consensus', 0)} consensus sequences")
+            logger.info(f"  - High quality: {phase3_stats.get('high_quality_consensus', 0)}")
+            logger.info(f"  - Medium quality: {phase3_stats.get('medium_quality_consensus', 0)}")
+            logger.info(f"  - Low quality: {phase3_stats.get('low_quality_consensus', 0)}")
             
             # Phase 4: 基因组Masking（可选）
             if self.config.__dict__.get('enable_masking', True):
@@ -83,7 +104,7 @@ class TEConsensusPipeline:
                     lambda: self.phase4.run(phase1_output, phase3_output),
                     checkpoint_name="phase4_complete"
                 )
-                logger.info(f"Phase 4 complete: {phase4_output['summary']}")
+                logger.info(f"Phase 4 complete: Generated masked genome")
                 
                 # 合并输出
                 final_output = {

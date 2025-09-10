@@ -1,170 +1,450 @@
-#!/usr/bin/perl
-use strict;
-use warnings;
-use Cwd qw(abs_path getcwd);
-use File::Basename qw(dirname basename);
-use File::Path qw(make_path);
+#!/usr/bin/env python3
 
-# Usage check
-my $fasta_file = abs_path($ARGV[0]);
-unless ($fasta_file && -e $fasta_file) {
-    die "Usage: $0 <fasta_file> <threads> <out_dir>\n";
-}
+import os
+import sys
+import argparse
+import subprocess
+import multiprocessing as mp
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from Bio import SeqIO
+import shutil
+import math
+import tempfile
 
-my $threads = $ARGV[1] || 1;
-my $out_dir = abs_path($ARGV[2]);
-make_path($out_dir) unless -d $out_dir;
-chdir $out_dir or die "Cannot change to directory $out_dir: $!\n";
+def get_file_size_gb(file_path):
+    """Get file size in GB"""
+    return os.path.getsize(file_path) / (1024 ** 3)
 
-# Check genome size and sample if necessary
-my $input_fasta = $fasta_file;
-my $genome_size = -s $fasta_file;
-my $size_threshold = 2 * 1024 * 1024 * 1024; # 2GB
-
-if ($genome_size > $size_threshold) {
-    print "Genome size ($genome_size bytes) exceeds 2GB threshold. Sampling 2GB data...\n";
-    $input_fasta = sample_genome($fasta_file, $out_dir);
-    print "Sampling completed. Using sampled file: $input_fasta\n";
-} else {
-    print "Genome size ($genome_size bytes) is within 2GB threshold. Using original genome.\n";
-}
-
-# Create inpactor2 directory
-make_path("Inpactor2") unless -d "Inpactor2";
-chdir "Inpactor2" or die "Cannot change to Inpactor2 directory: $!\n";
-
-# Run Inpactor2
-print "Running Inpactor2 on the entire genome...\n";
-my $current_dir = getcwd();
-
-# Execute Inpactor2
-if (-e "$current_dir/Inpactor2_library.fasta") {
-	print "Inpactor2 was done!\n";
-}else{
-	my $inpactor2_cmd = "conda run -n Inpactor2 Inpactor2.py -f $input_fasta -o $current_dir -t $threads -a no -n 100 -c no -g no >inpactor2.log  2>> inpactor2.log";
-	print "Executing: $inpactor2_cmd\n";
-	system($inpactor2_cmd) == 0 or die "Failed to execute Inpactor2: $!\n";
-	my $refine_cmd = "TE_Merge Inpactor2_library.fasta ./ --threads $threads";
-	print "Executing: $inpactor2_cmd\n";
-	system($refine_cmd) == 0 or die "Failed to execute refinement: $!\n";
-}
-# Check output file
-my $inpactor2_output = "$current_dir/all_sequences.fa";
-unless (-e $inpactor2_output) {
-    die "Inpactor2 output file not found: $inpactor2_output\n";
-}
-
-# Copy output file to expected location for downstream processing
-system("sed 's:N::g' $inpactor2_output > $current_dir/LTR.fa") == 0
-    or die "Failed to copy Inpactor2 output file\n";
-
-# Run filtering step to maintain compatibility with original workflow
-if (! -e "$current_dir/LTR.fa") {
-    die "LTR.fa file not found\n";
-}
-
-# Run LTR_Boundary_Optimizer
-my $optimizer_cmd = "LTR_Boundary_Optimizer.py LTR.fa ../genome/genome.fa output_dir --threads $threads --advanced-tsd --weighted-evidence --kmer-boundary --orientation-aware --low-complexity-filter --clustering --dynamic-threshold --orf-analysis";
-system($optimizer_cmd) == 0 or die "Failed to execute: $optimizer_cmd\n";
-
-# Copy final results
-system("cp output_dir/optimized_consensus.fa consensi.fa") == 0
-    or die "Failed to copy optimized consensus\n";
-
-print "LTR identification and refinement completed successfully\n";
-
-# Subroutine to sample genome for large genomes
-sub sample_genome {
-    my ($fasta_file, $out_dir) = @_;
-    my $sampled_file = "$out_dir/sampled_genome.fa";
+def split_genome_evenly(fasta_file, num_parts, output_dir):
+    """Split genome into equal parts while maintaining sequence integrity"""
+    sequences = list(SeqIO.parse(fasta_file, "fasta"))
+    total_length = sum(len(seq.seq) for seq in sequences)
+    target_length_per_part = total_length / num_parts
     
-    # Parameters for sampling
-    my $segment_size = 1024 * 1024; # 1MB per segment
-    my $total_target = 2 * 1024 * 1024 * 1024; # 2GB total
-    my $num_segments = $total_target / $segment_size; # 2000 segments
+    parts = []
+    current_part = []
+    current_length = 0
     
-    print "Creating sampled genome: $num_segments segments of 1MB each\n";
-    
-    # Read sequence information first
-    my @sequences;
-    my $current_seq = "";
-    my $current_header = "";
-    
-    open(my $fh, '<', $fasta_file) or die "Cannot open $fasta_file: $!\n";
-    while (my $line = <$fh>) {
-        chomp $line;
-        if ($line =~ /^>/) {
-            if ($current_header && $current_seq) {
-                push @sequences, {header => $current_header, seq => $current_seq};
-            }
-            $current_header = $line;
-            $current_seq = "";
-        } else {
-            $current_seq .= $line;
-        }
-    }
-    # Don't forget the last sequence
-    if ($current_header && $current_seq) {
-        push @sequences, {header => $current_header, seq => $current_seq};
-    }
-    close($fh);
-    
-    # Calculate total sequence length
-    my $total_length = 0;
-    for my $seq (@sequences) {
-        $total_length += length($seq->{seq});
-    }
-    
-    print "Total genome length: $total_length bp\n";
-    
-    # Open output file
-    open(my $out_fh, '>', $sampled_file) or die "Cannot create $sampled_file: $!\n";
-    
-    my $segments_written = 0;
-    my $attempts = 0;
-    my $max_attempts = $num_segments * 10; # Prevent infinite loop
-    
-    while ($segments_written < $num_segments && $attempts < $max_attempts) {
-        $attempts++;
+    for seq in sequences:
+        seq_len = len(seq.seq)
         
-        # Randomly select a sequence
-        my $seq_idx = int(rand(scalar @sequences));
-        my $selected_seq = $sequences[$seq_idx];
-        my $seq_len = length($selected_seq->{seq});
-        
-        # Skip if sequence is too short
-        next if $seq_len < $segment_size;
-        
-        # Randomly select a starting position
-        my $max_start = $seq_len - $segment_size;
-        my $start_pos = int(rand($max_start));
-        
-        # Extract segment
-        my $segment = substr($selected_seq->{seq}, $start_pos, $segment_size);
-        
-        # Skip segments with too many Ns
-        my $n_count = ($segment =~ tr/Nn//);
-        next if $n_count > $segment_size * 0.5; # Skip if >50% Ns
-        
-        # Write segment
-        print $out_fh ">sampled_segment_${segments_written}_from_seq${seq_idx}_pos${start_pos}\n";
-        # Split sequence into lines of 80 characters
-        for (my $i = 0; $i < length($segment); $i += 80) {
-            print $out_fh substr($segment, $i, 80) . "\n";
-        }
-        
-        $segments_written++;
-        
-        if ($segments_written % 100 == 0) {
-            print "Sampled $segments_written / $num_segments segments\n";
-        }
-    }
+        # If adding this sequence would exceed target by more than current shortage, start new part
+        if current_part and current_length > 0:
+            excess_if_added = (current_length + seq_len) - target_length_per_part
+            current_shortage = target_length_per_part - current_length
+            
+            if excess_if_added > current_shortage:
+                parts.append(current_part)
+                current_part = [seq]
+                current_length = seq_len
+            else:
+                current_part.append(seq)
+                current_length += seq_len
+        else:
+            current_part.append(seq)
+            current_length += seq_len
     
-    close($out_fh);
+    # Add the last part
+    if current_part:
+        parts.append(current_part)
     
-    if ($segments_written < $num_segments) {
-        print "Warning: Only sampled $segments_written segments (target: $num_segments)\n";
-    }
+    # Write parts to files
+    part_files = []
+    for i, part in enumerate(parts):
+        part_file = os.path.join(output_dir, f"genome_part_{i+1}.fa")
+        with open(part_file, 'w') as f:
+            SeqIO.write(part, f, "fasta")
+        part_files.append(part_file)
+        print(f"Part {i+1}: {len(part)} sequences, {sum(len(seq.seq) for seq in part):,} bp -> {part_file}")
     
-    return $sampled_file;
-}
+    return part_files
+
+def sample_genome_chunks(fasta_file, num_chunks, target_size_gb, output_dir):
+    """Sample genome into chunks of approximately target_size_gb each"""
+    sequences = list(SeqIO.parse(fasta_file, "fasta"))
+    total_length = sum(len(seq.seq) for seq in sequences)
+    target_length_per_chunk = int(target_size_gb * 1024 ** 3 / 4)  # Assuming 4 bytes per base (rough estimate)
+    
+    chunks = []
+    used_sequences = set()
+    
+    for chunk_idx in range(num_chunks):
+        chunk = []
+        chunk_length = 0
+        
+        # Randomly sample sequences until we reach target size
+        while chunk_length < target_length_per_chunk:
+            available_seqs = [i for i, seq in enumerate(sequences) 
+                            if i not in used_sequences and len(seq.seq) > 1000]
+            
+            if not available_seqs:
+                break
+                
+            # Select sequence that gets us closest to target without excessive overshoot
+            best_seq_idx = None
+            best_score = float('inf')
+            
+            for seq_idx in available_seqs:
+                seq = sequences[seq_idx]
+                new_length = chunk_length + len(seq.seq)
+                
+                if new_length <= target_length_per_chunk:
+                    # Prefer sequences that get us closer to target
+                    score = target_length_per_chunk - new_length
+                else:
+                    # Penalize overshoot but still consider if we're far from target
+                    overshoot = new_length - target_length_per_chunk
+                    current_shortage = target_length_per_chunk - chunk_length
+                    if overshoot <= current_shortage:
+                        score = overshoot
+                    else:
+                        continue  # Too much overshoot
+                
+                if score < best_score:
+                    best_score = score
+                    best_seq_idx = seq_idx
+            
+            if best_seq_idx is not None:
+                chunk.append(sequences[best_seq_idx])
+                chunk_length += len(sequences[best_seq_idx].seq)
+                used_sequences.add(best_seq_idx)
+            else:
+                break
+        
+        if chunk:
+            chunks.append(chunk)
+    
+    # Write chunks to files
+    chunk_files = []
+    for i, chunk in enumerate(chunks):
+        chunk_file = os.path.join(output_dir, f"genome_sample_{i+1}.fa")
+        with open(chunk_file, 'w') as f:
+            SeqIO.write(chunk, f, "fasta")
+        chunk_files.append(chunk_file)
+        chunk_size_gb = sum(len(seq.seq) for seq in chunk) * 4 / (1024 ** 3)
+        print(f"Sample {i+1}: {len(chunk)} sequences, {sum(len(seq.seq) for seq in chunk):,} bp (~{chunk_size_gb:.1f}GB) -> {chunk_file}")
+    
+    return chunk_files
+
+def run_look4ltrs_single(genome_file, threads, output_dir):
+    """Run Look4LTRs on a single genome file"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create a dedicated input directory for this Look4LTRs run
+    # Look4LTRs reads all .fa files in the input directory
+    input_dir = os.path.join(output_dir, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    
+    # Copy the genome file to the input directory with a .fa extension
+    genome_basename = os.path.basename(genome_file)
+    if not genome_basename.endswith('.fa'):
+        genome_basename = os.path.splitext(genome_basename)[0] + '.fa'
+    
+    input_genome_path = os.path.join(input_dir, genome_basename)
+    shutil.copy2(genome_file, input_genome_path)
+    
+    # Create conda environment command - input is the directory, not the file
+    look4ltrs_cmd = [
+        "look4ltrs", 
+        "-f", input_dir,  # Input directory, not file
+        "-o", output_dir,
+        "-pa", str(threads)
+    ]
+    
+    log_file = os.path.join(output_dir, "ltr.log")
+    
+    print(f"Running Look4LTRs on {genome_file} (copied to {input_genome_path})")
+    print(f"Command: {' '.join(look4ltrs_cmd)}")
+    
+    try:
+        with open(log_file, 'w') as log_f:
+            result = subprocess.run(
+                look4ltrs_cmd,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                check=True
+            )
+        print(f"Look4LTRs completed successfully for {genome_file}")
+        return output_dir
+    except subprocess.CalledProcessError as e:
+        print(f"Look4LTRs failed for {genome_file}: {e}")
+        return None
+
+def run_build_ltr_consensus(rtr_dirs, chunk_files, original_genome, threads, output_dir):
+    """Run build_ltr_consensus.py to combine results"""
+    # Collect all .rtr files
+    rtr_files = []
+    for rtr_dir in rtr_dirs:
+        rtr_path = os.path.join(rtr_dir, "Rtr", "genome.rtr")
+        if os.path.exists(rtr_path):
+            rtr_files.append(rtr_path)
+    
+    if not rtr_files:
+        raise Exception("No .rtr files found from Look4LTRs runs")
+    
+    # If multiple files, we need to merge them first
+    if len(rtr_files) > 1:
+        merged_rtr = os.path.join(output_dir, "merged_genome.rtr")
+        with open(merged_rtr, 'w') as outf:
+            for rtr_file in rtr_files:
+                with open(rtr_file, 'r') as inf:
+                    outf.write(inf.read())
+        rtr_input = merged_rtr
+    else:
+        rtr_input = rtr_files[0]
+    
+    # Determine which fasta file to use
+    # If we have multiple chunks/parts, we need to merge them for build_ltr_consensus.py
+    if len(chunk_files) > 1:
+        # Merge all chunk files into a single file for consensus building
+        merged_fasta = os.path.join(output_dir, "merged_chunks.fa")
+        with open(merged_fasta, 'w') as outf:
+            for chunk_file in chunk_files:
+                with open(chunk_file, 'r') as inf:
+                    outf.write(inf.read())
+        fasta_input = merged_fasta
+        print(f"Merged {len(chunk_files)} chunk files into {merged_fasta} for consensus building")
+    elif len(chunk_files) == 1:
+        # Use the single chunk file
+        fasta_input = chunk_files[0]
+        print(f"Using single chunk file {fasta_input} for consensus building")
+    else:
+        # Use original genome if no chunks (shouldn't happen)
+        fasta_input = original_genome
+        print(f"Using original genome {fasta_input} for consensus building")
+    
+    # Run build_ltr_consensus.py
+    consensus_cmd = [
+        "build_ltr_consensus.py",
+        "-r", rtr_input,
+        "--fasta", fasta_input,  # Use chunk files, not original genome
+        "--use-nesting",
+        "--threads", str(threads),
+        "--processes", str(max(1, threads // 2))
+    ]
+    
+    print(f"Running build_ltr_consensus.py")
+    print(f"Command: {' '.join(consensus_cmd)}")
+    
+    try:
+        subprocess.run(consensus_cmd, check=True, cwd=output_dir)
+        print("build_ltr_consensus.py completed successfully")
+    except subprocess.CalledProcessError as e:
+        print(f"build_ltr_consensus.py failed: {e}")
+        raise
+
+def main():
+    parser = argparse.ArgumentParser(description="Enhanced LTR detection with genome size-based processing")
+    parser.add_argument("fasta_file", help="Input genome FASTA file")
+    parser.add_argument("threads", type=int, help="Number of threads")
+    parser.add_argument("output_dir", help="Output directory")
+    
+    args = parser.parse_args()
+    
+    fasta_file = os.path.abspath(args.fasta_file)
+    threads = args.threads
+    output_dir = os.path.abspath(args.output_dir)
+    
+    # Validate inputs
+    if not os.path.exists(fasta_file):
+        print(f"Error: Genome file {fasta_file} not found")
+        sys.exit(1)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    os.chdir(output_dir)
+    
+    # Check if already completed
+    if os.path.exists(os.path.join(output_dir, "consensi.fa")):
+        print("LTR detection already completed!")
+        return
+    
+    # Get genome size
+    genome_size_gb = get_file_size_gb(fasta_file)
+    print(f"Genome size: {genome_size_gb:.2f} GB")
+    
+    # Determine processing strategy based on genome size
+    temp_dir = os.path.join(output_dir, "temp_parts")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    if genome_size_gb <= 5:
+        # Run on entire genome
+        print("Running Look4LTRs on entire genome")
+        ltr_output_dir = os.path.join(output_dir, "Look4LTRs")
+        result_dirs = [run_look4ltrs_single(fasta_file, threads, ltr_output_dir)]
+        chunk_files = [fasta_file]  # Use original genome file
+        
+    elif genome_size_gb <= 10:
+        # Split into 2 parts
+        print("Splitting genome into 2 parts")
+        part_files = split_genome_evenly(fasta_file, 2, temp_dir)
+        chunk_files = part_files  # Use split parts
+        
+        # Run Look4LTRs in parallel on parts
+        result_dirs = []
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            futures = {}
+            for i, part_file in enumerate(part_files):
+                part_output_dir = os.path.join(output_dir, f"Look4LTRs_part_{i+1}")
+                future = executor.submit(run_look4ltrs_single, part_file, threads//2, part_output_dir)
+                futures[future] = part_output_dir
+            
+            for future in as_completed(futures):
+                result_dir = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        result_dirs.append(result)
+                except Exception as e:
+                    print(f"Error processing part: {e}")
+        
+    elif genome_size_gb <= 15:
+        # Split into 3 parts
+        print("Splitting genome into 3 parts")
+        part_files = split_genome_evenly(fasta_file, 3, temp_dir)
+        chunk_files = part_files  # Use split parts
+        
+        result_dirs = []
+        with ProcessPoolExecutor(max_workers=3) as executor:
+            futures = {}
+            for i, part_file in enumerate(part_files):
+                part_output_dir = os.path.join(output_dir, f"Look4LTRs_part_{i+1}")
+                future = executor.submit(run_look4ltrs_single, part_file, threads//3, part_output_dir)
+                futures[future] = part_output_dir
+            
+            for future in as_completed(futures):
+                result_dir = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        result_dirs.append(result)
+                except Exception as e:
+                    print(f"Error processing part: {e}")
+        
+    elif genome_size_gb <= 20:
+        # Split into 4 parts
+        print("Splitting genome into 4 parts")
+        part_files = split_genome_evenly(fasta_file, 4, temp_dir)
+        chunk_files = part_files  # Use split parts
+        
+        result_dirs = []
+        with ProcessPoolExecutor(max_workers=4) as executor:
+            futures = {}
+            for i, part_file in enumerate(part_files):
+                part_output_dir = os.path.join(output_dir, f"Look4LTRs_part_{i+1}")
+                future = executor.submit(run_look4ltrs_single, part_file, threads//4, part_output_dir)
+                futures[future] = part_output_dir
+            
+            for future in as_completed(futures):
+                result_dir = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        result_dirs.append(result)
+                except Exception as e:
+                    print(f"Error processing part: {e}")
+                    
+    else:
+        # Sample 4 chunks of ~5GB each
+        print("Sampling 4 chunks of ~5GB each")
+        chunk_files = sample_genome_chunks(fasta_file, 4, 5, temp_dir)
+        
+        result_dirs = []
+        with ProcessPoolExecutor(max_workers=4) as executor:
+            futures = {}
+            for i, chunk_file in enumerate(chunk_files):
+                chunk_output_dir = os.path.join(output_dir, f"Look4LTRs_sample_{i+1}")
+                future = executor.submit(run_look4ltrs_single, chunk_file, threads//4, chunk_output_dir)
+                futures[future] = chunk_output_dir
+            
+            for future in as_completed(futures):
+                result_dir = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        result_dirs.append(result)
+                except Exception as e:
+                    print(f"Error processing sample: {e}")
+    
+    # Filter successful results
+    result_dirs = [d for d in result_dirs if d is not None]
+    
+    if not result_dirs:
+        print("Error: No Look4LTRs runs completed successfully")
+        sys.exit(1)
+    
+    print(f"Successfully completed {len(result_dirs)} Look4LTRs runs")
+    
+    # Run build_ltr_consensus.py serially to combine results
+    try:
+        run_build_ltr_consensus(result_dirs, chunk_files, fasta_file, threads, output_dir)
+    except Exception as e:
+        print(f"Error in consensus building: {e}")
+        sys.exit(1)
+    
+    # Check build_ltr_consensus.py output files
+    ltr_consensus_file = os.path.join(output_dir, "LTR_consensus.fasta")
+    if not os.path.exists(ltr_consensus_file):
+        print("Error: LTR_consensus.fasta not found after consensus building")
+        sys.exit(1)
+    
+    # Use LTR_consensus.fasta as input for LTR_Boundary_Optimizer
+    # Process output file (remove Ns and create LTR.fa)
+    ltr_file = os.path.join(output_dir, "LTR.fa")
+    try:
+        subprocess.run(f"sed 's:N::g' {ltr_consensus_file} > {ltr_file}", 
+                      shell=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error processing output file: {e}")
+        sys.exit(1)
+    
+    if not os.path.exists(ltr_file):
+        print("Error: LTR.fa file not created")
+        sys.exit(1)
+    
+    # Run LTR_Boundary_Optimizer
+    genome_file_path = os.path.join(os.path.dirname(output_dir), "genome", "genome.fa")
+    optimizer_output_dir = os.path.join(output_dir, "output_dir")
+    os.makedirs(optimizer_output_dir, exist_ok=True)
+    
+    optimizer_cmd = [
+        "LTR_Boundary_Optimizer.py",
+        ltr_file,
+        genome_file_path,
+        optimizer_output_dir,
+        "--threads", str(threads),
+        "--advanced-tsd",
+        "--weighted-evidence", 
+        "--kmer-boundary",
+        "--orientation-aware",
+        "--low-complexity-filter",
+        "--clustering",
+        "--dynamic-threshold",
+        "--orf-analysis"
+    ]
+    
+    try:
+        subprocess.run(optimizer_cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running LTR_Boundary_Optimizer: {e}")
+        sys.exit(1)
+    
+    # Copy final results
+    optimized_consensus = os.path.join(optimizer_output_dir, "optimized_consensus.fa")
+    final_consensus = os.path.join(output_dir, "consensi.fa")
+    
+    if os.path.exists(optimized_consensus):
+        shutil.copy2(optimized_consensus, final_consensus)
+    else:
+        print("Warning: optimized_consensus.fa not found, using LTR.fa as consensi.fa")
+        shutil.copy2(ltr_file, final_consensus)
+    
+    # Clean up temporary files
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    
+    print("LTR identification and refinement completed successfully")
+    print(f"Final consensus: {final_consensus}")
+
+if __name__ == "__main__":
+    main()

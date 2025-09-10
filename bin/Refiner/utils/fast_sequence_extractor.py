@@ -75,12 +75,14 @@ class FastSequenceExtractor:
         """确保基因组索引存在"""
         index_file = f"{self.genome_file}.fai"
         if not os.path.exists(index_file):
-            logger.info(f"Creating fai index for {self.genome_file}")
+            logger.debug(f"Index not found for {self.genome_file}, attempting to create")
             try:
                 subprocess.run(
                     ['samtools', 'faidx', self.genome_file],
-                    check=True
+                    check=True,
+                    capture_output=True
                 )
+                logger.debug(f"Successfully created index: {index_file}")
             except subprocess.CalledProcessError as e:
                 logger.error(f"Failed to create index: {e}")
     

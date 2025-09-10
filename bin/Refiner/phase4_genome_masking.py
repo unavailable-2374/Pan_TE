@@ -1,10 +1,10 @@
 """
-Phase 4: 高质量基因组软屏蔽 (High-Quality Genome Soft Masking)
+Phase 4: 高质量基因组硬屏蔽 (High-Quality Genome Hard Masking)
 新策略：
 1. 只使用高质量的共识序列(consensus)运行RepeatMasker
-2. 采用软屏蔽(soft masking)模式，保留原始序列信息
+2. 采用硬屏蔽(hard masking)模式，将重复序列替换为N字符
 3. 不再依赖Phase 1结果，完全基于Phase 3的高质量共识序列
-目标：基于最终高质量consensus的精准软屏蔽
+目标：基于最终高质量consensus的精准硬屏蔽
 """
 
 import logging
@@ -20,35 +20,50 @@ from Bio.SeqRecord import SeqRecord
 
 from config import PipelineConfig
 from utils.robust_runner import RobustRunner
+from utils.genome_renamer import GenomeRenamer, integrate_with_repeatmasker_workflow, restore_after_phase4
 
 logger = logging.getLogger(__name__)
 
 class GenomeMasker:
-    """Phase 4: 高质量基因组软屏蔽"""
+    """Phase 4: 高质量基因组硬屏蔽"""
     
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.runner = RobustRunner(config)
         
-        # 软屏蔽参数 (优化用于高质量consensus)
+        # 硬屏蔽参数 (优化用于高质量consensus)
         self.min_rm_score = 200  # RepeatMasker最小分数（适中，避免过于严格）
         self.min_identity = 70.0  # 较低阈值，捕获更多diverged copies
         self.min_length = 50     # 最小mask长度
-        self.soft_mask = True    # 强制软屏蔽模式
+        self.hard_mask = True    # 强制硬屏蔽模式
         
-        # 高质量consensus参数
-        self.min_consensus_quality = 0.8  # 只使用高质量consensus (80%以上)
-        self.min_consensus_copies = 3     # 至少基于3个拷贝的consensus
+        # 高质量consensus参数（更合理的默认值）
+        self.min_consensus_quality = 0.3  # 降低质量阈值，因为Phase 1已经筛选过
+        self.min_consensus_copies = 2     # 至少基于2个拷贝的consensus
         self.exclude_low_complexity = True  # 排除低复杂度sequences
+        self.min_consensus_length = 80    # 最小序列长度
         
-        logger.info(f"Phase 4 initialized (Consensus-only soft masking): "
+        # ID重命名和还原
+        self.use_id_renaming = True  # 启用ID重命名预防RepeatMasker ID问题
+        self.genome_renamer = None
+        self.renamed_genome_file = None
+        self.mapping_file = None
+        
+        logger.info(f"Phase 4 initialized (Consensus-only hard masking): "
                    f"min_score={self.min_rm_score}, min_identity={self.min_identity}%")
+        logger.info(f"ID renaming enabled: {self.use_id_renaming}")
     
     def run(self, phase1_output: Dict, phase3_output: Dict) -> Dict[str, any]:
-        """执行Phase 4完整流程（仅基于高质量consensus的软屏蔽）"""
+        """执行Phase 4完整流程（仅基于高质量consensus的硬屏蔽）"""
         logger.info("="*60)
-        logger.info("Phase 4: High-Quality Consensus Soft Masking")
+        logger.info("Phase 4: High-Quality Consensus Hard Masking")
         logger.info("="*60)
+        
+        # 步骤0：重命名基因组ID以避免RepeatMasker问题
+        genome_to_use = self.config.genome_file
+        if self.use_id_renaming:
+            genome_to_use, self.mapping_file = self._prepare_renamed_genome()
+            logger.info(f"Using renamed genome: {genome_to_use}")
         
         # 步骤1：从Phase 3获取并过滤高质量consensus序列
         high_quality_consensus = self._extract_high_quality_consensus(phase3_output)
@@ -58,17 +73,17 @@ class GenomeMasker:
         consensus_library_file = self._create_consensus_library(high_quality_consensus)
         logger.info(f"Created consensus library: {consensus_library_file}")
         
-        # 步骤3：使用高质量consensus运行RepeatMasker软屏蔽
-        soft_masked_genome = self._run_repeatmasker_soft_masking(
-            self.config.genome_file,
+        # 步骤3：使用高质量consensus运行RepeatMasker硬屏蔽
+        hard_masked_genome = self._run_repeatmasker_soft_masking(
+            genome_to_use,  # 使用重命名后的基因组
             consensus_library_file
         )
-        logger.info(f"Generated soft-masked genome: {soft_masked_genome}")
+        logger.info(f"Generated hard-masked genome: {hard_masked_genome}")
         
-        # 步骤4：验证软屏蔽质量
+        # 步骤4：验证硬屏蔽质量
         masking_stats = self._analyze_masking_quality(
             self.config.genome_file,
-            soft_masked_genome,
+            hard_masked_genome,
             high_quality_consensus
         )
         logger.info(f"Masking quality analysis completed")
@@ -76,97 +91,123 @@ class GenomeMasker:
         # 步骤5：计算masking统计和报告
         final_stats = self._calculate_final_stats(
             self.config.genome_file,
-            soft_masked_genome,
+            hard_masked_genome,
             masking_stats,
             high_quality_consensus
         )
         
         # 步骤6：生成输出文件
         output_files = self._generate_output_files(
-            soft_masked_genome,
-            final_stats,
-            consensus_library_file
+            hard_masked_genome,  # hard_masked_genome
+            final_stats,         # stats
+            consensus_library_file  # consensus_library
         )
         
         # 计算注释比例并写入文件供RECON使用
-        annotation_ratio = final_stats['soft_masked_percent'] / 100.0  # 转换为0-1范围
+        annotation_ratio = final_stats['hard_masked_percent'] / 100.0  # 转换为0-1范围
         annotation_file = Path(self.config.output_dir) / "annotation_ratio.txt"
         
         with open(annotation_file, 'w') as f:
             f.write(f"{annotation_ratio:.6f}\n")
-            f.write(f"# Annotation ratio: {final_stats['soft_masked_percent']:.2f}%\n")
-            f.write(f"# Masked bases: {final_stats['soft_masked_bp']:,}\n")
+            f.write(f"# Annotation ratio: {final_stats['hard_masked_percent']:.2f}%\n")
+            f.write(f"# Masked bases: {final_stats['hard_masked_bp']:,}\n")
             f.write(f"# Total bases: {final_stats['genome_size']:,}\n")
-            f.write(f"# Generated by Phase 4 Consensus-only Soft Masking\n")
+            f.write(f"# Generated by Phase 4 Consensus-only Hard Masking\n")
         
         logger.info(f"Annotation ratio ({annotation_ratio:.4f}) written to {annotation_file}")
         
+        # 步骤7：还原ID到原始格式（如果使用了重命名）
+        final_output_files = output_files
+        if self.use_id_renaming and self.mapping_file:
+            final_output_files = self._restore_original_ids(output_files)
+            logger.info(f"Restored original IDs for all output files")
+        
         return {
-            'soft_masked_genome': soft_masked_genome,
+            'hard_masked_genome': final_output_files.get('hard_masked_genome', hard_masked_genome),
             'consensus_library': consensus_library_file,
             'masking_stats': masking_stats,
             'final_stats': final_stats,
             'annotation_ratio': annotation_ratio,
             'annotation_file': str(annotation_file),
-            'output_files': output_files,
+            'output_files': final_output_files,
             'high_quality_consensus_count': len(high_quality_consensus),
-            'summary': f"Soft-masked {final_stats['soft_masked_percent']:.2f}% of genome using {len(high_quality_consensus)} high-quality consensus sequences (annotation ratio: {annotation_ratio:.4f})"
+            'id_mapping_file': self.mapping_file,
+            'renamed_genome_file': self.renamed_genome_file,
+            'id_renaming_used': self.use_id_renaming,
+            'summary': f"Hard-masked {final_stats['hard_masked_percent']:.2f}% of genome using {len(high_quality_consensus)} high-quality consensus sequences (annotation ratio: {annotation_ratio:.4f})"
         }
     
     def _extract_high_quality_consensus(self, phase3_output: Dict) -> List[Dict]:
         """从Phase 3输出中提取高质量consensus序列"""
         high_quality_consensus = []
         
-        # 检查phase3_output结构
-        if 'families' not in phase3_output:
-            logger.warning("No families found in phase3_output")
+        # Phase 3输出结构：masking_library, analysis_library
+        # 优先使用masking_library，它已经针对基因组屏蔽进行了优化
+        consensus_library = phase3_output.get('masking_library', [])
+        if not consensus_library:
+            # 后备选择：使用analysis_library
+            consensus_library = phase3_output.get('analysis_library', [])
+        
+        if not consensus_library:
+            logger.warning("No consensus sequences found in Phase 3 output")
             return high_quality_consensus
         
-        families = phase3_output['families']
-        logger.info(f"Processing {len(families)} families from Phase 3")
+        logger.info(f"Processing {len(consensus_library)} consensus sequences from Phase 3")
         
-        for family_id, family_data in families.items():
-            # 检查family_data结构
-            if not isinstance(family_data, dict):
-                logger.warning(f"Invalid family data for {family_id}")
+        for consensus_item in consensus_library:
+            # consensus_item是字典，包含id, sequence, quality_score, copy_number等
+            if not isinstance(consensus_item, dict):
+                logger.warning(f"Invalid consensus item: {type(consensus_item)}")
                 continue
             
-            # 获取consensus序列
-            consensus_seq = family_data.get('consensus')
+            # 获取基本信息
+            consensus_id = consensus_item.get('id', 'unknown')
+            consensus_seq = consensus_item.get('sequence', '')
             if not consensus_seq:
-                logger.debug(f"No consensus sequence for family {family_id}")
+                logger.debug(f"No sequence for consensus {consensus_id}")
                 continue
             
-            # 获取质量评分
-            quality_score = family_data.get('quality_score', 0.0)
-            copy_number = family_data.get('copy_number', 0)
-            boundary_score = family_data.get('boundary_score', 0.0)
+            # 获取质量评分（兼容多种字段名）
+            quality_score = consensus_item.get('quality_score', 
+                                              consensus_item.get('final', 0.5))  # 更合理的默认值
+            # 获取拷贝数（兼容Phase 2和Phase 3的字段名）
+            copy_number = consensus_item.get('copy_number', 
+                                            consensus_item.get('num_copies', 1))  # 默认至少1个拷贝
             
-            # 应用高质量过滤条件
-            if (quality_score >= self.min_consensus_quality and
-                copy_number >= self.min_consensus_copies):
+            # 序列长度检查
+            seq_length = len(consensus_seq)
+            if seq_length < self.min_consensus_length:
+                logger.debug(f"Excluded short consensus {consensus_id}: length={seq_length} < {self.min_consensus_length}")
+                continue
+            
+            # 应用高质量过滤条件（更宽松的条件）
+            # 优先考虑：1)序列长度 2)拷贝数 3)质量分数
+            if copy_number >= self.min_consensus_copies or \
+               (copy_number >= 1 and quality_score >= self.min_consensus_quality) or \
+               (seq_length >= 200 and copy_number >= 1):  # 长序列放宽要求
                 
                 # 检查低复杂度（如果启用）
                 if self.exclude_low_complexity:
                     complexity_score = self._calculate_sequence_complexity(consensus_seq)
-                    if complexity_score < 0.3:  # 排除低复杂度序列
-                        logger.debug(f"Excluded low complexity family {family_id} (complexity: {complexity_score:.3f})")
+                    if complexity_score < 0.2:  # 只排除极低复杂度序列（如AAAAA...）
+                        logger.debug(f"Excluded low complexity consensus {consensus_id} (complexity: {complexity_score:.3f})")
                         continue
                 
                 high_quality_consensus.append({
-                    'id': family_id,
+                    'id': consensus_id,
                     'sequence': consensus_seq,
                     'quality_score': quality_score,
                     'copy_number': copy_number,
-                    'boundary_score': boundary_score,
                     'length': len(consensus_seq),
                     'description': f"High-quality consensus from {copy_number} copies, quality={quality_score:.3f}"
                 })
                 
-                logger.debug(f"Included high-quality consensus {family_id}: "
-                           f"quality={quality_score:.3f}, copies={copy_number}, length={len(consensus_seq)}")
+                logger.debug(f"Included consensus {consensus_id}: "
+                           f"quality={quality_score:.3f}, copies={copy_number}, length={seq_length}")
             else:
-                logger.debug(f"Excluded family {family_id}: quality={quality_score:.3f}, copies={copy_number}")
+                logger.debug(f"Excluded consensus {consensus_id}: "
+                           f"quality={quality_score:.3f}, copies={copy_number}, length={seq_length} "
+                           f"(min_copies={self.min_consensus_copies}, min_quality={self.min_consensus_quality})")
         
         logger.info(f"Selected {len(high_quality_consensus)} high-quality consensus sequences")
         return high_quality_consensus
@@ -218,15 +259,15 @@ class GenomeMasker:
         return str(library_file)
     
     def _run_repeatmasker_soft_masking(self, genome_file: str, consensus_library: str) -> str:
-        """使用高质量consensus运行RepeatMasker软屏蔽"""
+        """使用高质量consensus运行RepeatMasker硬屏蔽"""
         output_dir = Path(self.config.output_dir)
-        soft_masked_file = output_dir / "genome_soft_masked.fa"
+        hard_masked_file = output_dir / "genome_hard_masked.fa"
         
-        # RepeatMasker软屏蔽参数
+        # RepeatMasker硬屏蔽参数
         cmd = [
             'RepeatMasker',
             '-lib', consensus_library,    # 使用自定义consensus库
-            '-xsmall',                    # 软屏蔽模式（小写字母）
+            # 移除 -xsmall 参数以启用硬屏蔽模式（N字符）
             '-nolow',                     # 不屏蔽低复杂度区域
             '-no_is',                     # 不搜索interspersed repeats
             '-norna',                     # 不搜索RNA genes
@@ -236,7 +277,7 @@ class GenomeMasker:
             genome_file
         ]
         
-        logger.info(f"Running RepeatMasker soft masking with command: {' '.join(cmd)}")
+        logger.info(f"Running RepeatMasker hard masking with command: {' '.join(cmd)}")
         
         try:
             result = subprocess.run(
@@ -252,15 +293,15 @@ class GenomeMasker:
                 logger.error(f"STDERR: {result.stderr}")
                 raise RuntimeError(f"RepeatMasker execution failed")
             
-            # RepeatMasker生成的文件名
-            genome_basename = Path(genome_file).stem
-            rm_output = output_dir / f"{genome_basename}.masked"
+            # RepeatMasker生成的文件名 (完整输入文件名 + .masked)
+            genome_filename = Path(genome_file).name
+            rm_output = output_dir / f"{genome_filename}.masked"
             
             if rm_output.exists():
                 # 重命名为标准名称
                 import shutil
-                shutil.move(str(rm_output), str(soft_masked_file))
-                logger.info(f"RepeatMasker soft masking completed: {soft_masked_file}")
+                shutil.move(str(rm_output), str(hard_masked_file))
+                logger.info(f"RepeatMasker hard masking completed: {hard_masked_file}")
             else:
                 raise RuntimeError(f"RepeatMasker output not found: {rm_output}")
             
@@ -271,21 +312,30 @@ class GenomeMasker:
             logger.error(f"RepeatMasker execution error: {e}")
             raise
         
-        return str(soft_masked_file)
+        return str(hard_masked_file)
     
-    def _analyze_masking_quality(self, original_genome: str, soft_masked_genome: str, 
+    def _analyze_masking_quality(self, original_genome: str, hard_masked_genome: str, 
                                 high_quality_consensus: List[Dict]) -> Dict:
-        """分析软屏蔽质量"""
-        logger.info("Analyzing soft masking quality...")
+        """分析硬屏蔽质量 - 使用RepeatMasker .tbl文件的准确统计"""
+        logger.info("Analyzing hard masking quality...")
         
-        # 计算屏蔽统计
-        original_stats = self._get_sequence_stats(original_genome)
-        masked_stats = self._get_sequence_stats(soft_masked_genome)
+        # 首先尝试从RepeatMasker .tbl文件读取准确的masking统计
+        rm_stats = self._parse_repeatmasker_tbl()
         
-        # 计算软屏蔽比例
-        masked_bases = masked_stats['lowercase_count']
-        total_bases = original_stats['total_bases']
-        masked_percent = (masked_bases / total_bases * 100) if total_bases > 0 else 0
+        if rm_stats:
+            # 使用RepeatMasker .tbl文件的准确统计
+            masked_bases = rm_stats['bases_masked']
+            total_bases = rm_stats['total_length']
+            masked_percent = rm_stats['masked_percent']
+            
+            logger.info(f"Using RepeatMasker .tbl statistics: {masked_percent:.2f}% masking")
+        else:
+            # 后备方案：手动计算（可能不准确）
+            logger.warning("RepeatMasker .tbl file not found, using manual calculation")
+            masked_stats = self._get_sequence_stats(hard_masked_genome)
+            masked_bases = masked_stats['n_count']
+            total_bases = masked_stats['total_bases']
+            masked_percent = (masked_bases / total_bases * 100) if total_bases > 0 else 0
         
         quality_stats = {
             'total_consensus_used': len(high_quality_consensus),
@@ -295,13 +345,103 @@ class GenomeMasker:
             'masked_bases': masked_bases,
             'total_bases': total_bases,
             'masked_percent': masked_percent,
-            'original_stats': original_stats,
-            'masked_stats': masked_stats
+            'repeatmasker_stats': rm_stats,
+            'stats_source': 'repeatmasker_tbl' if rm_stats else 'manual_calculation'
         }
         
-        logger.info(f"Soft masking quality: {masked_percent:.2f}% of genome masked using {len(high_quality_consensus)} consensus sequences")
+        logger.info(f"Hard masking quality: {masked_percent:.2f}% of genome masked using {len(high_quality_consensus)} consensus sequences")
+        if rm_stats:
+            logger.info(f"RepeatMasker statistics: {rm_stats['total_elements']} elements, {rm_stats['total_length']:,} bp genome")
         
         return quality_stats
+    
+    def _parse_repeatmasker_tbl(self) -> Dict:
+        """解析RepeatMasker .tbl文件获取准确的masking统计"""
+        # 查找RepeatMasker .tbl文件
+        output_dir = Path(self.config.output_dir)
+        possible_tbl_files = [
+            output_dir / f"{Path(self.renamed_genome_file).name}.tbl" if self.renamed_genome_file else None,
+            output_dir / "renamed_genome_merged_for_refiner.fa.tbl",
+            output_dir / "genome_hard_masked.fa.tbl",
+            # 在子目录中查找
+            output_dir / "genome_renaming" / "renamed_genome_merged_for_refiner.fa.tbl"
+        ]
+        
+        tbl_file = None
+        for possible_file in possible_tbl_files:
+            if possible_file and possible_file.exists():
+                tbl_file = possible_file
+                break
+        
+        if not tbl_file:
+            logger.warning("RepeatMasker .tbl file not found in expected locations")
+            return None
+        
+        logger.info(f"Parsing RepeatMasker statistics from: {tbl_file}")
+        
+        try:
+            with open(tbl_file, 'r') as f:
+                lines = f.readlines()
+            
+            stats = {}
+            
+            # 解析文件头信息
+            for line in lines[:10]:  # 前10行通常包含基本统计
+                line = line.strip()
+                
+                if line.startswith('file name:'):
+                    stats['file_name'] = line.split(':', 1)[1].strip()
+                elif line.startswith('sequences:'):
+                    stats['num_sequences'] = int(line.split()[1])
+                elif line.startswith('total length:'):
+                    # 格式: "total length:  838000000 bp  (759994272 bp excl N/X-runs)"
+                    parts = line.split()
+                    stats['total_length'] = int(parts[2])
+                elif line.startswith('bases masked:'):
+                    # 格式: "bases masked:  283523120 bp ( 33.83 %)"
+                    parts = line.split()
+                    stats['bases_masked'] = int(parts[2])
+                    # 提取百分比，格式可能是 "( 33.83 %)" 
+                    pct_str = line.split('(')[1].split('%')[0].strip()
+                    stats['masked_percent'] = float(pct_str)
+            
+            # 解析总的interspersed repeats统计
+            for line in lines:
+                if line.startswith('Total interspersed repeats:'):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        # 可能与bases masked不同，使用更准确的数字
+                        interspersed_masked = int(parts[3])
+                        if 'bases_masked' not in stats or interspersed_masked > 0:
+                            stats['bases_masked'] = interspersed_masked
+                    break
+            
+            # 统计分类的repeat数量
+            stats['total_elements'] = 0
+            for line in lines:
+                if line.startswith('Unclassified:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        stats['total_elements'] = int(parts[1])
+                    break
+            
+            # 验证必要字段
+            required_fields = ['total_length', 'bases_masked', 'masked_percent']
+            if not all(field in stats for field in required_fields):
+                logger.error(f"Failed to parse required fields from .tbl file: missing {[f for f in required_fields if f not in stats]}")
+                return None
+            
+            logger.info(f"RepeatMasker .tbl statistics:")
+            logger.info(f"  Genome length: {stats['total_length']:,} bp")
+            logger.info(f"  Bases masked: {stats['bases_masked']:,} bp")
+            logger.info(f"  Masked percent: {stats['masked_percent']:.2f}%")
+            logger.info(f"  Total elements: {stats.get('total_elements', 'unknown')}")
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Failed to parse RepeatMasker .tbl file {tbl_file}: {e}")
+            return None
     
     def _get_sequence_stats(self, fasta_file: str) -> Dict:
         """获取FASTA文件的序列统计信息"""
@@ -337,44 +477,58 @@ class GenomeMasker:
         
         return stats
     
-    def _calculate_final_stats(self, original_genome: str, soft_masked_genome: str,
+    def _calculate_final_stats(self, original_genome: str, hard_masked_genome: str,
                              masking_stats: Dict, consensus_list: List[Dict]) -> Dict:
         """计算最终统计信息"""
         
         stats = {
             'genome_size': masking_stats['total_bases'],
-            'soft_masked_bp': masking_stats['masked_bases'],
-            'soft_masked_percent': masking_stats['masked_percent'],
+            'hard_masked_bp': masking_stats['masked_bases'],
+            'hard_masked_percent': masking_stats['masked_percent'],
             'consensus_used': len(consensus_list),
             'avg_consensus_quality': masking_stats['avg_consensus_quality'],
             'avg_consensus_copies': masking_stats['avg_consensus_copies'],
             'avg_consensus_length': masking_stats['avg_consensus_length'],
-            'masking_method': 'soft_masking',
-            'masking_tool': 'RepeatMasker_with_consensus'
+            'masking_method': 'hard_masking',
+            'masking_tool': 'RepeatMasker_with_consensus',
+            'stats_source': masking_stats.get('stats_source', 'unknown'),
+            'repeatmasker_stats': masking_stats.get('repeatmasker_stats', None)
         }
         
         return stats
     
-    def _generate_output_files(self, soft_masked_genome: str, stats: Dict, consensus_library: str) -> Dict:
+    def _generate_output_files(self, hard_masked_genome: str, stats: Dict, consensus_library: str) -> Dict:
         """生成输出文件"""
         output_dir = Path(self.config.output_dir)
         
         # 创建最终输出文件（genome_final_masked.fa用于RECON）
         final_genome_file = output_dir / "genome_final_masked.fa"
         import shutil
-        shutil.copy2(soft_masked_genome, final_genome_file)
+        shutil.copy2(hard_masked_genome, final_genome_file)
         
         # 生成统计报告
         stats_file = output_dir / "phase4_masking_stats.txt"
         with open(stats_file, 'w') as f:
-            f.write("# Phase 4: High-Quality Consensus Soft Masking Statistics\n")
-            f.write(f"# Generated: {Path().absolute()}\n\n")
+            f.write("# Phase 4: High-Quality Consensus Hard Masking Statistics\n")
+            f.write(f"# Generated: {Path().absolute()}\n")
+            f.write(f"# Statistics source: {stats.get('stats_source', 'unknown')}\n\n")
             
             f.write("## Masking Overview\n")
             f.write(f"Genome size: {stats['genome_size']:,} bp\n")
-            f.write(f"Masked bases: {stats['soft_masked_bp']:,} bp\n")
-            f.write(f"Masked percentage: {stats['soft_masked_percent']:.2f}%\n")
+            f.write(f"Masked bases: {stats['hard_masked_bp']:,} bp\n")
+            f.write(f"Masked percentage: {stats['hard_masked_percent']:.2f}%\n")
             f.write(f"Masking method: {stats['masking_method']}\n\n")
+            
+            # 添加RepeatMasker原始统计信息
+            if stats.get('repeatmasker_stats'):
+                rm_stats = stats['repeatmasker_stats']
+                f.write("## RepeatMasker Original Statistics\n")
+                f.write(f"File analyzed: {rm_stats.get('file_name', 'unknown')}\n")
+                f.write(f"Total sequences: {rm_stats.get('num_sequences', 'unknown')}\n")
+                f.write(f"Total length: {rm_stats.get('total_length', 'unknown'):,} bp\n")
+                f.write(f"Bases masked: {rm_stats.get('bases_masked', 'unknown'):,} bp\n")
+                f.write(f"Masked percentage: {rm_stats.get('masked_percent', 'unknown'):.2f}%\n")
+                f.write(f"Total elements: {rm_stats.get('total_elements', 'unknown')}\n\n")
             
             f.write("## Consensus Library Used\n")
             f.write(f"Total consensus sequences: {stats['consensus_used']}\n")
@@ -383,12 +537,21 @@ class GenomeMasker:
             f.write(f"Average consensus length: {stats['avg_consensus_length']:.0f} bp\n\n")
             
             f.write("## Output Files\n")
-            f.write(f"Soft-masked genome: {soft_masked_genome}\n")
+            f.write(f"Hard-masked genome: {hard_masked_genome}\n")
             f.write(f"Final masked genome: {final_genome_file}\n")
-            f.write(f"Consensus library: {consensus_library}\n")
+            f.write(f"Consensus library: {consensus_library}\n\n")
+            
+            if stats.get('stats_source') == 'repeatmasker_tbl':
+                f.write("## Notes\n")
+                f.write("Statistics are based on RepeatMasker .tbl file analysis.\n")
+                f.write("This provides the most accurate masking statistics.\n")
+            else:
+                f.write("## Notes\n")
+                f.write("Statistics are based on manual sequence analysis.\n")
+                f.write("RepeatMasker .tbl file was not available for accurate statistics.\n")
         
         output_files = {
-            'soft_masked_genome': soft_masked_genome,
+            'hard_masked_genome': hard_masked_genome,
             'final_masked_genome': str(final_genome_file),
             'consensus_library': consensus_library,
             'stats_file': str(stats_file)
@@ -700,41 +863,152 @@ class GenomeMasker:
                               stats: Dict) -> Dict:
         """生成输出文件和报告"""
         output_files = {
-            'preliminary_masked': preliminary_masked,
-            'final_masked': final_masked,
+            'soft_masked_genome': preliminary_masked,  # 主要输出文件
+            'preliminary_masked': preliminary_masked,   # 兼容性
+            'final_masked': final_masked,               # 兼容性
             'stats_file': str(Path(self.config.output_dir) / 'masking_statistics.txt'),
             'summary_file': str(Path(self.config.output_dir) / 'masking_summary.txt')
         }
+        
+        # 调试：检查stats的类型
+        logger.debug(f"Stats type: {type(stats)}, content: {stats}")
         
         # 写统计文件
         with open(output_files['stats_file'], 'w') as f:
             f.write("Genome Masking Statistics\n")
             f.write("="*60 + "\n\n")
-            f.write(f"Genome size: {stats['genome_size']:,} bp\n")
-            f.write(f"Preliminary masked: {stats['preliminary_masked_bp']:,} bp ({stats['preliminary_masked_percent']:.2f}%)\n")
-            f.write(f"Final masked: {stats['final_masked_bp']:,} bp ({stats['final_masked_percent']:.2f}%)\n")
-            f.write(f"Additional masked: {stats['additional_masked_bp']:,} bp\n")
-            f.write("\nPer-chromosome statistics:\n")
-            f.write("-"*60 + "\n")
             
-            for chrom_id, chrom_stats in stats['chromosomes'].items():
-                f.write(f"{chrom_id}:\n")
-                f.write(f"  Size: {chrom_stats['size']:,} bp\n")
-                f.write(f"  Preliminary: {chrom_stats.get('preliminary_masked', 0):,} bp\n")
-                f.write(f"  Final: {chrom_stats.get('final_masked', 0):,} bp\n")
+            # 安全地访问字典
+            if isinstance(stats, dict):
+                f.write(f"Genome size: {stats.get('genome_size', 'N/A'):,} bp\n")
+            else:
+                f.write(f"Error: stats is not a dict, type: {type(stats)}\n")
+                return output_files
+            f.write(f"Soft masked: {stats['soft_masked_bp']:,} bp ({stats['soft_masked_percent']:.2f}%)\n")
+            f.write(f"Consensus used: {stats['consensus_used']}\n")
+            f.write(f"Average consensus quality: {stats.get('avg_consensus_quality', 'N/A')}\n")
+            f.write(f"Average consensus copies: {stats.get('avg_consensus_copies', 'N/A')}\n")
+            f.write(f"Average consensus length: {stats.get('avg_consensus_length', 'N/A')}\n")
+            f.write(f"Masking method: {stats.get('masking_method', 'soft_masking')}\n")
+            f.write(f"Masking tool: {stats.get('masking_tool', 'RepeatMasker')}\n")
         
         # 写摘要文件
         with open(output_files['summary_file'], 'w') as f:
             f.write("Phase 4: Genome Masking Summary\n")
             f.write("="*60 + "\n\n")
-            f.write("Two-step masking strategy:\n")
-            f.write("1. High-confidence RepeatMasker hits from Phase 1\n")
-            f.write("2. Final consensus sequences from Phase 3\n\n")
+            f.write("High-quality consensus soft masking strategy:\n")
+            f.write("- Uses high-quality consensus sequences from Phase 3\n")
+            f.write("- RepeatMasker soft masking with strict parameters\n\n")
             f.write(f"Results:\n")
-            f.write(f"- Total genome masked: {stats['final_masked_percent']:.2f}%\n")
-            f.write(f"- Low false positive rate achieved through strict thresholds\n")
-            f.write(f"- Low false negative rate through two-round masking\n")
+            f.write(f"- Total genome soft-masked: {stats['soft_masked_percent']:.2f}%\n")
+            f.write(f"- High-quality consensus sequences used: {stats['consensus_used']}\n")
+            f.write(f"- Balanced specificity and sensitivity achieved\n")
         
         logger.info(f"Output files written to {self.config.output_dir}")
         
         return output_files
+    
+    def _prepare_renamed_genome(self) -> Tuple[str, str]:
+        """
+        准备重命名的基因组文件以避免RepeatMasker ID问题
+        
+        Returns:
+            (重命名后的基因组文件路径, 映射文件路径)
+        """
+        logger.info("Preparing renamed genome to avoid RepeatMasker ID conflicts")
+        
+        # 创建基因组重命名器
+        work_dir = Path(self.config.output_dir) / "genome_renaming"
+        work_dir.mkdir(exist_ok=True)
+        
+        self.genome_renamer = GenomeRenamer(str(work_dir))
+        
+        # 执行重命名
+        self.renamed_genome_file, mapping_file = self.genome_renamer.rename_genome_for_repeatmasker(
+            self.config.genome_file
+        )
+        
+        # 记录统计信息
+        stats = self.genome_renamer.get_mapping_stats()
+        logger.info(f"Renamed {stats['total_sequences']} sequences")
+        logger.info(f"Original: {stats['original_genome']}")
+        logger.info(f"Renamed: {stats['renamed_genome']}")
+        logger.info(f"Mapping file: {mapping_file}")
+        
+        return self.renamed_genome_file, mapping_file
+    
+    def _restore_original_ids(self, output_files: Dict) -> Dict:
+        """
+        还原所有输出文件的ID到原始格式
+        
+        Args:
+            output_files: 原始输出文件字典
+            
+        Returns:
+            还原后的输出文件字典
+        """
+        logger.info("Restoring original sequence IDs in all output files")
+        
+        if not self.genome_renamer or not self.mapping_file:
+            logger.error("No genome renamer or mapping file available")
+            return output_files
+        
+        restored_files = {}
+        restored_dir = Path(self.config.output_dir) / "restored_output"
+        restored_dir.mkdir(exist_ok=True)
+        
+        # 需要还原ID的文件类型
+        files_to_restore = [
+            'soft_masked_genome',
+            'preliminary_masked', 
+            'final_masked'
+        ]
+        
+        for file_key in files_to_restore:
+            if file_key in output_files:
+                original_file = output_files[file_key]
+                if original_file and Path(original_file).exists():
+                    try:
+                        restored_file = restored_dir / f"restored_{Path(original_file).name}"
+                        
+                        # 还原ID
+                        final_restored = self.genome_renamer.restore_genome_ids(
+                            original_file, str(restored_file)
+                        )
+                        
+                        restored_files[file_key] = final_restored
+                        logger.info(f"Restored {file_key}: {Path(original_file).name} → {Path(final_restored).name}")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to restore {file_key}: {e}")
+                        restored_files[file_key] = original_file  # 使用原始文件
+                else:
+                    restored_files[file_key] = original_file
+            else:
+                if file_key in output_files:
+                    restored_files[file_key] = output_files[file_key]
+        
+        # 复制不需要还原的文件
+        for key, value in output_files.items():
+            if key not in restored_files:
+                restored_files[key] = value
+        
+        # 创建一个特殊的主输出文件链接
+        if 'soft_masked_genome' in restored_files:
+            main_output = Path(self.config.output_dir) / "genome_final_masked.fa"
+            main_restored = Path(restored_files['soft_masked_genome'])
+            
+            # 创建符号链接或复制文件
+            try:
+                if main_output.exists():
+                    main_output.unlink()
+                main_output.symlink_to(main_restored.resolve())
+                logger.info(f"Created main output link: {main_output} → {main_restored.name}")
+            except Exception:
+                # 如果符号链接失败，复制文件
+                import shutil
+                shutil.copy2(str(main_restored), str(main_output))
+                logger.info(f"Copied main output: {main_output}")
+        
+        logger.info(f"ID restoration completed. Restored files in: {restored_dir}")
+        return restored_files

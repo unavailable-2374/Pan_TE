@@ -29,12 +29,13 @@ class OptimizedTwoStageSamplingStrategy(TwoStageSamplingStrategy):
         self.extractor = None
         if hasattr(config, 'genome_file'):
             self.extractor = FastSequenceExtractor(config.genome_file)
+            # 注意：基因组文件已规范化为lcl|格式，无需ID映射
     
     def _extract_sequences_for_selected_hits(self, selected_hits: List[Dict], 
                                             seed_seq: Dict, config) -> List[Dict]:
         """
-        优化版：使用外部工具批量提取序列
-        替代原来的逐个BioPython提取
+        优化版：使用安全的序列提取器
+        同时处理ID映射和坐标不匹配问题
         """
         if not selected_hits:
             logger.warning("No hits provided for extraction")
@@ -44,68 +45,69 @@ class OptimizedTwoStageSamplingStrategy(TwoStageSamplingStrategy):
             logger.error("Config or genome_file is missing!")
             return []
         
-        logger.info(f"Starting optimized batch extraction for {len(selected_hits)} selected hits")
+        logger.info(f"Starting safe batch extraction for {len(selected_hits)} selected hits")
+        
+        # 使用安全序列提取器
+        from utils.safe_sequence_extractor import create_safe_extractor
+        extractor = create_safe_extractor(config.genome_file)
         
         # 准备批量提取的区域列表
         regions = []
-        valid_indices = []
-        
         for i, hit in enumerate(selected_hits):
             # 检查数据完整性
             required_fields = ['chrom', 'start', 'end']
             if all(field in hit and hit[field] is not None for field in required_fields):
-                # 添加flanking区域
-                flanking = 20
-                extract_start = max(0, hit['start'] - flanking)
-                extract_end = hit['end'] + flanking
-                
                 regions.append({
                     'chrom': hit['chrom'],
-                    'start': extract_start,
-                    'end': extract_end,
+                    'start': hit['start'], 
+                    'end': hit['end'],
                     'strand': hit.get('strand', '+'),
                     'original_hit': hit,
-                    'hit_index': i
+                    'hit_index': i,
+                    'identity': hit.get('identity', 100),
+                    'divergence': hit.get('divergence', 0)
                 })
-                valid_indices.append(i)
             else:
-                logger.warning(f"Hit {i} missing required fields")
+                logger.warning(f"Hit {i} missing required fields: {hit}")
         
         if not regions:
             logger.warning("No valid regions to extract")
             return []
         
-        # 批量提取序列
-        logger.info(f"Batch extracting {len(regions)} sequences")
+        # 批量安全提取序列（包含20bp flanking区域）
+        logger.info(f"Safe batch extracting {len(regions)} sequences")
+        extracted_results = extractor.extract_batch_safe(
+            regions, 
+            flanking=20, 
+            fallback_strategy='truncate'  # 截断超出范围的坐标
+        )
         
-        if self.extractor:
-            # 使用优化的批量提取
-            extracted = self.extractor.extract_batch(regions)
-        else:
-            # 降级到传统批量提取
-            extracted = extract_sequences_batch(config.genome_file, regions)
-        
-        logger.info(f"Successfully extracted {len(extracted)} sequences")
+        logger.info(f"Successfully extracted {len(extracted_results)} sequences")
         
         # 处理提取结果
         copies = []
-        for result in extracted:
+        for result in extracted_results:
             if not result.get('sequence'):
                 continue
             
             hit = result['original_hit']
             sequence = result['sequence']
             
-            # 计算实际的flanking长度
+            # 获取实际提取的坐标
             actual_start = result['start']
             actual_end = result['end']
-            left_flanking = hit['start'] - actual_start
-            right_flanking = actual_end - hit['end']
+            original_start = result['original_start']
+            original_end = result['original_end']
+            flanking = result.get('flanking', 20)
             
-            # 如果获取了flanking序列，提取核心序列和扩展序列
+            # 计算flanking区域
+            left_flanking = max(0, original_start - actual_start)
+            right_flanking = max(0, actual_end - original_end)
+            
+            # 提取核心序列
             if left_flanking > 0 or right_flanking > 0:
                 core_start = left_flanking
-                core_end = len(sequence) - right_flanking
+                core_end = len(sequence) - right_flanking if right_flanking > 0 else len(sequence)
                 core_sequence = sequence[core_start:core_end] if core_start < core_end else sequence
                 extended_sequence = sequence
             else:
@@ -124,23 +126,43 @@ class OptimizedTwoStageSamplingStrategy(TwoStageSamplingStrategy):
             copy_record = {
                 'sequence': core_sequence,
                 'extended_sequence': extended_sequence,
-                'chrom': hit['chrom'],
-                'start': hit['start'],
-                'end': hit['end'],
+                'chrom': result['original_chrom'],  # 保持原始ID用于记录
+                'mapped_chrom': result['chrom'],    # 实际映射的ID
+                'start': original_start,
+                'end': original_end,
+                'actual_start': actual_start,
+                'actual_end': actual_end,
                 'strand': hit.get('strand', '+'),
                 'length': len(core_sequence),
                 'identity': hit.get('identity', 100),
                 'divergence': hit.get('divergence', 0),
                 'has_tsd': tsd_info is not None,
                 'tsd': tsd_info,
-                'quality_score': self._calculate_copy_quality(hit, tsd_info is not None)
+                'quality_score': self._calculate_copy_quality(hit, tsd_info is not None),
+                'coordinate_issues': result.get('coordinate_issues', []),
+                'extraction_notes': self._format_extraction_notes(result)
             }
             
             copies.append(copy_record)
         
-        logger.info(f"Processed {len(copies)} valid copies from {len(regions)} extractions")
+        logger.info(f"Processed {len(copies)} valid copies from {len(extracted_results)} extractions")
         
         return copies
+    
+    def _format_extraction_notes(self, result: Dict) -> str:
+        """格式化序列提取的注释信息"""
+        notes = []
+        
+        if result.get('coordinate_issues'):
+            notes.extend(result['coordinate_issues'])
+        
+        if result.get('fallback_strategy'):
+            notes.append(f"Used fallback strategy: {result['fallback_strategy']}")
+        
+        if result['original_chrom'] != result['chrom']:
+            notes.append(f"ID mapped: {result['original_chrom']} -> {result['chrom']}")
+        
+        return '; '.join(notes) if notes else ''
     
     def _detect_tsd_from_flanking(self, left_flank: str, right_flank: str) -> Optional[Dict]:
         """检测目标位点重复（TSD）"""
