@@ -961,12 +961,18 @@ class GenomeMasker:
         files_to_restore = [
             'soft_masked_genome',
             'preliminary_masked', 
-            'final_masked'
+            'final_masked',
+            'hard_masked_genome',
+            'final_masked_genome'
         ]
         
         for file_key in files_to_restore:
             if file_key in output_files:
                 original_file = output_files[file_key]
+                # 确保original_file是字符串路径，不是字典
+                if isinstance(original_file, dict):
+                    logger.warning(f"Skipping {file_key}: value is a dict, not a file path")
+                    continue
                 if original_file and Path(original_file).exists():
                     try:
                         restored_file = restored_dir / f"restored_{Path(original_file).name}"

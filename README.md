@@ -11,18 +11,20 @@ Design for linear or graph genome TE detection and annotation
 
     cd Pan_TE
     chmod 750 bin/*
-    echo 'export PATH="/YOUR/PATH/TO/Pan_TE/bin:$PATH"' >> ~/.bashrc //* like: echo 'export PATH=/public/home/soft/Pan_TE/bin:$PATH' >> ~/.bashrc
+    echo 'export PATH=$HOME/tools/Pan_TE/bin:$PATH' >> ~/.bashrc
     mamba env create -f env/pgta.yml
-    echo 'export PERL5LIB=/home/tool/Pan_TE/share:/home/tool/miniconda3/envs/PGTA/share/RepeatMasker:$PERL5LIB"' >> ~/.bashrc
+    echo 'export PERL5LIB=$HOME/tools/Pan_TE/share:$HOME/tools/miniconda3/envs/PGTA/share/RepeatMasker:$PERL5LIB' >> ~/.bashrc
     conda activate PGTA
     cd submodule/ClassifyTE
     conda env create -f environment.yml
     cd submodule/LookLTRs
     mkdir bin
     cd bin
+    export CC=$HOME/tools/miniconda3/envs/PGTA/bin/x86_64-conda-linux-gnu-gcc
+    export CXX=$HOME/tools/miniconda3/envs/PGTA/bin/x86_64-conda-linux-gnu-c++
     cmake ..
     make look4ltrs
-    echo 'export PATH="/YOUR/PATH/TO/bin:$PATH"' >> ~/.bashrc //* like: echo 'export PATH=/public/home/soft/Pan_TE/submodule/Look4LTRs/bin:$PATH' >> ~/.bashrc
+    echo 'export PATH=$HOME/tools/Pan_TE/submodule/Look4LTRs/bin:$PATH' >> ~/.bashrc
 
 
 ### [ClassifyTE](https://github.com/manisa/ClassifyTE/tree/master) database download:
