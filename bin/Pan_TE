@@ -111,7 +111,7 @@ class PanTEPipeline:
         self.vcf_dir = os.path.abspath(vcf_dir) if vcf_dir else None
         self.output_dir = os.path.abspath(output_dir)
         self.threads = threads
-        self.model_dir = os.path.abspath(model_dir)
+        self.model_dir = os.path.abspath(model_dir) if model_dir else None
         self.processed_genome = os.path.join(self.output_dir, 'genome', 'genome.fa')
 
         # Verify inputs
@@ -180,7 +180,6 @@ class PanTEPipeline:
         directories = [
             self.output_dir,
             os.path.join(self.output_dir, 'genome'),
-            os.path.join(self.output_dir, 'Inpactor2'),
             os.path.join(self.output_dir, 'RepeatScout'),
             os.path.join(self.output_dir, 'RECON'),
             os.path.join(self.output_dir, 'Combine')
@@ -313,8 +312,6 @@ class PanTEPipeline:
             return
             
         logger.info(f"Starting LTR processing with {self.ltr_threads} threads")
-        ltr_dir = os.path.join(self.output_dir, 'Inpactor2')
-        os.makedirs(ltr_dir, exist_ok=True)
         
         # Use the processed genome file from genome directory
         genome_file = os.path.join(self.output_dir, 'genome', 'genome.fa')
@@ -326,8 +323,8 @@ class PanTEPipeline:
             self.run_cmd(f"samtools faidx {genome_file}")
         
         # Run LTR_detect with the processed genome file
-        cmd = f"LTR_detect {self.processed_genome} {self.ltr_threads} {self.output_dir}"
-        self.run_cmd(cmd, ltr_dir)
+        cmd = f"LTR_detect {genome_file} {self.ltr_threads} {self.output_dir}"
+        self.run_cmd(cmd)
         
         self.create_checkpoint('ltr')
         logger.info("LTR processing completed")
@@ -377,7 +374,7 @@ class PanTEPipeline:
         sample_size = os.path.getsize(masked_genome)
         logger.info(f"Using full masked genome (size: {sample_size:,} bp) for RECON")
         
-        cmd = f"run_RECON_advanced 1 {self.threads} {masked_genome} {sample_size}"
+        cmd = f"run_RECON_advanced {self.threads} {masked_genome} {sample_size}"
         self.run_cmd(cmd, recon_dir)
         
         self.create_checkpoint('recon')
@@ -389,15 +386,42 @@ class PanTEPipeline:
             return
             
         if not self.model_dir:
-            logger.warning("No model directory specified, skipping classification")
-            return
+            logger.warning("No model directory specified, skipping classification step")
+            # Continue with combination but skip classification
             
         logger.info("Starting results combination and classification")
         combine_dir = os.path.join(self.output_dir, 'Combine')
         
-        # Step 1: Combine raw results from all three sources
-        self.run_cmd("cat ../Inpactor2/consensi.fa ../RepeatScout/consensi.fa ../RECON/round-1/consensi.fa > raw_TEs_combined.fa",
-                    combine_dir)
+        # Step 1: Combine raw results from LTR, RepeatScout and RECON
+        # RepeatScout now uses Refiner output with high_quality_consensus.fasta
+        rs_consensus = "../RepeatScout/refiner_output/high_quality_consensus.fasta"
+        if not os.path.exists(os.path.join(combine_dir, rs_consensus)):
+            rs_consensus = "../RepeatScout/consensi.fa"  # fallback
+        
+        # Find all RECON consensi files from different tracks and rounds
+        recon_dir = os.path.join(self.output_dir, 'RECON')
+        recon_consensi = []
+        
+        # Check for masked track consensi
+        masked_track_consensi = os.path.join(recon_dir, 'masked_track', 'consensi.fa')
+        if os.path.exists(masked_track_consensi) and os.path.getsize(masked_track_consensi) > 0:
+            recon_consensi.append("../RECON/masked_track/consensi.fa")
+        
+        # Check for sampling track rounds
+        sampling_track_dir = os.path.join(recon_dir, 'sampling_track')
+        if os.path.isdir(sampling_track_dir):
+            for round_dir in sorted(os.listdir(sampling_track_dir)):
+                if round_dir.startswith('round_'):
+                    round_consensi = os.path.join(sampling_track_dir, round_dir, 'consensi.fa')
+                    if os.path.exists(round_consensi) and os.path.getsize(round_consensi) > 0:
+                        recon_consensi.append(f"../RECON/sampling_track/{round_dir}/consensi.fa")
+        
+        # Build the cat command with all available consensi files
+        input_files = ["../Look4LTRs/consensi.fa", rs_consensus] + recon_consensi
+        cat_cmd = f"cat {' '.join(input_files)} > raw_TEs_combined.fa"
+        
+        logger.info(f"Combining consensus libraries from {len(input_files)} sources: LTR, RepeatScout, and {len(recon_consensi)} RECON rounds")
+        self.run_cmd(cat_cmd, combine_dir)
         
         # Step 2: TE-optimized deduplication using CD-HIT-EST
         logger.info("Removing redundant TEs with TE-optimized parameters...")
@@ -438,8 +462,11 @@ class PanTEPipeline:
         logger.info(f"Deduplication: {raw_count} -> {final_count} sequences "
                    f"({raw_count - final_count} duplicates removed)")
         
-        # Step 3: Run classifier on deduplicated TEs
-        self.run_cmd(f"run_Classifier {self.model_dir}", combine_dir)
+        # Step 3: Run classifier on deduplicated TEs (if model directory available)
+        if self.model_dir:
+            self.run_cmd(f"run_Classifier {self.model_dir}", combine_dir)
+        else:
+            logger.info("Skipping classification step (no model directory specified)")
         
         self.create_checkpoint('combine')
         logger.info("Results combination completed")

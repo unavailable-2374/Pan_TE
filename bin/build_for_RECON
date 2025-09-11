@@ -96,8 +96,10 @@ sub process_families {
     $fh_idx->autoflush(0);
     
     # Initialize DB once for all operations
+    # RECON creates tmp.fa, not DB.fa
+    my $db_file = -f "$workDir/tmp.fa" ? "$workDir/tmp.fa" : "$workDir/DB.fa";
     my $batchDB = FastaDB->new(
-        fileName => "$workDir/DB.fa",
+        fileName => $db_file,
         openMode => SeqDBI::ReadOnly
     );
 

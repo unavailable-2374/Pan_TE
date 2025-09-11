@@ -214,24 +214,23 @@ def run_build_ltr_consensus(rtr_dirs, chunk_files, original_genome, threads, out
         fasta_input = original_genome
         print(f"Using original genome {fasta_input} for consensus building")
     
-    # Run build_ltr_consensus.py
+    # Run build_ltr_consensus (simplified version)
     consensus_cmd = [
         "build_ltr_consensus.py",
-        "-r", rtr_input,
+        "--rtr", rtr_input,
         "--fasta", fasta_input,  # Use chunk files, not original genome
-        "--use-nesting",
-        "--threads", str(threads),
-        "--processes", str(max(1, threads // 2))
+        "--outdir", output_dir,
+        "--threads", str(threads)
     ]
     
-    print(f"Running build_ltr_consensus.py")
+    print(f"Running build_ltr_consensus (simplified version)")
     print(f"Command: {' '.join(consensus_cmd)}")
     
     try:
-        subprocess.run(consensus_cmd, check=True, cwd=output_dir)
-        print("build_ltr_consensus.py completed successfully")
+        subprocess.run(consensus_cmd, check=True)
+        print("Build_ltr_consensus completed successfully")
     except subprocess.CalledProcessError as e:
-        print(f"build_ltr_consensus.py failed: {e}")
+        print(f"Build_ltr_consensus failed: {e}")
         raise
 
 def main():
@@ -375,22 +374,26 @@ def main():
     
     print(f"Successfully completed {len(result_dirs)} Look4LTRs runs")
     
-    # Run build_ltr_consensus.py serially to combine results
+    # Create Look4LTRs directory for consensus building
+    look4ltrs_dir = os.path.join(output_dir, "Look4LTRs")
+    os.makedirs(look4ltrs_dir, exist_ok=True)
+    
+    # Run build_ltr_consensus.py serially to combine results in Look4LTRs directory
     try:
-        run_build_ltr_consensus(result_dirs, chunk_files, fasta_file, threads, output_dir)
+        run_build_ltr_consensus(result_dirs, chunk_files, fasta_file, threads, look4ltrs_dir)
     except Exception as e:
         print(f"Error in consensus building: {e}")
         sys.exit(1)
     
     # Check build_ltr_consensus.py output files
-    ltr_consensus_file = os.path.join(output_dir, "LTR_consensus.fasta")
+    ltr_consensus_file = os.path.join(look4ltrs_dir, "LTR_consensus.fasta")
     if not os.path.exists(ltr_consensus_file):
         print("Error: LTR_consensus.fasta not found after consensus building")
         sys.exit(1)
     
     # Use LTR_consensus.fasta as input for LTR_Boundary_Optimizer
     # Process output file (remove Ns and create LTR.fa)
-    ltr_file = os.path.join(output_dir, "LTR.fa")
+    ltr_file = os.path.join(look4ltrs_dir, "LTR.fa")
     try:
         subprocess.run(f"sed 's:N::g' {ltr_consensus_file} > {ltr_file}", 
                       shell=True, check=True)
@@ -403,8 +406,8 @@ def main():
         sys.exit(1)
     
     # Run LTR_Boundary_Optimizer
-    genome_file_path = os.path.join(os.path.dirname(output_dir), "genome", "genome.fa")
-    optimizer_output_dir = os.path.join(output_dir, "output_dir")
+    genome_file_path = os.path.join(output_dir, "genome", "genome.fa")
+    optimizer_output_dir = os.path.join(look4ltrs_dir, "output_dir")
     os.makedirs(optimizer_output_dir, exist_ok=True)
     
     optimizer_cmd = [
@@ -429,9 +432,9 @@ def main():
         print(f"Error running LTR_Boundary_Optimizer: {e}")
         sys.exit(1)
     
-    # Copy final results
+    # Copy final results to Look4LTRs directory
     optimized_consensus = os.path.join(optimizer_output_dir, "optimized_consensus.fa")
-    final_consensus = os.path.join(output_dir, "consensi.fa")
+    final_consensus = os.path.join(look4ltrs_dir, "consensi.fa")
     
     if os.path.exists(optimized_consensus):
         shutil.copy2(optimized_consensus, final_consensus)
