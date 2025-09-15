@@ -1,0 +1,73 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use RECON::Core;
+use RECON::Logger;
+
+# Initialize logger
+init_logger();
+
+my $action = shift @ARGV;
+
+unless ($action) {
+    print "Usage: recon_checkpoint_manager <action> [checkpoint_name]\n";
+    print "Actions:\n";
+    print "  list        - List all checkpoints\n";
+    print "  remove <name> - Remove specific checkpoint (e.g., famdef.ok)\n";
+    print "  remove_all  - Remove all RECON checkpoints\n";
+    print "  cleanup     - Cleanup intermediate files if consensi.fa exists\n";
+    print "  cleanup_force - Force cleanup intermediate files\n";
+    exit 1;
+}
+
+my @checkpoint_names = ("imagespread.ok", "eledef.ok", "eleredef.ok", "edgeredef.ok", "famdef.ok");
+my @step_names = ("Image spreading", "Element definition", "Element redefinition", "Edge redefinition", "Family definition");
+
+if ($action eq "list") {
+    print "RECON Checkpoint Status:\n";
+    print "=" x 50 . "\n";
+    
+    for my $i (0..$#checkpoint_names) {
+        my $checkpoint = $checkpoint_names[$i];
+        my $step = $step_names[$i];
+        my $status = check_checkpoint($checkpoint) ? "COMPLETED" : "PENDING";
+        printf "%-25s %-15s %s\n", $step, "($checkpoint)", $status;
+    }
+    
+} elsif ($action eq "remove") {
+    my $checkpoint = shift @ARGV;
+    unless ($checkpoint) {
+        print "Error: Please specify checkpoint name to remove\n";
+        print "Available checkpoints: " . join(", ", @checkpoint_names) . "\n";
+        exit 1;
+    }
+    
+    if (remove_checkpoint($checkpoint)) {
+        print "Checkpoint '$checkpoint' removed successfully\n";
+    } else {
+        print "Checkpoint '$checkpoint' not found\n";
+    }
+    
+} elsif ($action eq "remove_all") {
+    my $count = remove_all_checkpoints();
+    print "Removed $count checkpoint files\n";
+    
+} elsif ($action eq "cleanup") {
+    my $count = cleanup_intermediate_files();
+    if ($count > 0) {
+        print "Cleaned up $count intermediate directories\n";
+    } else {
+        print "No cleanup performed (consensi.fa not found or RECON_DEBUG set)\n";
+    }
+    
+} elsif ($action eq "cleanup_force") {
+    my $count = cleanup_intermediate_files(1);  # force=1
+    print "Force cleaned up $count intermediate directories\n";
+    
+} else {
+    print "Unknown action: $action\n";
+    exit 1;
+}

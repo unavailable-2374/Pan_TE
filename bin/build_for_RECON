@@ -1,60 +1,86 @@
 #!/usr/bin/env perl
 use strict;
+use warnings;
 use FindBin;
-use lib $FindBin::RealBin;
-use POSIX qw(:sys_wait_h ceil floor);
-use File::Spec;
-use File::Path qw(make_path);
 use File::Basename;
 use Parallel::ForkManager;
-use IO::Handle;  # For buffering optimization
 
-use RepModelConfig;
-use lib $RepModelConfig::configuration->{'REPEATMASKER_DIR'}->{'value'};
-use SeedAlignment;
-use SeedAlignmentCollection;
-use SearchResult;
-use SearchResultCollection;
-use NCBIBlastSearchEngine;
-use SeqDBI;
-use FastaDB;
+# Simple version of build_for_RECON that avoids RepeatModeler dependencies
+# Focus on core functionality
 
 our %families = ();
-our $familySizeCutoff = 15;
-our $DEBUG = 0;
+# Enhanced thresholds for higher quality consensus
+our $familySizeCutoff = 15;          # Process families with 15 or more elements  
+our $minConsensusLength = 80;        # Minimum consensus sequence length (reduced from 100)
+our $minRefinerScore = 150;          # Restored original score threshold
+our $minAlignmentSize = 5;           # Reduced minimum alignment size (from 8 to 5)
+our $maxLowComplexity = 0.7;         # Slightly more permissive for low complexity
+our $DEBUG = 0;  # Disable debug for production
 
 die "Usage: $0 workDir genomeDB total_threads\n" unless @ARGV == 3;
 my ($workDir, $genomeDB, $threads) = @ARGV;
 
-# Pre-calculate constants
-my $max_parallel = int($threads / 4);  # 4 threads per Refiner process
-$max_parallel = 1 if $max_parallel < 1;
+# Production version - minimal output
 
-# Initialize file handles with large buffers for better IO performance
-my $buffer_size = 1024 * 1024;  # 1MB buffer
-$| = 1;  # Disable output buffering for STDOUT
+# Load sequences into memory for faster access
+my %sequences = load_fasta_sequences($genomeDB);
+print "Loaded " . scalar(keys %sequences) . " sequences from genome database\n";
 
-# Process RECON output with optimized IO
+# Process RECON output
 %families = process_recon_output($workDir);
 my $family_count = scalar(keys(%families));
 print "Number of families returned by RECON: $family_count\n";
 print "Processing families with greater than $familySizeCutoff elements\n";
 
-# Process families in parallel batches
-my %refinableFamilies = process_families(\%families, $workDir);
+# Process families and create family files
+my %refinableFamilies = process_families(\%families, \%sequences, $workDir);
+print "Created " . scalar(keys %refinableFamilies) . " refinable families\n";
 
-# Setup parallel processing
-my $pm = Parallel::ForkManager->new($max_parallel);
-$pm->set_waitpid_blocking_sleep(0);  # Non-blocking wait
+# Run Refiner on each family
+run_parallel_refiners(\%refinableFamilies, $workDir, $threads);
 
-# Process refinement in parallel
-run_parallel_refiners(\%refinableFamilies, $workDir, $genomeDB, $threads, $pm);
-
-# Final processing
+# Combine refined results
 process_refined_families(\%families, \%refinableFamilies, $workDir);
 
-undef %families;
-undef %refinableFamilies;
+print "=== Processing completed ===\n";
+
+sub load_fasta_sequences {
+    my $fasta_file = shift;
+    my %seqs;
+    
+    print "Loading sequences from $fasta_file...\n";
+    
+    open my $fh, '<', $fasta_file or die "Cannot open $fasta_file: $!";
+    
+    my $current_id;
+    my $current_seq = '';
+    
+    while (<$fh>) {
+        chomp;
+        if (/^>(.+)/) {
+            # Save previous sequence
+            if ($current_id) {
+                $seqs{$current_id} = $current_seq;
+            }
+            # Start new sequence - extract just the ID part (before first space)
+            my $full_header = $1;
+            # Extract the first part (e.g., "gi|1" from "gi|1 unmasked_region_1 from_chr25:2883748-3383748")
+            my ($seq_id) = split /\s+/, $full_header, 2;
+            $current_id = $seq_id;
+            $current_seq = '';
+        } else {
+            $current_seq .= $_;
+        }
+    }
+    
+    # Save last sequence
+    if ($current_id) {
+        $seqs{$current_id} = $current_seq;
+    }
+    
+    close $fh;
+    return %seqs;
+}
 
 sub process_recon_output {
     my $workDir = shift;
@@ -63,206 +89,335 @@ sub process_recon_output {
     my $eles_file = "$workDir/summary/eles";
     die "Error: Recon failed to produce the summary/eles file!\n" unless -f $eles_file;
     
-    # Use large buffer for file reading
+    print "Processing $eles_file...\n";
+    
     open my $fh, '<', $eles_file or die "Cannot open eles file: $!";
-    $fh->blocking(0);
+    my $line_count = 0;
+    
     while (<$fh>) {
-        next if /^#/;
-        if (/^\s+\d+\s+/) {
-            my @fields = split;
-            next if $fields[4] < 0 || $fields[5] < 0;
-            $families{$fields[0]}->{elements} ||= [];
-            push @{$families{$fields[0]}->{elements}}, {
-                seqName   => $fields[3],
-                elementID => $fields[1],
-                orient    => $fields[2],
-                start     => $fields[4],
-                end       => $fields[5]
-            };
+        chomp;
+        $line_count++;
+        
+        # Skip header and empty lines
+        next if /^#/ || /^\s*$/;
+        
+        # Parse: fam ele dir sequence start end (note: first field is empty due to leading spaces)
+        my @fields = split /\s+/;
+        next unless @fields >= 7;  # Need 7 fields because first is empty
+        
+        # Skip the leading empty field due to formatting
+        my ($empty, $fam_id, $ele_id, $orient, $seq_name, $start, $end) = @fields;
+        
+        # Skip invalid coordinates
+        next if $start < 0 || $end < 0 || $end <= $start;
+        
+        # Debug first few entries
+        if ($line_count <= 10 && $DEBUG) {
+            print "DEBUG: Line $line_count: fam=$fam_id, ele=$ele_id, seq=$seq_name, start=$start, end=$end\n";
         }
+        
+        # Store family element
+        $families{$fam_id}->{elements} ||= [];
+        push @{$families{$fam_id}->{elements}}, {
+            seqName   => $seq_name,
+            elementID => $ele_id,
+            orient    => $orient,
+            start     => $start,
+            end       => $end
+        };
     }
     close $fh;
+    
+    print "Processed $line_count lines from eles file\n";
     return %families;
 }
 
 sub process_families {
-    my ($families_ref, $workDir) = @_;
+    my ($families_ref, $sequences_ref, $workDir) = @_;
     my %refinableFamilies;
-
-    # Open output files with large buffers
-    open my $fh_cons, '>', "$workDir/consensi.fa" or die $!;
-    open my $fh_idx, '>', "$workDir/index.html" or die $!;
-    $fh_cons->autoflush(0);
-    $fh_idx->autoflush(0);
     
-    # Initialize DB once for all operations
-    # RECON creates tmp.fa, not DB.fa
-    my $db_file = -f "$workDir/tmp.fa" ? "$workDir/tmp.fa" : "$workDir/DB.fa";
-    my $batchDB = FastaDB->new(
-        fileName => $db_file,
-        openMode => SeqDBI::ReadOnly
-    );
-
-    # Pre-sort families by size
+    # Open consensus output file
+    open my $fh_cons, '>', "$workDir/consensi.fa" or die "Cannot create consensi.fa: $!";
+    
+    # Process families sorted by size
     my @sortedKeys = sort {
         @{$families_ref->{$b}->{elements}} <=> @{$families_ref->{$a}->{elements}}
     } keys %$families_ref;
-
+    
+    my $processed_count = 0;
+    my $max_families_to_process = $DEBUG ? 5 : 999999;  # Limit for debugging
+    
     foreach my $familyID (@sortedKeys) {
-        last if @{$families_ref->{$familyID}->{elements}} < $familySizeCutoff;
+        my $element_count = @{$families_ref->{$familyID}->{elements}};
         
-        process_single_family($familyID, $families_ref, $batchDB, $workDir);
-        $refinableFamilies{$familyID}++;
+        # Skip small families with enhanced threshold
+        last if $element_count < $familySizeCutoff;
+        
+        # Stop after processing max families in debug mode
+        last if $processed_count >= $max_families_to_process;
+        
+        $processed_count++;
+        if ($DEBUG && $processed_count <= 5) {
+            print "Processing family $familyID with $element_count elements\n";
+        }
+        
+        # Create family file
+        my $success = process_single_family($familyID, $families_ref, $sequences_ref, $workDir);
+        
+        if ($success) {
+            $refinableFamilies{$familyID}++;
+        }
     }
-
-    # Flush and close files
+    
     close $fh_cons;
-    close $fh_idx;
-    undef $batchDB;
-
+    print "Processed $processed_count families for refinement\n";
     return %refinableFamilies;
 }
 
 sub process_single_family {
-    my ($familyID, $families_ref, $batchDB, $workDir) = @_;
+    my ($familyID, $families_ref, $sequences_ref, $workDir) = @_;
     
-    open my $fh_fam, '>:raw', "$workDir/family-$familyID.fa" 
-        or die "Cannot open family-$familyID.fa: $!";
+    my $family_file = "$workDir/family-$familyID.fa";
+    open my $fh_fam, '>', $family_file or die "Cannot create $family_file: $!";
     
     my $elementsRef = $families_ref->{$familyID}->{elements};
     my $giID = 1;
-
-    # Pre-sort elements
+    my $written_count = 0;
+    
+    # Sort elements by size (largest first)
     my @sorted_elements = sort {
         ($b->{end} - $b->{start}) <=> ($a->{end} - $a->{start})
     } @$elementsRef;
-
+    
     foreach my $elementRef (@sorted_elements) {
         my $seqName = $elementRef->{seqName};
-        my $seqDesc = $batchDB->getDescription($seqName);
+        my $startOffset = $elementRef->{start};  # 1-based
+        my $endOffset = $elementRef->{end};      # 1-based
         
-        # Debug: print what we got
-        if ($DEBUG) {
-            print STDERR "DEBUG: seqName=$seqName, seqDesc=$seqDesc\n";
+        # Find sequence in our hash
+        if (!exists $sequences_ref->{$seqName}) {
+            if ($DEBUG && $written_count < 3) {
+                print "WARNING: Sequence $seqName not found in database\n";
+            }
+            next;
         }
         
-        # Parse both old format (chr:start-end) and new format (chr_start_end)
-        my ($genomicSeqID, $genomicStartPos, $genomicEndPos);
-        my $is_new_format = 0;
+        my $full_sequence = $sequences_ref->{$seqName};
+        my $seq_length = length($full_sequence);
         
-        # The description might include "gi|" prefix, remove it if present
-        $seqDesc =~ s/^gi\|//;
-        
-        if ($seqDesc =~ /(\S+):(\d+)-(\d+)/) {
-            # Old format: chr:start-end (0-based coordinates)
-            ($genomicSeqID, $genomicStartPos, $genomicEndPos) = ($1, $2, $3);
-        } elsif ($seqDesc =~ /^(\w+)_(\d+)_(\d+)/) {
-            # New format: chr_start_end (1-based genomic coordinates)
-            ($genomicSeqID, $genomicStartPos, $genomicEndPos) = ($1, $2, $3);
-            $is_new_format = 1;
-        } else {
-            print STDERR "WARNING: Cannot parse description for $seqName: $seqDesc\n" if $DEBUG;
-            next;  # Skip if format doesn't match
-        }
-
-        my $startOffset = $elementRef->{start};  # 1-based offset within the sequence
-        my $endOffset = $elementRef->{end};      # 1-based offset within the sequence
-        
-        next if $endOffset > $batchDB->getSeqLength($seqName);
-        
-        my $sequence = $batchDB->getSubstr($seqName, $startOffset, $endOffset - $startOffset);
-        
-        # Calculate actual genomic coordinates
-        my ($actualStart, $actualEnd);
-        if ($is_new_format) {
-            # For new format, genomicStartPos is already 1-based genomic coordinate
-            # startOffset is 1-based offset, so actual position is: genomicStartPos + startOffset - 1
-            $actualStart = $genomicStartPos + $startOffset - 1;
-            $actualEnd = $genomicStartPos + $endOffset - 1;
-        } else {
-            # For old format, keep original logic
-            $actualStart = $startOffset + $genomicStartPos;
-            $actualEnd = $endOffset + $genomicStartPos;
+        # Check bounds
+        if ($endOffset > $seq_length || $startOffset < 1) {
+            if ($DEBUG && $written_count < 3) {
+                print "WARNING: Coordinates out of bounds for $seqName: $startOffset-$endOffset (length: $seq_length)\n";
+            }
+            next;
         }
         
+        # Extract subsequence (convert to 0-based for substr)
+        my $extract_length = $endOffset - $startOffset + 1;
+        my $sequence = substr($full_sequence, $startOffset - 1, $extract_length);
+        
+        # Handle reverse orientation
         if ($elementRef->{orient} ne "1") {
             $sequence = reverse($sequence);
             $sequence =~ tr/ACGTYRMKHBVD/TGCARYKMDVBH/;
-            # Swap coordinates for reverse strand
-            my $tmp = $actualStart;
-            $actualStart = $actualEnd;
-            $actualEnd = $tmp;
         }
-
-        $elementRef->{sequence} = $sequence;
-        print $fh_fam ">gi|$giID $genomicSeqID:" 
-            . $actualStart . "-"
-            . $actualEnd
-            . " element-" 
-            . $elementRef->{elementID} . "\n$sequence\n";
+        
+        # Write to family file
+        print $fh_fam ">gi|$giID $seqName:$startOffset-$endOffset element-$elementRef->{elementID}\n";
+        print $fh_fam "$sequence\n";
         $giID++;
+        $written_count++;
+        
+        # Debug first few sequences
+        if ($DEBUG && $written_count <= 2) {
+            print "DEBUG: Wrote sequence $written_count for family $familyID: $seqName:$startOffset-$endOffset (length: " . length($sequence) . ")\n";
+        }
     }
+    
     close $fh_fam;
+    
+    if ($written_count > 0) {
+        print "Created family-$familyID.fa with $written_count sequences\n" if $DEBUG;
+        return 1;
+    } else {
+        print "WARNING: No sequences written for family $familyID\n";
+        unlink $family_file;  # Remove empty file
+        return 0;
+    }
 }
 
 sub run_parallel_refiners {
-    my ($refinableFamilies_ref, $workDir, $genomeDB, $threads,  $pm) = @_;
+    my ($refinableFamilies_ref, $workDir, $threads) = @_;
     
+    # More flexible thread allocation for better parallelization
+    my $max_parallel;
+    if ($threads <= 4) {
+        $max_parallel = 1;  # Single process for small thread counts
+    } elsif ($threads <= 8) {
+        $max_parallel = 2;  # 2 processes, ~2-4 threads each
+    } elsif ($threads <= 16) {
+        $max_parallel = 4;  # 4 processes, ~2-4 threads each
+    } else {
+        $max_parallel = int($threads / 4);  # 4 threads per process for large counts
+    }
+    
+    print "Running Refiner on " . scalar(keys %$refinableFamilies_ref) . " families with max $max_parallel parallel jobs\n";
+    
+    my $pm = Parallel::ForkManager->new($max_parallel);
+    
+    my $processed = 0;
     foreach my $familyID (keys %$refinableFamilies_ref) {
         $pm->start and next;
         
+        $processed++;
         my $instancesFile = "family-$familyID.fa";
-        my $cmd = "$FindBin::RealBin/Refiner.py"
-                . " $instancesFile "
-		        . $instancesFile .".refiner_cons"
-		        . " -t 4"
-                . " --min-score 150"
-                . " --gap-init 20"
-                . " --gap-ext 5 2> refine.log";
-        system($cmd);
+        my $output_file = "$instancesFile.refiner_cons";
+        
+        # Run Refiner with enhanced parameters for higher quality
+        my $cmd = "$FindBin::RealBin/Refiner.py $instancesFile $output_file -t 4 --min-score $minRefinerScore --gap-init 25 --gap-ext 8 2> refine_$familyID.log";
+        
+        if ($DEBUG && $processed <= 3) {
+            print "Running: $cmd\n";
+        }
+        
+        my $result = system($cmd);
+        
+        if ($result != 0 && $DEBUG) {
+            print "WARNING: Refiner failed for family $familyID (exit code: $result)\n";
+        }
+        
         $pm->finish;
     }
     
     $pm->wait_all_children;
+    print "Completed Refiner processing\n";
 }
 
 sub process_refined_families {
     my ($families_ref, $refinableFamilies_ref, $workDir) = @_;
     
-    open my $fh_cons, '>>', "$workDir/consensi.fa" or die $!;
-    $fh_cons->autoflush(0);
-
+    open my $fh_cons, '>>', "$workDir/consensi.fa" or die "Cannot append to consensi.fa: $!";
+    
+    my $consensus_count = 0;
+    my $filtered_stats = {
+        total_processed => 0,
+        filtered_length => 0,
+        filtered_alignment => 0, 
+        filtered_complexity => 0,
+        passed_filters => 0
+    };
+    
     foreach my $familyID (keys %$refinableFamilies_ref) {
         my $refiner_cons = "$workDir/family-$familyID.fa.refiner_cons";
-        next unless -s $refiner_cons;
-
+        
+        next unless -s $refiner_cons;  # Skip empty files
+        
         open my $fh_in, '<', $refiner_cons or next;
         my ($cons, $maSize) = ('', 1);
         my $in_sequence = 0;
+        
         while (<$fh_in>) {
-            # Check for consensus copy number in the description line
-            if (/^>.*consensus from (\d+) copies/) {
+            if (/^>.*consensus from (\d+) copies, method=(\w+)/) {
+                $maSize = $1;
+                my $method = $2;
+                $in_sequence = 1;
+                # Enhanced Refiner provides method information
+                if ($DEBUG && $consensus_count < 3) {
+                    print "Family $familyID: consensus built using method '$method' from $maSize copies\n";
+                }
+                next;
+            } elsif (/^>.*consensus from (\d+) copies/) {
                 $maSize = $1;
                 $in_sequence = 1;
+                next;
             } elsif (/^>/) {
-                # Another sequence header, keep default maSize
                 $in_sequence = 1;
-            } elsif ($in_sequence) {
-                # Sequence data
+                next;
+            } elsif ($in_sequence && !/^>/) {
+                chomp;
                 $cons .= $_;
             }
         }
         close $fh_in;
-
-        next unless $cons;
-
+        
+        next unless $cons;  # Skip if no consensus sequence
+        
+        $filtered_stats->{total_processed}++;
+        
+        # Apply quality filters with statistics
+        if (length($cons) < $minConsensusLength) {
+            $filtered_stats->{filtered_length}++;
+            next;
+        }
+        
+        if ($maSize < $minAlignmentSize) {
+            $filtered_stats->{filtered_alignment}++;
+            next;
+        }
+        
+        # Check for low complexity sequences
+        my $low_complexity_ratio = calculate_low_complexity($cons);
+        if ($low_complexity_ratio > $maxLowComplexity) {
+            $filtered_stats->{filtered_complexity}++;
+            next;
+        }
+        
+        $filtered_stats->{passed_filters}++;
+        
+        # Store in families hash
         $families_ref->{$familyID}->{consensus} = $cons;
         $families_ref->{$familyID}->{finalElementCount} = $maSize;
-
-        print $fh_cons ">family-$familyID (Recon Family Size = "
-            . (@{$families_ref->{$familyID}->{elements}} + 1)
-            . ", Final Multiple Alignment Size = $maSize)\n$cons\n";
+        
+        # Write to consensus file
+        my $original_count = @{$families_ref->{$familyID}->{elements}};
+        print $fh_cons ">family-$familyID (Recon Family Size = $original_count, Final Multiple Alignment Size = $maSize)\n";
+        print $fh_cons "$cons\n";
+        
+        $consensus_count++;
+        
+        if ($DEBUG && $consensus_count <= 3) {
+            print "Added consensus for family $familyID: " . length($cons) . " bp from $maSize copies\n";
+        }
     }
+    
     close $fh_cons;
+    print "Generated $consensus_count consensus sequences in consensi.fa\n";
+    
+    # Print filtering statistics
+    print "=== Quality Filtering Results ===\n";
+    print "Total families processed: $filtered_stats->{total_processed}\n";
+    print "Filtered by length (<${minConsensusLength}bp): $filtered_stats->{filtered_length}\n";
+    print "Filtered by alignment size (<${minAlignmentSize}): $filtered_stats->{filtered_alignment}\n";
+    print "Filtered by low complexity (>${maxLowComplexity}): $filtered_stats->{filtered_complexity}\n";
+    print "Passed all filters: $filtered_stats->{passed_filters}\n";
+    my $filter_rate = $filtered_stats->{total_processed} > 0 ? 
+                     (1 - $filtered_stats->{passed_filters} / $filtered_stats->{total_processed}) * 100 : 0;
+    printf "Overall filtering rate: %.1f%%\n", $filter_rate;
 }
 
+sub calculate_low_complexity {
+    my $sequence = shift;
+    my $seq_length = length($sequence);
+    return 1.0 if $seq_length == 0;
+    
+    # Count mono-nucleotide runs and simple repeats
+    my $low_complexity_bases = 0;
+    
+    # Count mono-nucleotide runs (3+ consecutive identical bases)
+    while ($sequence =~ /([ATGCN])\1{2,}/gi) {
+        $low_complexity_bases += length($&);
+    }
+    
+    # Count simple dinucleotide repeats (6+ bases of pattern)
+    while ($sequence =~ /([ATGCN]{2})\1{2,}/gi) {
+        $low_complexity_bases += length($&);
+    }
+    
+    # Count simple trinucleotide repeats (9+ bases of pattern)
+    while ($sequence =~ /([ATGCN]{3})\1{2,}/gi) {
+        $low_complexity_bases += length($&);
+    }
+    
+    return $low_complexity_bases / $seq_length;
+}

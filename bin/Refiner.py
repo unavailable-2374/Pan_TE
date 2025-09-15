@@ -10,13 +10,15 @@ import logging
 import argparse
 import tempfile
 import subprocess
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict, Counter
 import numpy as np
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
+from itertools import combinations
 
 # Configure logging
 logging.basicConfig(
@@ -26,20 +28,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class EnhancedTERefiner:
-    """Enhanced TE Consensus Builder based on phase2 logic"""
+    """Enhanced TE Consensus Builder with 5 key improvements:
+    1. Enhanced sequence similarity scoring with k-mer analysis
+    2. Adaptive threshold determination based on sequence divergence
+    3. Multi-round consensus building with iterative refinement
+    4. TSD-aware boundary refinement for accurate element detection
+    5. Quality-based subfamily detection and classification
+    """
     
-    def __init__(self, min_score=150, gap_init=20, gap_ext=5, threads=4):
+    def __init__(self, min_score=150, gap_init=20, gap_ext=5, threads=4, kmer_size=21):
         self.min_score = min_score
         self.gap_init = gap_init
         self.gap_ext = gap_ext
         self.threads = threads or 4
+        self.kmer_size = kmer_size
+        
+        # Adaptive thresholds - will be determined based on sequence characteristics
+        self.adaptive_identity_threshold = 85.0
+        self.adaptive_length_threshold = 0.2
+        
+        # Multi-round parameters
+        self.max_refinement_rounds = 3
+        self.convergence_threshold = 0.95  # Stop if 95% sequences unchanged between rounds
+        
+        # TSD detection parameters
+        self.tsd_min_length = 2
+        self.tsd_max_length = 20
+        self.tsd_similarity_threshold = 0.8
         
         # Try to find required tools
         self.mafft_path = self._find_tool('mafft')
+        self.blast_path = self._find_tool('blastn')
         if not self.mafft_path:
             logger.warning("MAFFT not found in PATH, will use basic consensus")
         
-        logger.info(f"Enhanced TE Refiner initialized: min_score={min_score}, threads={threads}")
+        logger.info(f"Enhanced TE Refiner initialized: min_score={min_score}, threads={threads}, kmer_size={kmer_size}")
     
     def _find_tool(self, tool_name: str) -> Optional[str]:
         """Find tool in PATH"""
@@ -84,42 +107,144 @@ class EnhancedTERefiner:
             return False
     
     def _build_enhanced_consensus(self, copies: List[Dict]) -> Optional[Dict]:
-        """Build consensus using enhanced logic from phase2"""
+        """Multi-round consensus building with iterative refinement"""
         
         if not copies:
             return None
         
         if len(copies) == 1:
-            # Single sequence - use as is but try to improve
-            return self._create_single_consensus(copies[0])
+            # Single sequence - apply TSD detection and boundary refinement
+            refined_copy = self._refine_sequence_boundaries([copies[0]])[0]
+            return self._create_single_consensus(refined_copy)
         
-        # Analyze sequence characteristics
+        # Initial analysis
         characteristics = self._analyze_sequence_characteristics(copies)
-        logger.info(f"Sequence characteristics: {characteristics}")
+        logger.info(f"Initial sequence characteristics: {characteristics}")
         
-        # Check if we should split into subfamilies
-        if self._should_split_subfamilies(characteristics, len(copies)):
-            logger.info("Splitting into subfamilies")
-            subfamilies = self._identify_subfamilies(copies, characteristics)
+        # Apply TSD-aware boundary refinement to all sequences
+        refined_copies = self._refine_sequence_boundaries(copies)
+        
+        # Re-analyze after boundary refinement
+        refined_characteristics = self._analyze_sequence_characteristics(refined_copies)
+        logger.info(f"Post-refinement characteristics: {refined_characteristics}")
+        
+        # Quality-based subfamily detection
+        if self._should_split_subfamilies(refined_characteristics, len(refined_copies)):
+            logger.info("Applying quality-based subfamily detection")
+            subfamilies = self._identify_subfamilies_enhanced(refined_copies, refined_characteristics)
             
-            # Build consensus for largest subfamily
-            if subfamilies:
-                largest_subfamily = max(subfamilies, key=len)
-                logger.info(f"Using largest subfamily with {len(largest_subfamily)} sequences")
-                return self._build_msa_consensus(largest_subfamily, characteristics)
+            # Build consensus for each subfamily and select best
+            if subfamilies and len(subfamilies) > 1:
+                subfamily_consensuses = []
+                for i, subfamily in enumerate(subfamilies):
+                    logger.info(f"Building consensus for subfamily {i+1} with {len(subfamily)} sequences")
+                    consensus = self._multi_round_consensus(subfamily, refined_characteristics)
+                    if consensus:
+                        subfamily_consensuses.append((len(subfamily), consensus))
+                
+                # Return consensus from largest high-quality subfamily
+                if subfamily_consensuses:
+                    subfamily_consensuses.sort(key=lambda x: x[0], reverse=True)
+                    return subfamily_consensuses[0][1]
         
-        # Build single consensus from all sequences
-        return self._build_msa_consensus(copies, characteristics)
+        # Multi-round consensus building for all sequences
+        return self._multi_round_consensus(refined_copies, refined_characteristics)
+    
+    def _multi_round_consensus(self, copies: List[Dict], characteristics: Dict) -> Optional[Dict]:
+        """Multi-round iterative consensus refinement"""
+        
+        current_copies = copies.copy()
+        previous_consensus = None
+        
+        for round_num in range(1, self.max_refinement_rounds + 1):
+            logger.info(f"Consensus refinement round {round_num}/{self.max_refinement_rounds}")
+            
+            # Build consensus for current round
+            current_consensus = self._build_msa_consensus(current_copies, characteristics)
+            
+            if not current_consensus:
+                logger.warning(f"Failed to build consensus in round {round_num}")
+                return previous_consensus if previous_consensus else None
+            
+            # Check convergence
+            if previous_consensus and self._check_convergence(previous_consensus, current_consensus):
+                logger.info(f"Consensus converged after round {round_num}")
+                return current_consensus
+            
+            # Filter sequences based on similarity to current consensus for next round
+            if round_num < self.max_refinement_rounds:
+                filtered_copies = self._filter_sequences_by_consensus(
+                    current_copies, current_consensus, characteristics
+                )
+                
+                # If we lose too many sequences, stop refinement
+                retention_rate = len(filtered_copies) / len(current_copies)
+                if retention_rate < 0.5:
+                    logger.info(f"Low retention rate ({retention_rate:.2f}), stopping refinement")
+                    return current_consensus
+                
+                current_copies = filtered_copies
+                logger.info(f"Round {round_num}: retained {len(current_copies)}/{len(copies)} sequences")
+            
+            previous_consensus = current_consensus
+        
+        return previous_consensus
+    
+    def _check_convergence(self, prev_consensus: Dict, curr_consensus: Dict) -> bool:
+        """Check if consensus has converged between rounds"""
+        if not prev_consensus or not curr_consensus:
+            return False
+        
+        prev_seq = prev_consensus['sequence']
+        curr_seq = curr_consensus['sequence']
+        
+        # Calculate similarity between consecutive consensus sequences
+        similarity = self._calculate_identity(prev_seq, curr_seq)
+        
+        return similarity >= self.convergence_threshold * 100
+    
+    def _filter_sequences_by_consensus(self, copies: List[Dict], consensus: Dict, 
+                                     characteristics: Dict) -> List[Dict]:
+        """Filter sequences based on similarity to consensus"""
+        consensus_seq = consensus['sequence']
+        filtered_copies = []
+        
+        # Dynamic threshold based on sequence characteristics
+        min_similarity = max(
+            self.adaptive_identity_threshold - 10,  # Allow some flexibility
+            50.0  # Minimum threshold
+        )
+        
+        for copy in copies:
+            similarity = self._calculate_identity(copy['sequence'], consensus_seq)
+            if similarity >= min_similarity:
+                filtered_copies.append(copy)
+            else:
+                logger.debug(f"Filtered out sequence {copy['id']} (similarity: {similarity:.1f}%)")
+        
+        return filtered_copies if len(filtered_copies) >= 2 else copies
     
     def _analyze_sequence_characteristics(self, copies: List[Dict]) -> Dict:
-        """Analyze sequence characteristics"""
+        """Analyze sequence characteristics with adaptive threshold determination"""
         lengths = [copy['length'] for copy in copies]
         sequences = [copy['sequence'] for copy in copies]
         
-        # Calculate pairwise identities (simplified)
+        # Calculate pairwise identities (enhanced with k-mer analysis)
         identities = []
+        gc_contents = []
+        complexity_scores = []
+        
+        # Analyze individual sequences
+        for seq in sequences:
+            gc_content = (seq.count('G') + seq.count('C')) / len(seq) * 100 if len(seq) > 0 else 0
+            gc_contents.append(gc_content)
+            
+            # Calculate sequence complexity (Shannon entropy)
+            complexity = self._calculate_sequence_complexity(seq)
+            complexity_scores.append(complexity)
+        
+        # Sample pairwise comparisons efficiently
         if len(sequences) > 1:
-            # Sample pairs for efficiency
             max_pairs = min(100, len(sequences) * (len(sequences) - 1) // 2)
             pairs_sampled = 0
             
@@ -139,45 +264,276 @@ class EnhancedTERefiner:
             'length_std': np.std(lengths),
             'min_length': min(lengths),
             'max_length': max(lengths),
+            'length_cv': np.std(lengths) / np.mean(lengths) if np.mean(lengths) > 0 else 0,
             'avg_identity': np.mean(identities) if identities else 100.0,
-            'identity_std': np.std(identities) if identities else 0.0
+            'identity_std': np.std(identities) if identities else 0.0,
+            'avg_gc_content': np.mean(gc_contents),
+            'gc_std': np.std(gc_contents),
+            'avg_complexity': np.mean(complexity_scores),
+            'complexity_std': np.std(complexity_scores)
         }
+        
+        # Adaptive threshold determination
+        self._determine_adaptive_thresholds(characteristics)
         
         return characteristics
     
+    def _calculate_sequence_complexity(self, sequence: str) -> float:
+        """Calculate sequence complexity using Shannon entropy"""
+        if len(sequence) == 0:
+            return 0.0
+        
+        # Count nucleotide frequencies
+        counts = Counter(sequence.upper())
+        total = sum(counts.values())
+        
+        if total == 0:
+            return 0.0
+        
+        # Calculate Shannon entropy
+        entropy = 0.0
+        for count in counts.values():
+            if count > 0:
+                p = count / total
+                entropy -= p * np.log2(p)
+        
+        # Normalize to 0-1 range (max entropy for DNA is 2 bits)
+        return entropy / 2.0
+    
+    def _determine_adaptive_thresholds(self, characteristics: Dict):
+        """Determine adaptive thresholds based on sequence divergence patterns"""
+        avg_identity = characteristics['avg_identity']
+        identity_std = characteristics['identity_std']
+        length_cv = characteristics['length_cv']
+        count = characteristics['count']
+        
+        # Adaptive identity threshold based on sequence divergence
+        if avg_identity > 95:
+            # Very similar sequences - use stricter threshold
+            self.adaptive_identity_threshold = 92.0
+        elif avg_identity > 85:
+            # Moderately similar - standard threshold
+            self.adaptive_identity_threshold = 80.0
+        elif avg_identity > 70:
+            # Divergent sequences - relaxed threshold
+            self.adaptive_identity_threshold = 65.0
+        else:
+            # Very divergent - very relaxed threshold
+            self.adaptive_identity_threshold = 50.0
+        
+        # Adjust based on variability
+        if identity_std > 15:
+            # High variability - relax threshold
+            self.adaptive_identity_threshold -= 5.0
+        elif identity_std < 5:
+            # Low variability - can be more stringent
+            self.adaptive_identity_threshold += 5.0
+        
+        # Adaptive length threshold
+        if count < 5:
+            # Few sequences - be more permissive with length variation
+            self.adaptive_length_threshold = 0.3
+        elif length_cv > 0.4:
+            # High length variation
+            self.adaptive_length_threshold = 0.5
+        else:
+            # Standard threshold
+            self.adaptive_length_threshold = 0.2
+        
+        logger.info(f"Adaptive thresholds: identity={self.adaptive_identity_threshold:.1f}%, length_cv={self.adaptive_length_threshold:.2f}")
+    
     def _calculate_identity(self, seq1: str, seq2: str) -> float:
-        """Calculate simple sequence identity"""
+        """Enhanced sequence similarity scoring with k-mer analysis"""
         if len(seq1) == 0 or len(seq2) == 0:
             return 0.0
         
-        # Align sequences (simple approach)
+        # Use k-mer based similarity for better accuracy
+        kmer_similarity = self._calculate_kmer_similarity(seq1, seq2)
+        
+        # Combine with direct alignment for short sequences
+        if min(len(seq1), len(seq2)) < 100:
+            direct_similarity = self._calculate_direct_similarity(seq1, seq2)
+            # Weighted average favoring k-mer for longer sequences
+            weight = min(len(seq1), len(seq2)) / 100.0
+            return kmer_similarity * weight + direct_similarity * (1 - weight)
+        else:
+            return kmer_similarity
+    
+    def _calculate_kmer_similarity(self, seq1: str, seq2: str) -> float:
+        """Calculate k-mer based similarity (Jaccard index)"""
+        # Generate k-mers
+        kmers1 = self._get_kmers(seq1, self.kmer_size)
+        kmers2 = self._get_kmers(seq2, self.kmer_size)
+        
+        if not kmers1 or not kmers2:
+            return 0.0
+        
+        # Calculate Jaccard similarity
+        intersection = len(kmers1 & kmers2)
+        union = len(kmers1 | kmers2)
+        
+        if union == 0:
+            return 0.0
+        
+        jaccard = intersection / union
+        return jaccard * 100.0
+    
+    def _get_kmers(self, sequence: str, k: int) -> Set[str]:
+        """Extract k-mers from sequence"""
+        kmers = set()
+        for i in range(len(sequence) - k + 1):
+            kmer = sequence[i:i+k].upper()
+            if 'N' not in kmer:  # Skip k-mers with ambiguous nucleotides
+                kmers.add(kmer)
+        return kmers
+    
+    def _calculate_direct_similarity(self, seq1: str, seq2: str) -> float:
+        """Calculate direct alignment similarity for short sequences"""
         min_len = min(len(seq1), len(seq2))
-        matches = sum(1 for i in range(min_len) if seq1[i] == seq2[i])
-        return (matches / min_len) * 100.0
+        max_len = max(len(seq1), len(seq2))
+        
+        # Simple alignment with sliding window
+        best_matches = 0
+        best_overlap = 0
+        
+        for offset in range(-min_len//2, min_len//2 + 1):
+            matches = 0
+            overlap = 0
+            
+            start1 = max(0, offset)
+            start2 = max(0, -offset)
+            
+            end1 = min(len(seq1), len(seq2) + offset)
+            end2 = min(len(seq2), len(seq1) - offset)
+            
+            for i in range(max(start1, start2), min(end1, end2)):
+                pos1 = i - offset if offset >= 0 else i
+                pos2 = i + offset if offset < 0 else i
+                
+                if 0 <= pos1 < len(seq1) and 0 <= pos2 < len(seq2):
+                    overlap += 1
+                    if seq1[pos1] == seq2[pos2]:
+                        matches += 1
+            
+            if overlap > best_overlap or (overlap == best_overlap and matches > best_matches):
+                best_matches = matches
+                best_overlap = overlap
+        
+        return (best_matches / best_overlap * 100.0) if best_overlap > 0 else 0.0
     
     def _should_split_subfamilies(self, characteristics: Dict, num_copies: int) -> bool:
-        """Decide if sequences should be split into subfamilies"""
-        # Split if:
-        # 1. Many sequences with high diversity
-        # 2. Large length variation
+        """Quality-based subfamily detection decision using adaptive thresholds"""
         if num_copies < 4:
             return False
         
-        if (num_copies >= 10 and 
-            characteristics['avg_identity'] < 85.0 and 
-            characteristics['length_std'] / characteristics['avg_length'] > 0.2):
-            return True
+        # Use adaptive thresholds instead of fixed ones
+        identity_threshold = self.adaptive_identity_threshold
+        length_threshold = self.adaptive_length_threshold
+        
+        # Multiple criteria for subfamily splitting
+        conditions = [
+            # High sequence count with diversity
+            num_copies >= 10 and characteristics['avg_identity'] < identity_threshold,
+            # Length variation exceeds adaptive threshold
+            characteristics['length_cv'] > length_threshold,
+            # High identity variance suggests subfamilies
+            characteristics['identity_std'] > 20.0,
+            # GC content variation suggests different origins
+            characteristics.get('gc_std', 0) > 10.0,
+            # Complexity variation suggests structural differences
+            characteristics.get('complexity_std', 0) > 0.3
+        ]
+        
+        # Require at least 2 conditions for splitting (more conservative)
+        split_score = sum(conditions)
+        
+        # Additional quality checks
+        if split_score >= 2:
+            # Ensure we have enough sequences for meaningful subfamilies
+            if num_copies >= 8:
+                logger.info(f"Subfamily splitting recommended: {split_score}/5 conditions met")
+                return True
         
         return False
     
-    def _identify_subfamilies(self, copies: List[Dict], characteristics: Dict) -> List[List[Dict]]:
-        """Identify subfamilies using clustering"""
+    def _identify_subfamilies_enhanced(self, copies: List[Dict], characteristics: Dict) -> List[List[Dict]]:
+        """Enhanced subfamily identification with quality-based clustering"""
         
         if len(copies) < 4:
             return [copies]
         
         try:
-            # Build distance matrix
+            # Multi-dimensional clustering using multiple features
+            features = []
+            
+            for copy in copies:
+                seq = copy['sequence']
+                feature_vector = [
+                    copy['length'],
+                    (seq.count('G') + seq.count('C')) / len(seq) * 100,  # GC content
+                    self._calculate_sequence_complexity(seq),  # Complexity
+                    self._count_tandem_repeats(seq),  # Tandem repeat content
+                ]
+                features.append(feature_vector)
+            
+            # Normalize features
+            features = np.array(features)
+            features = (features - features.mean(axis=0)) / (features.std(axis=0) + 1e-8)
+            
+            # Build combined distance matrix
+            n = len(copies)
+            distances = np.zeros((n, n))
+            
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # Sequence similarity component
+                    seq_identity = self._calculate_identity(copies[i]['sequence'], copies[j]['sequence'])
+                    seq_distance = 100.0 - seq_identity
+                    
+                    # Feature similarity component
+                    feature_distance = np.linalg.norm(features[i] - features[j])
+                    
+                    # Combined distance (weighted)
+                    combined_distance = 0.7 * seq_distance + 0.3 * feature_distance * 20
+                    distances[i, j] = combined_distance
+                    distances[j, i] = combined_distance
+            
+            # Adaptive threshold based on characteristics
+            base_threshold = 100.0 - self.adaptive_identity_threshold
+            
+            # Dynamic clustering
+            subfamilies = self._hierarchical_clustering(copies, distances, base_threshold)
+            
+            # Quality filtering of subfamilies
+            quality_subfamilies = []
+            for subfamily in subfamilies:
+                if len(subfamily) >= 2:
+                    # Calculate subfamily cohesion
+                    cohesion = self._calculate_subfamily_cohesion(subfamily)
+                    if cohesion > 0.7:  # High cohesion threshold
+                        quality_subfamilies.append(subfamily)
+                    else:
+                        logger.debug(f"Filtered out subfamily with low cohesion: {cohesion:.2f}")
+            
+            # If no quality subfamilies, return largest clusters
+            if not quality_subfamilies:
+                subfamilies.sort(key=len, reverse=True)
+                quality_subfamilies = subfamilies[:3]  # Top 3 largest
+            
+            logger.info(f"Identified {len(quality_subfamilies)} quality subfamilies")
+            return quality_subfamilies if quality_subfamilies else [copies]
+            
+        except Exception as e:
+            logger.warning(f"Enhanced subfamily identification failed: {e}, using simple clustering")
+            return self._identify_subfamilies_simple(copies, characteristics)
+    
+    def _identify_subfamilies_simple(self, copies: List[Dict], characteristics: Dict) -> List[List[Dict]]:
+        """Simple fallback subfamily identification"""
+        
+        if len(copies) < 4:
+            return [copies]
+        
+        try:
             n = len(copies)
             distances = np.zeros((n, n))
             
@@ -188,36 +544,176 @@ class EnhancedTERefiner:
                     distances[i, j] = distance
                     distances[j, i] = distance
             
-            # Simple clustering - group sequences within distance threshold
-            threshold = 15.0  # 85% identity threshold
-            visited = [False] * n
-            subfamilies = []
-            
-            for i in range(n):
-                if visited[i]:
-                    continue
-                
-                subfamily = [copies[i]]
-                visited[i] = True
-                
-                for j in range(i + 1, n):
-                    if not visited[j] and distances[i, j] <= threshold:
-                        subfamily.append(copies[j])
-                        visited[j] = True
-                
-                if len(subfamily) >= 2:  # Only keep subfamilies with multiple members
-                    subfamilies.append(subfamily)
-            
-            # If no good subfamilies, return all as one
-            if not subfamilies:
-                return [copies]
-            
-            logger.info(f"Identified {len(subfamilies)} subfamilies")
-            return subfamilies
+            threshold = 100.0 - self.adaptive_identity_threshold
+            return self._hierarchical_clustering(copies, distances, threshold)
             
         except Exception as e:
-            logger.warning(f"Subfamily identification failed: {e}, using all sequences")
+            logger.warning(f"Simple subfamily identification failed: {e}, using all sequences")
             return [copies]
+    
+    def _hierarchical_clustering(self, copies: List[Dict], distances: np.ndarray, threshold: float) -> List[List[Dict]]:
+        """Simple hierarchical clustering"""
+        
+        n = len(copies)
+        visited = [False] * n
+        subfamilies = []
+        
+        for i in range(n):
+            if visited[i]:
+                continue
+            
+            subfamily = [copies[i]]
+            visited[i] = True
+            
+            # Find all sequences within threshold
+            for j in range(i + 1, n):
+                if not visited[j] and distances[i, j] <= threshold:
+                    subfamily.append(copies[j])
+                    visited[j] = True
+            
+            if len(subfamily) >= 1:  # Keep all clusters
+                subfamilies.append(subfamily)
+        
+        return subfamilies if subfamilies else [copies]
+    
+    def _calculate_subfamily_cohesion(self, subfamily: List[Dict]) -> float:
+        """Calculate cohesion score for a subfamily"""
+        
+        if len(subfamily) < 2:
+            return 1.0
+        
+        similarities = []
+        for i in range(len(subfamily)):
+            for j in range(i + 1, len(subfamily)):
+                sim = self._calculate_identity(subfamily[i]['sequence'], subfamily[j]['sequence'])
+                similarities.append(sim)
+        
+        return np.mean(similarities) / 100.0 if similarities else 0.0
+    
+    def _count_tandem_repeats(self, sequence: str) -> float:
+        """Count tandem repeat content in sequence"""
+        
+        if len(sequence) < 20:
+            return 0.0
+        
+        repeat_count = 0
+        window_size = min(10, len(sequence) // 4)
+        
+        for i in range(len(sequence) - window_size * 2):
+            motif = sequence[i:i + window_size]
+            next_motif = sequence[i + window_size:i + window_size * 2]
+            
+            if motif == next_motif:
+                repeat_count += 1
+        
+        return repeat_count / (len(sequence) - window_size * 2) if len(sequence) > window_size * 2 else 0.0
+    
+    def _refine_sequence_boundaries(self, copies: List[Dict]) -> List[Dict]:
+        """TSD-aware boundary refinement for accurate element detection"""
+        
+        refined_copies = []
+        
+        for copy in copies:
+            refined_copy = copy.copy()
+            
+            # Detect and trim terminal repeats/TSDs
+            refined_seq = self._detect_and_trim_tsds(copy['sequence'])
+            
+            if refined_seq and len(refined_seq) >= 50:  # Minimum length threshold
+                refined_copy['sequence'] = refined_seq
+                refined_copy['length'] = len(refined_seq)
+                refined_copy['boundary_refined'] = True
+                
+                # Calculate improvement metrics
+                original_len = len(copy['sequence'])
+                refined_len = len(refined_seq)
+                refined_copy['length_change'] = refined_len - original_len
+                refined_copy['length_ratio'] = refined_len / original_len
+            else:
+                refined_copy['boundary_refined'] = False
+            
+            refined_copies.append(refined_copy)
+        
+        refined_count = sum(1 for c in refined_copies if c.get('boundary_refined', False))
+        logger.info(f"Boundary refinement: {refined_count}/{len(copies)} sequences refined")
+        
+        return refined_copies
+    
+    def _detect_and_trim_tsds(self, sequence: str) -> Optional[str]:
+        """Detect Target Site Duplications and trim boundaries"""
+        
+        if len(sequence) < self.tsd_max_length * 4:  # Too short for TSD analysis
+            return sequence
+        
+        # Check for TSDs at both ends
+        best_tsd_length = 0
+        best_start = 0
+        best_end = len(sequence)
+        
+        for tsd_len in range(self.tsd_min_length, min(self.tsd_max_length + 1, len(sequence) // 4)):
+            left_tsd = sequence[:tsd_len]
+            right_tsd = sequence[-tsd_len:]
+            
+            # Calculate similarity between terminal sequences
+            similarity = self._calculate_tsd_similarity(left_tsd, right_tsd)
+            
+            if similarity >= self.tsd_similarity_threshold:
+                # Found potential TSD
+                if tsd_len > best_tsd_length:
+                    best_tsd_length = tsd_len
+                    best_start = tsd_len
+                    best_end = len(sequence) - tsd_len
+        
+        # Additional boundary refinement - remove low complexity regions
+        if best_tsd_length > 0:
+            trimmed_seq = sequence[best_start:best_end]
+            
+            # Further refine by removing terminal low-complexity regions
+            refined_seq = self._trim_low_complexity_ends(trimmed_seq)
+            
+            if len(refined_seq) >= 50:
+                logger.debug(f"TSD detected: length={best_tsd_length}, refined length: {len(sequence)} -> {len(refined_seq)}")
+                return refined_seq
+        
+        # No significant TSDs found, apply light trimming
+        return self._trim_low_complexity_ends(sequence)
+    
+    def _calculate_tsd_similarity(self, seq1: str, seq2: str) -> float:
+        """Calculate similarity between potential TSDs"""
+        
+        if len(seq1) != len(seq2) or len(seq1) == 0:
+            return 0.0
+        
+        matches = sum(1 for i in range(len(seq1)) if seq1[i] == seq2[i])
+        return matches / len(seq1)
+    
+    def _trim_low_complexity_ends(self, sequence: str, window_size: int = 20) -> str:
+        """Trim low-complexity regions from sequence ends"""
+        
+        if len(sequence) <= window_size * 2:
+            return sequence
+        
+        # Trim from start
+        start_pos = 0
+        for i in range(0, len(sequence) - window_size, window_size // 2):
+            window = sequence[i:i + window_size]
+            complexity = self._calculate_sequence_complexity(window)
+            
+            if complexity > 0.3:  # Found reasonable complexity
+                start_pos = max(0, i - window_size // 2)
+                break
+        
+        # Trim from end
+        end_pos = len(sequence)
+        for i in range(len(sequence) - window_size, window_size, -window_size // 2):
+            window = sequence[i - window_size:i]
+            complexity = self._calculate_sequence_complexity(window)
+            
+            if complexity > 0.3:  # Found reasonable complexity
+                end_pos = min(len(sequence), i + window_size // 2)
+                break
+        
+        return sequence[start_pos:end_pos] if end_pos > start_pos else sequence
     
     def _build_msa_consensus(self, copies: List[Dict], characteristics: Dict) -> Optional[Dict]:
         """Build consensus using multiple sequence alignment"""
@@ -339,6 +835,7 @@ class EnhancedTERefiner:
         
         # For simple consensus, just use the longest sequence
         # In a more sophisticated implementation, we could do position-wise consensus
+        longest = max(copies, key=lambda x: x['length'])
         longest = max(copies, key=lambda x: x['length'])
         return longest['sequence']
     
