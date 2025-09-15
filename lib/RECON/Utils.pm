@@ -25,7 +25,7 @@ our %GENOME_THRESHOLDS = (
 
 # Constants
 use constant {
-    FRAGMENT_SIZE => 40000,
+    FRAGMENT_SIZE => 200000,
     MAX_RECON_ITERATIONS => 50000,
 };
 

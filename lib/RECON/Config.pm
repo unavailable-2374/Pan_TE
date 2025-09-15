@@ -18,7 +18,7 @@ our @EXPORT = qw(
 our %DEFAULT_CONFIG = (
     threads => 4,
     cpu_threads => undef,  # Will be calculated
-    fragment_size => 40000,
+    fragment_size => 200000,
     use_full_genome => 0,
     memory_limit => undef,
     
@@ -245,7 +245,7 @@ Positional Arguments:
 
 Options:
     --memory, -M SIZE      Memory limit in MB
-    --fragment-size SIZE   Genome fragment size (default: 40000)
+    --fragment-size SIZE   Genome fragment size (default: 200000)
     --full-genome         Force single-track full genome processing
     --help, -h            Show this help message
     --version, -v         Show version information
