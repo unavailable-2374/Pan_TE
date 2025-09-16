@@ -42,6 +42,9 @@ run_parallel_refiners(\%refinableFamilies, $workDir, $threads);
 # Combine refined results
 process_refined_families(\%families, \%refinableFamilies, $workDir);
 
+# Clean up temporary files after successful completion
+cleanup_refiner_files($workDir);
+
 print "=== Processing completed ===\n";
 
 sub load_fasta_sequences {
@@ -420,4 +423,57 @@ sub calculate_low_complexity {
     }
     
     return $low_complexity_bases / $seq_length;
+}
+
+sub cleanup_refiner_files {
+    my ($workDir) = @_;
+    
+    print "Cleaning up temporary refiner files...\n";
+    
+    # Count files before cleanup for reporting
+    my @family_files = glob("$workDir/family-*.fa");
+    my @log_files = glob("$workDir/refine_*.log");
+    my @refiner_cons_files = glob("$workDir/family-*.fa.refiner_cons");
+    
+    my $family_count = scalar(@family_files);
+    my $log_count = scalar(@log_files);
+    my $cons_count = scalar(@refiner_cons_files);
+    
+    # Remove family*.fa files
+    if (@family_files) {
+        foreach my $file (@family_files) {
+            if (-f $file) {
+                unlink($file) or warn "Could not remove $file: $!";
+            }
+        }
+        print "Removed $family_count family-*.fa files\n";
+    }
+    
+    # Remove refiner log files (refine_*.log)
+    if (@log_files) {
+        foreach my $file (@log_files) {
+            if (-f $file) {
+                unlink($file) or warn "Could not remove $file: $!";
+            }
+        }
+        print "Removed $log_count refine_*.log files\n";
+    }
+    
+    # Remove refiner consensus intermediate files (family-*.fa.refiner_cons)
+    if (@refiner_cons_files) {
+        foreach my $file (@refiner_cons_files) {
+            if (-f $file) {
+                unlink($file) or warn "Could not remove $file: $!";
+            }
+        }
+        print "Removed $cons_count refiner consensus intermediate files\n";
+    }
+    
+    # Report cleanup summary
+    my $total_removed = $family_count + $log_count + $cons_count;
+    if ($total_removed > 0) {
+        print "Cleanup completed: removed $total_removed temporary files\n";
+    } else {
+        print "No temporary files found to clean up\n";
+    }
 }

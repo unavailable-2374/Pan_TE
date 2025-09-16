@@ -1,36 +1,85 @@
 #!/usr/bin/perl
 use strict;
 
-my %hash;
+my %unknown_seqs;  # Store sequences marked as Unknown by RepeatClassifier
+my %classified_seqs;  # Store sequences successfully classified by RepeatClassifier
+my %classifyTE_results;  # Store ClassifyTE classification results
 my $flag;
 my $key;
 
+# Read RepeatClassifier results
 open(IN,"data/re.fa.classified ") or die "open file die for $!\n";
-open(OUT,">TEs.fa");
 while(<IN>){
     chomp;
     if(/>/){
         if(/#Unknown/){
+            # Store Unknown sequences for potential ClassifyTE classification
             s/>//;
             my @arr = split(/#/);
             $key = $arr[0];
-            $hash{$key};
+            $unknown_seqs{$key} = "";
             $flag = 0;
         }else{
-            print OUT $_."\n";
+            # Store successfully classified sequences with their headers
+            my $header = $_;
+            s/>//;
+            my @arr = split(/#/);
+            $key = $arr[0];
+            $classified_seqs{$key} = {header => $header, sequence => ""};
             $flag = 1;
         }
+    }elsif($flag == 0){
+        # Accumulate sequence data for Unknown sequences
+        $unknown_seqs{$key} .= $_;
     }elsif($flag == 1){
-        print OUT $_."\n";
+        # Accumulate sequence data for classified sequences  
+        $classified_seqs{$key}->{sequence} .= $_;
+    }
+}
+close(IN);
+
+# Read ClassifyTE results
+if(-e "result.txt"){
+    open(LS,"result.txt ") or die "result.txt die for $!\n";
+    while(<LS>){
+        chomp;
+        # Format: TE_00000001#Unknown,tRNA#E_00000010#Unknown,hAT
+        my @entries = split(/\#E_/);
+        foreach my $entry (@entries){
+            if($entry =~ /^(TE_\d+)#Unknown,(.+)$/){
+                my $seq_id = $1;
+                my $classification = $2;
+                # Store the ClassifyTE result
+                $classifyTE_results{$seq_id} = $seq_id . "#" . $classification;
+            }
+        }
+    }
+    close(LS);
+}
+
+# Write output with prioritized classification logic
+open(OUT,">TEs.fa") or die "Cannot create TEs.fa: $!\n";
+
+# Process all sequences from RepeatClassifier
+foreach my $seq_id (keys %classified_seqs){
+    # RepeatClassifier succeeded - use its result (priority 1)
+    print OUT $classified_seqs{$seq_id}->{header}."\n".$classified_seqs{$seq_id}->{sequence}."\n";
+}
+
+foreach my $seq_id (keys %unknown_seqs){
+    if(exists $classifyTE_results{$seq_id}){
+        # RepeatClassifier failed but ClassifyTE succeeded - use ClassifyTE result (priority 2)
+        print OUT ">".$classifyTE_results{$seq_id}."\n".$unknown_seqs{$seq_id}."\n";
     }else{
-        $hash{$key} .= $_;
+        # Both failed - keep as Unknown (priority 3)
+        print OUT ">".$seq_id."#Unknown\n".$unknown_seqs{$seq_id}."\n";
     }
 }
 
-open(LS,"result.txt ") or die "result.txt die for $!\n";
+close(OUT);
 
-while(<LS>){
-    chomp;
-    my @arr = split(/#/);
-    if(exists $hash{$arr[0]}){print OUT ">".$_."\n".$hash{$arr[0]}."\n";}
-}
+print STDERR "Classification summary:\n";
+print STDERR "RepeatClassifier classified: " . scalar(keys %classified_seqs) . " sequences\n";
+print STDERR "ClassifyTE classified unknown: " . scalar(grep {exists $classifyTE_results{$_}} keys %unknown_seqs) . " sequences\n";
+print STDERR "Remaining unknown: " . scalar(grep {!exists $classifyTE_results{$_}} keys %unknown_seqs) . " sequences\n";
+print STDERR "Total output sequences: " . (scalar(keys %classified_seqs) + scalar(keys %unknown_seqs)) . "\n";
