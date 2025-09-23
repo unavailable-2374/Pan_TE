@@ -96,12 +96,14 @@ sub main {
 sub run_single_track_pipeline {
     my ($config) = @_;
     
-    log_step_start("SINGLE TRACK MODE", "Small genome - full processing");
+    log_step_start("SINGLE TRACK MODE", "Small genome - masked track processing");
     
-    log_message("INFO", "Genome mode", "Single-track (small genome)");
+    log_message("INFO", "Genome mode", "Single-track (small genome with masked track processing)");
     log_message("INFO", "Input file", "genome=$config->{genome_file}");
     
-    my $success = run_full_genome_track(
+    # Use masked track processing for small genomes to get high-quality consensus
+    # This extracts unmasked regions and uses gi|N naming format
+    my $success = run_masked_track_independent(
         $config->{genome_file},
         getcwd(),
         $config->{threads},
@@ -110,7 +112,7 @@ sub run_single_track_pipeline {
     );
     
     log_step_end("SINGLE TRACK MODE", $success, 
-                 $success ? "Single track completed" : "Single track failed");
+                 $success ? "Single track (masked track) completed" : "Single track (masked track) failed");
     
     return $success;
 }
@@ -268,14 +270,21 @@ sub generate_final_report {
 sub generate_single_track_report {
     my ($config) = @_;
     
-    log_message("INFO", "Pipeline mode", "Single-track (small genome)");
+    log_message("INFO", "Pipeline mode", "Single-track (small genome with masked track processing)");
     
     if (-s "consensi.fa") {
         my $count = `grep -c '^>' consensi.fa`;
         chomp $count;
         my $size = -s "consensi.fa";
         log_message("INFO", "Final results", "sequences=$count, file_size=${size} bytes");
-        print "Generated $count consensus sequences\n";
+        print "Generated $count consensus sequences (using masked track processing)\n";
+        
+        # Report unmasked region extraction statistics if available
+        if (-f "unmasked_extraction.ok") {
+            my $extraction_info = `tail -2 unmasked_extraction.ok | head -1`;
+            chomp $extraction_info;
+            log_message("INFO", "Unmasked region extraction", $extraction_info);
+        }
     } else {
         log_message("WARN", "No consensus sequences generated", "consensi.fa missing or empty");
         print "Warning: No consensus sequences generated\n";
@@ -349,7 +358,10 @@ sub create_completion_marker {
     # Create completion marker
     open(my $fh_ok, '>', "RECON.ok") or die "Cannot create RECON.ok: $!\n";
     print $fh_ok "Completed at " . localtime() . "\n";
-    print $fh_ok "Processing mode: $config->{processing_mode}\n";
+    my $mode_description = $config->{processing_mode} eq 'single_track' ? 
+                          "single_track (using masked track processing)" : 
+                          $config->{processing_mode};
+    print $fh_ok "Processing mode: $mode_description\n";
     print $fh_ok "Genome class: $config->{genome_class}\n";
     print $fh_ok "Threads: $config->{threads}\n";
     close $fh_ok;

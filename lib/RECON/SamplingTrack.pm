@@ -111,8 +111,35 @@ sub run_sampling_track_independent {
         my $required_size = $sample_size_mb * 1000000;
         
         if ($available_size < $required_size * 1.5) {
-            log_message("WARN", "Insufficient genome space", 
+            log_message("WARN", "Insufficient genome space for sampling", 
                        "available=" . format_size($available_size) . ", required=" . format_size($required_size));
+            log_message("INFO", "Falling back to full masked track processing", "switching to complete genome analysis");
+            
+            # Run full masked track processing as fallback
+            my $success = run_masked_track_independent(
+                $genome_file,
+                ".",  # Current round directory
+                $threads,
+                $cpu_threads,
+                calculate_genome_size($genome_file)
+            );
+            
+            if ($success) {
+                # Mark this round as completed using masked track approach
+                open(my $fh, '>', "round_completed.ok") or die "Cannot create round completion marker: $!\n";
+                print $fh "Round $round completed at " . localtime() . "\n";
+                print $fh "Method: Full masked track (sampling skipped due to insufficient space)\n";
+                print $fh "Available space: " . format_size($available_size) . "\n";
+                print $fh "Required space: " . format_size($required_size) . "\n";
+                close $fh;
+                
+                log_message("INFO", "Round $round completed with masked track fallback", 
+                           "consensi generated successfully");
+            } else {
+                log_message("ERROR", "Masked track fallback also failed", 
+                           "round $round could not be completed");
+            }
+            
             chdir "..";
             last;
         }
