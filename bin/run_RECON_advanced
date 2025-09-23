@@ -24,6 +24,13 @@ sub main {
     # Initialize fresh logger for new run
     init_logger();
     
+    # Check if pipeline is already completed
+    if (check_pipeline_completion()) {
+        log_message("INFO", "Pipeline already completed", "skipping execution, RECON.ok found");
+        print "RECON pipeline already completed successfully. Remove RECON.ok to rerun.\n";
+        exit 0;
+    }
+    
     # Initialize pipeline
     log_step_start("PIPELINE INITIALIZATION", "Advanced RECON pipeline with dual-track processing");
     
@@ -375,6 +382,86 @@ sub setup_working_directory {
     
     # Ensure we have a clean working environment
     # (Optional: could add cleanup logic here)
+}
+
+sub check_pipeline_completion {
+    # Check if RECON.ok exists and validate results
+    return 0 unless -f "RECON.ok";
+    
+    log_message("INFO", "Found completion marker", "file=RECON.ok");
+    
+    # Read the checkpoint file to determine mode
+    my $mode = 'unknown';
+    my $checkpoint_time = (stat("RECON.ok"))[9];
+    
+    if (open(my $fh, '<', "RECON.ok")) {
+        while (my $line = <$fh>) {
+            if ($line =~ /Processing mode: (\S+)/) {
+                $mode = $1;
+                last;
+            }
+        }
+        close $fh;
+    }
+    
+    log_message("INFO", "Checking completion status", "mode=$mode");
+    
+    # Validate based on processing mode
+    if ($mode eq 'single_track') {
+        # Check for single track results
+        if (-f "consensi.fa" && -s "consensi.fa" > 100) {
+            my $consensi_time = (stat("consensi.fa"))[9];
+            if ($consensi_time >= $checkpoint_time - 10) {  # Allow 10 second tolerance
+                log_message("INFO", "Single track results valid", "consensi.fa exists and is recent");
+                return 1;
+            } else {
+                log_message("WARN", "Checkpoint newer than results", 
+                           "consensi.fa may be stale, regenerating");
+                return 0;
+            }
+        } else {
+            log_message("WARN", "Single track results missing", "consensi.fa not found or empty");
+            return 0;
+        }
+    } elsif ($mode eq 'dual_track') {
+        # Check for dual track results
+        my $masked_ok = 0;
+        my $sampling_ok = 0;
+        
+        if (-f "masked_track/consensi.fa" && -s "masked_track/consensi.fa" > 100) {
+            my $masked_time = (stat("masked_track/consensi.fa"))[9];
+            $masked_ok = ($masked_time >= $checkpoint_time - 10);
+            log_message("INFO", "Masked track status", 
+                       "valid=" . ($masked_ok ? "yes" : "no") . 
+                       ", size=" . (-s "masked_track/consensi.fa"));
+        }
+        
+        # Check sampling track
+        for my $round_dir (glob "sampling_track/round_*") {
+            my $consensi_file = "$round_dir/consensi.fa";
+            if (-f $consensi_file && -s $consensi_file > 100) {
+                my $sampling_time = (stat($consensi_file))[9];
+                if ($sampling_time >= $checkpoint_time - 10) {
+                    $sampling_ok = 1;
+                    log_message("INFO", "Sampling track valid", "round=$round_dir");
+                    last;
+                }
+            }
+        }
+        
+        if ($masked_ok || $sampling_ok) {
+            log_message("INFO", "Dual track results valid", 
+                       "masked=$masked_ok, sampling=$sampling_ok");
+            return 1;
+        } else {
+            log_message("WARN", "Dual track results incomplete", 
+                       "regenerating pipeline");
+            return 0;
+        }
+    } else {
+        log_message("WARN", "Unknown processing mode in checkpoint", "mode=$mode");
+        return 0;
+    }
 }
 
 # ============================================================================

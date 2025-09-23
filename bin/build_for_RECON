@@ -22,6 +22,15 @@ my ($workDir, $genomeDB, $threads) = @ARGV;
 
 # Production version - minimal output
 
+# Check if consensus building is already completed
+if (-f "$workDir/consensus.ok" && -s "$workDir/consensi.fa") {
+    print "Consensus building already completed (consensus.ok exists)\n";
+    my $count = `grep -c '^>' $workDir/consensi.fa 2>/dev/null || echo 0`;
+    chomp $count;
+    print "Found $count existing consensus sequences in consensi.fa\n";
+    exit 0;
+}
+
 # Load sequences into memory for faster access
 my %sequences = load_fasta_sequences($genomeDB);
 print "Loaded " . scalar(keys %sequences) . " sequences from genome database\n";
@@ -41,6 +50,18 @@ run_parallel_refiners(\%refinableFamilies, $workDir, $threads);
 
 # Combine refined results
 process_refined_families(\%families, \%refinableFamilies, $workDir);
+
+# Create consensus.ok checkpoint after successful completion
+if (-s "$workDir/consensi.fa") {
+    open my $fh_ok, '>', "$workDir/consensus.ok" or die "Cannot create consensus.ok: $!";
+    print $fh_ok "Consensus building completed at " . localtime() . "\n";
+    my $count = `grep -c '^>' $workDir/consensi.fa 2>/dev/null || echo 0`;
+    chomp $count;
+    print $fh_ok "Consensus sequences: $count\n";
+    print $fh_ok "File size: " . (-s "$workDir/consensi.fa") . " bytes\n";
+    close $fh_ok;
+    print "Created consensus.ok checkpoint\n";
+}
 
 # Clean up temporary files after successful completion
 cleanup_refiner_files($workDir);
@@ -139,8 +160,9 @@ sub process_families {
     my ($families_ref, $sequences_ref, $workDir) = @_;
     my %refinableFamilies;
     
-    # Open consensus output file
-    open my $fh_cons, '>', "$workDir/consensi.fa" or die "Cannot create consensi.fa: $!";
+    # Open consensus output file - use temporary file to avoid data loss
+    my $temp_consensi = "$workDir/consensi.fa.tmp";
+    open my $fh_cons, '>', $temp_consensi or die "Cannot create $temp_consensi: $!";
     
     # Process families sorted by size
     my @sortedKeys = sort {
@@ -173,6 +195,14 @@ sub process_families {
     }
     
     close $fh_cons;
+    
+    # Move temp file to final location only if we have data
+    if (-s $temp_consensi) {
+        rename($temp_consensi, "$workDir/consensi.fa") or die "Cannot rename temp file: $!";
+    } else {
+        unlink $temp_consensi;  # Remove empty temp file
+    }
+    
     print "Processed $processed_count families for refinement\n";
     return %refinableFamilies;
 }
@@ -181,6 +211,14 @@ sub process_single_family {
     my ($familyID, $families_ref, $sequences_ref, $workDir) = @_;
     
     my $family_file = "$workDir/family-$familyID.fa";
+    my $refiner_output = "$family_file.refiner_cons";
+    
+    # Skip if already processed (check for refiner output)
+    if (-s $refiner_output) {
+        print "Family $familyID already processed (refiner output exists)\n" if $DEBUG;
+        return 1;  # Consider it successful
+    }
+    
     open my $fh_fam, '>', $family_file or die "Cannot create $family_file: $!";
     
     my $elementsRef = $families_ref->{$familyID}->{elements};
@@ -299,6 +337,12 @@ sub run_parallel_refiners {
 
 sub process_refined_families {
     my ($families_ref, $refinableFamilies_ref, $workDir) = @_;
+    
+    # Check if consensi.fa exists, if not something went wrong
+    unless (-f "$workDir/consensi.fa") {
+        open my $fh_init, '>', "$workDir/consensi.fa" or die "Cannot create consensi.fa: $!";
+        close $fh_init;
+    }
     
     open my $fh_cons, '>>', "$workDir/consensi.fa" or die "Cannot append to consensi.fa: $!";
     
