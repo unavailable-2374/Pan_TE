@@ -6,6 +6,9 @@ import logging
 import argparse
 import subprocess
 import time
+import gzip
+import bz2
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +26,7 @@ Example:
 
 Parameters:
 [General]
-    --genome <string>         Required. Genome file in FASTA format.
+    --genome <string>         Required. Genome file in FASTA format (.fa, .fasta, .fna, .fas), optionally compressed (.gz, .bz2).
     --model-dir <string>      Provide path to ClassifyTE for classification.
 
 [Other]
@@ -47,6 +50,81 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+def detect_compression_format(file_path: str) -> str:
+    """
+    Detect the compression format of a file.
+    
+    Returns:
+        'gzip' for .gz files
+        'bzip2' for .bz2 files  
+        'uncompressed' for regular files
+    """
+    file_path_lower = file_path.lower()
+    
+    if file_path_lower.endswith('.gz'):
+        return 'gzip'
+    elif file_path_lower.endswith('.bz2'):
+        return 'bzip2'
+    else:
+        return 'uncompressed'
+
+def is_fasta_file(file_path: str) -> bool:
+    """
+    Check if a file is a FASTA file based on extension.
+    Supports both compressed and uncompressed formats.
+    """
+    file_path_lower = file_path.lower()
+    
+    # Remove compression extensions first
+    if file_path_lower.endswith('.gz'):
+        file_path_lower = file_path_lower[:-3]
+    elif file_path_lower.endswith('.bz2'):
+        file_path_lower = file_path_lower[:-4]
+    
+    # Check for FASTA extensions
+    return file_path_lower.endswith(('.fa', '.fasta', '.fna', '.fas'))
+
+def decompress_file(input_file: str, output_file: str = None) -> str:
+    """
+    Decompress a file if it's compressed, otherwise return original path.
+    
+    Args:
+        input_file: Path to potentially compressed file
+        output_file: Optional output path for decompressed file
+        
+    Returns:
+        Path to decompressed file (or original if not compressed)
+    """
+    compression_format = detect_compression_format(input_file)
+    
+    if compression_format == 'uncompressed':
+        return input_file
+    
+    # Create temp file if no output specified
+    if output_file is None:
+        temp_fd, output_file = tempfile.mkstemp(suffix='.fa', prefix='pan_te_genome_')
+        os.close(temp_fd)
+    
+    logger.info(f"Decompressing {compression_format} file: {input_file}")
+    
+    try:
+        if compression_format == 'gzip':
+            with gzip.open(input_file, 'rt') as infile, open(output_file, 'w') as outfile:
+                outfile.write(infile.read())
+        elif compression_format == 'bzip2':
+            with bz2.open(input_file, 'rt') as infile, open(output_file, 'w') as outfile:
+                outfile.write(infile.read())
+        
+        logger.info(f"Decompression completed: {output_file}")
+        return output_file
+        
+    except Exception as e:
+        # Clean up temp file on error
+        if output_file and os.path.exists(output_file):
+            os.remove(output_file)
+        logger.error(f"Failed to decompress {input_file}: {str(e)}")
+        raise
 
 class CustomArgumentParser(argparse.ArgumentParser):
     def format_help(self):
@@ -98,6 +176,13 @@ def parse_arguments():
     # Validate required arguments
     if not args.genome:
         parser.error('--genome is required')
+    
+    # Validate genome file exists and is FASTA format
+    if args.genome:
+        if not os.path.exists(args.genome):
+            parser.error(f'Genome file not found: {args.genome}')
+        if not is_fasta_file(args.genome):
+            parser.error(f'Genome file must be in FASTA format (.fa, .fasta, .fna, .fas), optionally compressed (.gz, .bz2): {args.genome}')
         
     return args
 
@@ -107,16 +192,19 @@ class PanTEPipeline:
     def __init__(self, genome_file: Optional[str], output_dir: str, threads: int = 4, 
                  model_dir: Optional[str] = None, vcf_dir: Optional[str] = None):
         """Initialize the pipeline with configuration parameters."""
-        self.genome_file = os.path.abspath(genome_file) if genome_file else None
+        self.original_genome_file = os.path.abspath(genome_file) if genome_file else None
+        self.genome_file = None  # Will be set after decompression if needed
+        self.decompressed_genome_file = None  # Track decompressed temp file for cleanup
         self.vcf_dir = os.path.abspath(vcf_dir) if vcf_dir else None
         self.output_dir = os.path.abspath(output_dir)
         self.threads = threads
         self.model_dir = os.path.abspath(model_dir) if model_dir else None
         self.processed_genome = os.path.join(self.output_dir, 'genome', 'genome.fa')
+        
+        # Handle compressed genome file
+        if self.original_genome_file:
+            self.prepare_genome_file()
 
-        # Verify inputs
-        if not self.genome_file:
-            raise ValueError("genome_file must be provided")
         # Verify inputs
         if not self.genome_file and not self.vcf_dir:
             raise ValueError("Either genome_file or vcf_dir must be provided")
@@ -145,6 +233,35 @@ class PanTEPipeline:
         }
         # Create output directory structure
         self.setup_directories()
+
+    def prepare_genome_file(self):
+        """Handle decompression of genome file if needed."""
+        if not self.original_genome_file:
+            return
+            
+        compression_format = detect_compression_format(self.original_genome_file)
+        
+        if compression_format == 'uncompressed':
+            self.genome_file = self.original_genome_file
+            logger.info(f"Using uncompressed genome file: {self.genome_file}")
+        else:
+            logger.info(f"Detected {compression_format} compressed genome file: {self.original_genome_file}")
+            # Decompress to a temporary file in the output directory
+            temp_genome = os.path.join(self.output_dir, 'genome', 'decompressed_genome.fa')
+            os.makedirs(os.path.dirname(temp_genome), exist_ok=True)
+            
+            self.genome_file = decompress_file(self.original_genome_file, temp_genome)
+            self.decompressed_genome_file = temp_genome
+            logger.info(f"Decompressed genome file ready: {self.genome_file}")
+
+    def cleanup_temp_files(self):
+        """Clean up temporary files created during processing."""
+        if self.decompressed_genome_file and os.path.exists(self.decompressed_genome_file):
+            try:
+                os.remove(self.decompressed_genome_file)
+                logger.info(f"Cleaned up decompressed genome file: {self.decompressed_genome_file}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up decompressed genome file: {e}")
 
     def calculate_chunk_count(self):
         """Calculate the number of chunks that will be used by build_RS based on genome size."""
@@ -394,7 +511,7 @@ class PanTEPipeline:
         
         # Step 1: Combine raw results from LTR, RepeatScout and RECON
         # RepeatScout now uses Refiner output with high_quality_consensus.fasta
-        rs_consensus = "../RepeatScout/refiner_output/high_quality_consensus.fasta"
+        rs_consensus = "../RepeatScout/refiner_output/phase3_analysis_library.fa"
         if not os.path.exists(os.path.join(combine_dir, rs_consensus)):
             rs_consensus = "../RepeatScout/consensi.fa"  # fallback
         
@@ -402,25 +519,39 @@ class PanTEPipeline:
         recon_dir = os.path.join(self.output_dir, 'RECON')
         recon_consensi = []
         
-        # Check for masked track consensi
+        # Check for direct consensi.fa (single_track mode for small genomes)
+        direct_consensi = os.path.join(recon_dir, 'consensi.fa')
+        if os.path.exists(direct_consensi) and os.path.getsize(direct_consensi) > 0:
+            recon_consensi.append("../RECON/consensi.fa")
+            logger.info("Found RECON single_track result: consensi.fa")
+        
+        # Check for masked track consensi (dual_track mode)
         masked_track_consensi = os.path.join(recon_dir, 'masked_track', 'consensi.fa')
         if os.path.exists(masked_track_consensi) and os.path.getsize(masked_track_consensi) > 0:
             recon_consensi.append("../RECON/masked_track/consensi.fa")
+            logger.info("Found RECON masked_track result: masked_track/consensi.fa")
         
-        # Check for sampling track rounds
+        # Check for sampling track rounds (dual_track mode)
         sampling_track_dir = os.path.join(recon_dir, 'sampling_track')
         if os.path.isdir(sampling_track_dir):
-            for round_dir in sorted(os.listdir(sampling_track_dir)):
-                if round_dir.startswith('round_'):
-                    round_consensi = os.path.join(sampling_track_dir, round_dir, 'consensi.fa')
-                    if os.path.exists(round_consensi) and os.path.getsize(round_consensi) > 0:
-                        recon_consensi.append(f"../RECON/sampling_track/{round_dir}/consensi.fa")
+            # Get all round directories and sort them numerically
+            round_dirs = [d for d in os.listdir(sampling_track_dir) if d.startswith('round_')]
+            round_dirs.sort(key=lambda x: int(x.split('_')[1]) if x.split('_')[1].isdigit() else 0)
+            
+            for round_dir in round_dirs:
+                round_consensi = os.path.join(sampling_track_dir, round_dir, 'consensi.fa')
+                if os.path.exists(round_consensi) and os.path.getsize(round_consensi) > 0:
+                    recon_consensi.append(f"../RECON/sampling_track/{round_dir}/consensi.fa")
+                    logger.info(f"Found RECON sampling_track result: sampling_track/{round_dir}/consensi.fa")
         
         # Build the cat command with all available consensi files
         input_files = ["../Look4LTRs/consensi.fa", rs_consensus] + recon_consensi
         cat_cmd = f"cat {' '.join(input_files)} > raw_TEs_combined.fa"
         
-        logger.info(f"Combining consensus libraries from {len(input_files)} sources: LTR, RepeatScout, and {len(recon_consensi)} RECON rounds")
+        if len(recon_consensi) == 0:
+            logger.warning("No RECON consensus files found - check if RECON step completed successfully")
+        
+        logger.info(f"Combining consensus libraries from {len(input_files)} sources: LTR, RepeatScout, and {len(recon_consensi)} RECON result(s)")
         self.run_cmd(cat_cmd, combine_dir)
         
         # Step 2: TE-optimized deduplication using CD-HIT-EST
@@ -464,7 +595,7 @@ class PanTEPipeline:
         
         # Step 3: Run classifier on deduplicated TEs (if model directory available)
         if self.model_dir:
-            self.run_cmd(f"run_Classifier {self.model_dir}", combine_dir)
+            self.run_cmd(f"run_Classifier {self.model_dir} {self.threads}", combine_dir)
         else:
             logger.info("Skipping classification step (no model directory specified)")
         
@@ -544,6 +675,9 @@ class PanTEPipeline:
         except Exception as e:
             logger.error(f"Pipeline failed: {str(e)}")
             raise
+        finally:
+            # Clean up temporary files
+            self.cleanup_temp_files()
 
 def main():
     """Main execution function."""

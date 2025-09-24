@@ -1331,6 +1331,9 @@ def _generate_phase4_compatible_output(self, consensus_sequences: List[Dict],
     # 生成analysis library（90%去重，包含更多序列用于分析）
     analysis_library = consensus_sequences
     
+    # 保存 Analysis library 为 FASTA 文件
+    self._save_analysis_library_fasta(analysis_library)
+    
     result = {
         'masking_library': masking_library,
         'analysis_library': analysis_library,
@@ -1351,6 +1354,46 @@ def _generate_phase4_compatible_output(self, consensus_sequences: List[Dict],
     return result
 
 
+def _save_analysis_library_fasta(self, analysis_library: List[Dict]):
+    """保存 Analysis library 为 FASTA 文件"""
+    from pathlib import Path
+    
+    # 确定输出文件路径
+    output_dir = Path(self.config.output_dir)
+    fasta_file = output_dir / "phase3_analysis_library.fa"
+    
+    try:
+        with open(fasta_file, 'w') as f:
+            for seq in analysis_library:
+                seq_id = seq.get('id', 'unknown')
+                sequence = seq.get('sequence', '')
+                quality_grade = seq.get('quality_grade', 'unknown')
+                quality_score = seq.get('quality_score', 0.0)
+                copy_number = seq.get('copy_number', 0)
+                avg_identity = seq.get('avg_identity', 0.0)
+                source_id = seq.get('source_id', 'unknown')
+                
+                # 构建信息丰富的FASTA头部
+                header = f">{seq_id} quality={quality_grade} score={quality_score:.3f} copies={copy_number} identity={avg_identity:.1f}% source={source_id}"
+                
+                f.write(f"{header}\n")
+                f.write(f"{sequence}\n")
+        
+        logger.info(f"Saved Analysis library to: {fasta_file}")
+        logger.info(f"  - Total sequences: {len(analysis_library)}")
+        
+        # 按质量分级统计
+        quality_counts = {}
+        for seq in analysis_library:
+            grade = seq.get('quality_grade', 'unknown')
+            quality_counts[grade] = quality_counts.get(grade, 0) + 1
+        
+        logger.info(f"  - Quality distribution in FASTA: {quality_counts}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save Analysis library FASTA: {e}")
+
+
 # 为ConsensusBuilder类添加这些方法 - 在类定义后绑定
 # _extract_sequences_from_phase2 already defined inside the class
 ConsensusBuilder._categorize_input_sequences = _categorize_input_sequences
@@ -1363,3 +1406,4 @@ ConsensusBuilder._filter_and_grade_consensus = _filter_and_grade_consensus
 ConsensusBuilder._deduplicate_consensus_sequences = _deduplicate_consensus_sequences
 ConsensusBuilder._calculate_sequence_similarity = _calculate_sequence_similarity
 ConsensusBuilder._generate_phase4_compatible_output = _generate_phase4_compatible_output
+ConsensusBuilder._save_analysis_library_fasta = _save_analysis_library_fasta
