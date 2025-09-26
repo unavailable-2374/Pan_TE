@@ -11,10 +11,10 @@ use Parallel::ForkManager;
 our %families = ();
 # Enhanced thresholds for higher quality consensus
 our $familySizeCutoff = 15;          # Process families with 15 or more elements  
-our $minConsensusLength = 80;        # Minimum consensus sequence length (reduced from 100)
+our $minConsensusLength = 50;        # Minimum consensus sequence length (reduced from 100)
 our $minRefinerScore = 150;          # Restored original score threshold
-our $minAlignmentSize = 5;           # Reduced minimum alignment size (from 8 to 5)
-our $maxLowComplexity = 0.7;         # Slightly more permissive for low complexity
+our $minAlignmentSize = 8;           # Reduced minimum alignment size (from 8 to 5)
+our $maxLowComplexity = 0.55;         # Slightly more permissive for low complexity
 our $DEBUG = 0;  # Disable debug for production
 
 die "Usage: $0 workDir genomeDB total_threads\n" unless @ARGV == 3;

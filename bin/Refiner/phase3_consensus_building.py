@@ -20,6 +20,7 @@ import threading
 import time
 import psutil
 import os
+import re
 
 from config import PipelineConfig
 from utils.robust_runner import RobustRunner
@@ -156,7 +157,7 @@ class ConsensusBuilder:
         logger.info(f"  - Unsplit chimeras: {len(sequence_categories['unsplit_chimeras'])}")
         logger.info(f"  - Processing failures: {len(sequence_categories['failed_sequences'])}")
         
-        # 统计信息
+        # 统计信息 - 增强版本
         stats = {
             'input_sequences': len(input_sequences),
             'processed_sequences': 0,
@@ -168,7 +169,8 @@ class ConsensusBuilder:
             'total_consensus': 0,
             'high_quality_consensus': 0,
             'medium_quality_consensus': 0,
-            'low_quality_consensus': 0
+            'low_quality_consensus': 0,
+            'rejected_consensus': 0  # 新增：被拒绝的序列数
         }
         
         # 所有输入序列都是共识构建的候选（Phase 1已经筛选过）
@@ -191,12 +193,14 @@ class ConsensusBuilder:
         # 生成Phase 4兼容的输出结果
         result = self._generate_phase4_compatible_output(deduplicated_consensus, stats, sequence_categories)
         
-        logger.info(f"Phase 3 complete:")
+        logger.info(f"Enhanced Phase 3 complete:")
         logger.info(f"  - Input: {stats['input_sequences']} sequences")
         logger.info(f"  - Processed: {stats['processed_sequences']} candidates")
         logger.info(f"  - Generated: {stats['total_consensus']} consensus sequences")
         logger.info(f"  - Quality distribution: High={stats['high_quality_consensus']}, "
-                   f"Medium={stats['medium_quality_consensus']}, Low={stats['low_quality_consensus']}")
+                   f"Medium={stats['medium_quality_consensus']}, Low={stats['low_quality_consensus']}, "
+                   f"Rejected={stats['rejected_consensus']}")
+        logger.info(f"  - Enhancement features: Adaptive thresholds, Biological validation, Smart selection")
         
         return result
     
@@ -962,40 +966,503 @@ def build_expanded_consensus(copies: List[Dict],
 
 
 def calculate_consensus_quality(consensus: Dict, copies: List[Dict]) -> float:
-    """计算共识序列质量"""
+    """计算共识序列质量 - 增强版本
     
-    quality_components = []
+    改进：
+    1. 重新平衡权重，提升TSD和生物学特征的重要性
+    2. 降低拷贝数权重，使用对数缩放
+    3. 增加序列复杂度和边界质量评估
+    4. 考虑序列一致性分布
+    """
     
-    # 1. 拷贝数支持度
-    copy_support = min(consensus['copy_number'] / 10, 1.0)
-    quality_components.append(copy_support * 0.3)
-    
-    # 2. 序列一致性
-    identity_score = consensus['avg_identity'] / 100.0
-    quality_components.append(identity_score * 0.3)
-    
-    # 3. 长度改进
-    if consensus['improvement_ratio'] > 1.0:
-        improvement_score = min((consensus['improvement_ratio'] - 1.0) / 0.5, 1.0)
-    else:
-        improvement_score = consensus['improvement_ratio']
-    quality_components.append(improvement_score * 0.2)
-    
-    # 4. TSD支持
+    # 1. TSD支持度 (25% - 提升权重)
     tsd_score = consensus.get('tsd_support', 0)
-    quality_components.append(tsd_score * 0.1)
+    if tsd_score > 0.8:  # 强TSD支持给予额外奖励
+        tsd_score = min(1.0, tsd_score * 1.1)
     
-    # 5. 长度合理性
-    length = consensus['length']
-    if 100 <= length <= 5000:
-        length_score = 1.0
-    elif length < 100:
-        length_score = length / 100
+    # 2. 序列一致性与分布 (20% - 考虑分布)
+    avg_identity = consensus.get('avg_identity', 0) / 100.0
+    if copies and len(copies) > 1:
+        identity_values = [c.get('identity', consensus.get('avg_identity', 0)) for c in copies]
+        identity_std = np.std(identity_values) / 100.0
+        # 惩罚高方差（表示家族内差异大）
+        identity_score = avg_identity * (1 - min(identity_std * 0.3, 0.5))
     else:
-        length_score = max(0.5, 1.0 - (length - 5000) / 10000)
-    quality_components.append(length_score * 0.1)
+        identity_score = avg_identity
     
-    return sum(quality_components)
+    # 3. 拷贝数支持 (20% - 降低权重，使用对数缩放)
+    copy_number = consensus.get('copy_number', 1)
+    copy_score = min(1.0, np.log1p(copy_number) / np.log1p(50))  # 50个拷贝达满分
+    
+    # 4. 序列复杂度 (15% - 新增)
+    sequence = consensus.get('sequence', '')
+    complexity_score = _calculate_sequence_complexity_score(sequence)
+    
+    # 5. 长度完整性 (10%)
+    length_score = _evaluate_length_completeness(consensus, copies)
+    
+    # 6. 边界质量 (10% - 新增)
+    boundary_score = _evaluate_boundary_quality(sequence)
+    
+    # 计算加权总分
+    final_score = (
+        tsd_score * 0.25 +
+        identity_score * 0.20 +
+        copy_score * 0.20 +
+        complexity_score * 0.15 +
+        length_score * 0.10 +
+        boundary_score * 0.10
+    )
+    
+    # 保存质量组件用于调试和分析
+    consensus['quality_components'] = {
+        'tsd': tsd_score,
+        'identity': identity_score,
+        'copy_support': copy_score,
+        'complexity': complexity_score,
+        'length': length_score,
+        'boundary': boundary_score
+    }
+    
+    return final_score
+
+
+def _calculate_sequence_complexity_score(sequence: str) -> float:
+    """计算序列复杂度分数"""
+    if not sequence or len(sequence) < 10:
+        return 0.0
+    
+    sequence = sequence.upper()
+    
+    # 1. 计算低复杂度比例
+    low_complexity_ratio = _calculate_low_complexity_ratio(sequence)
+    
+    # 2. 计算串联重复比例
+    tandem_ratio = _calculate_tandem_repeat_ratio(sequence)
+    
+    # 3. 计算熵值
+    entropy = _calculate_sequence_entropy(sequence)
+    
+    # 综合评分（高复杂度得高分）
+    complexity_score = (
+        (1.0 - low_complexity_ratio) * 0.4 +
+        (1.0 - tandem_ratio) * 0.3 +
+        (entropy / 2.0) * 0.3  # 熵值最大约为2.0
+    )
+    
+    return min(1.0, max(0.0, complexity_score))
+
+
+def _calculate_low_complexity_ratio(sequence: str) -> float:
+    """计算低复杂度区域比例"""
+    if not sequence:
+        return 1.0
+    
+    # 简单的低复杂度检测：单核苷酸和二核苷酸重复
+    patterns = [
+        r'A{5,}', r'T{5,}', r'G{5,}', r'C{5,}',  # 单核苷酸
+        r'(AT){4,}', r'(TA){4,}', r'(GC){4,}', r'(CG){4,}',  # 二核苷酸
+        r'(AG){4,}', r'(GA){4,}', r'(TC){4,}', r'(CT){4,}',
+        r'(AC){4,}', r'(CA){4,}', r'(TG){4,}', r'(GT){4,}'
+    ]
+    
+    low_complexity_length = 0
+    covered_positions = set()
+    
+    for pattern in patterns:
+        for match in re.finditer(pattern, sequence):
+            start, end = match.span()
+            for pos in range(start, end):
+                if pos not in covered_positions:
+                    covered_positions.add(pos)
+                    low_complexity_length += 1
+    
+    return low_complexity_length / len(sequence)
+
+
+def _calculate_tandem_repeat_ratio(sequence: str) -> float:
+    """计算串联重复比例"""
+    if not sequence or len(sequence) < 10:
+        return 0.0
+    
+    # 检测3-6bp的串联重复
+    tandem_length = 0
+    covered = set()
+    
+    for repeat_len in range(3, 7):
+        for i in range(len(sequence) - repeat_len * 2):
+            if i in covered:
+                continue
+            
+            unit = sequence[i:i+repeat_len]
+            j = i + repeat_len
+            repeat_count = 1
+            
+            while j + repeat_len <= len(sequence) and sequence[j:j+repeat_len] == unit:
+                repeat_count += 1
+                j += repeat_len
+            
+            if repeat_count >= 3:  # 至少重复3次
+                for pos in range(i, i + repeat_len * repeat_count):
+                    covered.add(pos)
+                tandem_length += repeat_len * repeat_count
+    
+    return len(covered) / len(sequence)
+
+
+def _calculate_sequence_entropy(sequence: str) -> float:
+    """计算序列的信息熵"""
+    if not sequence:
+        return 0.0
+    
+    # 计算碱基频率
+    base_counts = Counter(sequence)
+    seq_len = len(sequence)
+    
+    entropy = 0.0
+    for count in base_counts.values():
+        if count > 0:
+            freq = count / seq_len
+            entropy -= freq * np.log2(freq)
+    
+    return entropy
+
+
+def _evaluate_length_completeness(consensus: Dict, copies: List[Dict]) -> float:
+    """评估长度完整性"""
+    cons_length = len(consensus.get('sequence', ''))
+    
+    if cons_length < 50:
+        return 0.0
+    elif cons_length > 20000:
+        return 0.5  # 过长可能有问题
+    
+    # 理想长度范围
+    if 100 <= cons_length <= 5000:
+        base_score = 1.0
+    elif cons_length < 100:
+        base_score = cons_length / 100
+    else:
+        base_score = max(0.5, 1.0 - (cons_length - 5000) / 15000)
+    
+    # 如果有改进比例，额外加分
+    improvement_ratio = consensus.get('improvement_ratio', 1.0)
+    if improvement_ratio > 1.0:
+        improvement_bonus = min(0.2, (improvement_ratio - 1.0) * 0.4)
+        base_score = min(1.0, base_score + improvement_bonus)
+    
+    return base_score
+
+
+def _evaluate_boundary_quality(sequence: str) -> float:
+    """评估序列边界质量"""
+    if not sequence or len(sequence) < 20:
+        return 0.0
+    
+    # 检查5'和3'端的质量
+    boundary_len = min(20, len(sequence) // 10)
+    
+    start_seq = sequence[:boundary_len].upper()
+    end_seq = sequence[-boundary_len:].upper()
+    
+    # 检查N含量
+    start_n_ratio = start_seq.count('N') / len(start_seq)
+    end_n_ratio = end_seq.count('N') / len(end_seq)
+    
+    # 检查低复杂度
+    start_low_complex = _calculate_low_complexity_ratio(start_seq)
+    end_low_complex = _calculate_low_complexity_ratio(end_seq)
+    
+    # 综合评分
+    boundary_score = (
+        (1.0 - start_n_ratio) * 0.25 +
+        (1.0 - end_n_ratio) * 0.25 +
+        (1.0 - start_low_complex) * 0.25 +
+        (1.0 - end_low_complex) * 0.25
+    )
+    
+    return boundary_score
+
+
+def _validate_consensus_quality(consensus: Dict) -> Dict[str, bool]:
+    """多层次的质量验证"""
+    validations = {}
+    sequence = consensus.get('sequence', '')
+    
+    if not sequence:
+        return {'sequence_exists': False}
+    
+    # 1. 长度验证
+    seq_len = len(sequence)
+    validations['length_valid'] = 50 <= seq_len <= 20000
+    
+    # 2. 复杂度验证
+    tandem_ratio = _calculate_tandem_repeat_ratio(sequence)
+    validations['complexity_valid'] = tandem_ratio < 0.5
+    
+    # 3. GC含量验证
+    gc_content = _calculate_gc_content(sequence)
+    validations['gc_valid'] = 0.15 < gc_content < 0.85
+    
+    # 4. N含量验证
+    n_ratio = sequence.upper().count('N') / len(sequence)
+    validations['n_content_valid'] = n_ratio < 0.1
+    
+    # 5. TSD验证（如果声称有TSD）
+    if consensus.get('tsd'):
+        validations['tsd_valid'] = _verify_tsd_pattern(consensus['tsd'])
+    
+    # 6. 模糊碱基验证
+    ambiguous_ratio = _calculate_ambiguous_base_ratio(sequence)
+    validations['ambiguity_valid'] = ambiguous_ratio < 0.15
+    
+    # 7. 最小信息熵验证
+    entropy = _calculate_sequence_entropy(sequence.upper())
+    validations['entropy_valid'] = entropy > 1.0  # 最小熵阈值
+    
+    return validations
+
+
+def _calculate_gc_content(sequence: str) -> float:
+    """计算GC含量"""
+    if not sequence:
+        return 0.0
+    
+    sequence = sequence.upper()
+    gc_count = sequence.count('G') + sequence.count('C')
+    at_count = sequence.count('A') + sequence.count('T')
+    total = gc_count + at_count
+    
+    return gc_count / total if total > 0 else 0.0
+
+
+def _verify_tsd_pattern(tsd: str) -> bool:
+    """验证TSD模式"""
+    if not tsd or not isinstance(tsd, str):
+        return False
+    
+    # TSD应该是2-20bp的序列
+    if not (2 <= len(tsd) <= 20):
+        return False
+    
+    # 不应该全是N或低复杂度
+    if tsd.upper().count('N') / len(tsd) > 0.5:
+        return False
+    
+    # 不应该是单一碱基重复
+    if len(set(tsd.upper())) == 1:
+        return False
+    
+    return True
+
+
+def _calculate_ambiguous_base_ratio(sequence: str) -> float:
+    """计算模糊碱基比例"""
+    if not sequence:
+        return 1.0
+    
+    sequence = sequence.upper()
+    ambiguous_bases = set('RYSWKMBDHVN')
+    ambiguous_count = sum(1 for base in sequence if base in ambiguous_bases)
+    
+    return ambiguous_count / len(sequence)
+
+
+def _calculate_adaptive_thresholds(quality_scores: List[float]) -> Dict[str, float]:
+    """基于数据分布的自适应阈值"""
+    
+    if not quality_scores:
+        return {'high': 0.8, 'medium': 0.6, 'low': 0.3}
+    
+    # 移除异常值
+    scores_array = np.array(quality_scores)
+    q1 = np.percentile(scores_array, 25)
+    q3 = np.percentile(scores_array, 75)
+    iqr = q3 - q1
+    
+    # 过滤异常值
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    filtered_scores = scores_array[(scores_array >= lower_bound) & (scores_array <= upper_bound)]
+    
+    if len(filtered_scores) < 3:
+        filtered_scores = scores_array
+    
+    # 使用分位数方法
+    if len(filtered_scores) >= 10:
+        # 足够的数据点，使用三分位
+        high_threshold = np.percentile(filtered_scores, 70)
+        medium_threshold = np.percentile(filtered_scores, 40)
+        low_threshold = np.percentile(filtered_scores, 10)
+    else:
+        # 数据点较少，使用更保守的方法
+        mean_score = np.mean(filtered_scores)
+        std_score = np.std(filtered_scores)
+        
+        high_threshold = mean_score + 0.5 * std_score
+        medium_threshold = mean_score
+        low_threshold = mean_score - 0.5 * std_score
+    
+    # 应用合理的边界限制
+    high_threshold = max(0.55, min(0.85, high_threshold))
+    medium_threshold = max(0.40, min(0.65, medium_threshold))
+    low_threshold = max(0.25, min(0.45, low_threshold))
+    
+    # 确保阈值的顺序正确
+    if medium_threshold >= high_threshold:
+        medium_threshold = high_threshold - 0.1
+    if low_threshold >= medium_threshold:
+        low_threshold = medium_threshold - 0.1
+    
+    return {
+        'high': high_threshold,
+        'medium': medium_threshold,
+        'low': low_threshold
+    }
+
+
+def _select_representative_medium_sequences(medium_sequences: List[Dict]) -> List[Dict]:
+    """基于多样性和互补性智能选择medium序列"""
+    
+    if len(medium_sequences) <= 5:
+        return medium_sequences
+    
+    logger.info(f"Intelligently selecting from {len(medium_sequences)} medium quality sequences")
+    
+    selected = []
+    remaining = medium_sequences.copy()
+    
+    # 1. 按亚家族分组，每组选择最佳代表
+    subfamily_groups = defaultdict(list)
+    for seq in remaining:
+        subfamily = seq.get('subfamily_id', 'default')
+        subfamily_groups[subfamily].append(seq)
+    
+    for subfamily, seqs in subfamily_groups.items():
+        if seqs:
+            # 选择最终质量分数×长度最高的
+            best = max(seqs, 
+                      key=lambda x: x.get('final_quality_score', 0) * len(x.get('sequence', '')))
+            selected.append(best)
+            remaining.remove(best)
+    
+    # 2. 基于长度分布选择互补序列
+    length_ranges = [
+        (0, 200, 'very_short'),
+        (200, 500, 'short'),
+        (500, 1500, 'medium_length'),
+        (1500, 3000, 'long'),
+        (3000, 10000, 'very_long'),
+        (10000, float('inf'), 'extra_long')
+    ]
+    
+    for min_len, max_len, category in length_ranges:
+        range_seqs = [s for s in remaining 
+                     if min_len <= len(s.get('sequence', '')) < max_len]
+        if range_seqs:
+            # 每个长度范围选择质量最好的
+            best_in_range = max(range_seqs, 
+                               key=lambda x: x.get('final_quality_score', 0))
+            selected.append(best_in_range)
+            remaining.remove(best_in_range)
+            logger.debug(f"Selected {best_in_range['id']} for {category} range")
+    
+    # 3. 基于序列特征的多样性选择
+    target_count = min(len(medium_sequences) // 2, len(medium_sequences))
+    
+    while len(selected) < target_count and remaining:
+        # 计算每个剩余序列与已选序列的最小相似度
+        diversity_scores = []
+        
+        for seq in remaining:
+            if not selected:
+                # 如果还没有选择任何序列，使用质量分数
+                diversity_score = seq.get('final_quality_score', 0)
+            else:
+                # 计算与已选序列的最小相似度
+                min_similarity = min(
+                    _calculate_sequence_feature_similarity(seq, sel)
+                    for sel in selected
+                )
+                # 多样性分数 = (1 - 相似度) × 质量分数
+                diversity_score = (1 - min_similarity) * seq.get('final_quality_score', 0)
+            
+            diversity_scores.append((diversity_score, seq))
+        
+        # 选择多样性分数最高的
+        if diversity_scores:
+            diversity_scores.sort(key=lambda x: x[0], reverse=True)
+            best_diverse = diversity_scores[0][1]
+            selected.append(best_diverse)
+            remaining.remove(best_diverse)
+    
+    logger.info(f"Selected {len(selected)} representative medium sequences")
+    return selected
+
+
+def _calculate_sequence_feature_similarity(seq1: Dict, seq2: Dict) -> float:
+    """计算两个序列的特征相似度"""
+    
+    # 长度相似度
+    len1 = len(seq1.get('sequence', ''))
+    len2 = len(seq2.get('sequence', ''))
+    length_sim = min(len1, len2) / max(len1, len2) if max(len1, len2) > 0 else 0
+    
+    # GC含量相似度
+    gc1 = _calculate_gc_content(seq1.get('sequence', ''))
+    gc2 = _calculate_gc_content(seq2.get('sequence', ''))
+    gc_diff = abs(gc1 - gc2)
+    gc_sim = 1 - gc_diff
+    
+    # 质量分数相似度
+    score1 = seq1.get('final_quality_score', 0)
+    score2 = seq2.get('final_quality_score', 0)
+    score_sim = 1 - abs(score1 - score2)
+    
+    # 亚家族相似度
+    subfamily_sim = 1.0 if seq1.get('subfamily_id') == seq2.get('subfamily_id') else 0.0
+    
+    # 加权平均
+    feature_similarity = (
+        length_sim * 0.3 +
+        gc_sim * 0.2 +
+        score_sim * 0.2 +
+        subfamily_sim * 0.3
+    )
+    
+    return feature_similarity
+
+
+def _select_valuable_low_sequences(low_sequences: List[Dict]) -> List[Dict]:
+    """选择有特殊价值的低质量序列"""
+    
+    if not low_sequences:
+        return []
+    
+    valuable = []
+    
+    # 选择特别长的序列（可能是完整但质量较低的TE）
+    long_sequences = [s for s in low_sequences 
+                     if len(s.get('sequence', '')) > 3000]
+    
+    if long_sequences:
+        # 选择最长的前3个
+        long_sequences.sort(key=lambda x: len(x.get('sequence', '')), reverse=True)
+        valuable.extend(long_sequences[:3])
+    
+    # 选择有强TSD支持的序列
+    tsd_sequences = [s for s in low_sequences 
+                    if s.get('tsd_support', 0) > 0.7 and s not in valuable]
+    
+    if tsd_sequences:
+        # 选择TSD支持最强的前2个
+        tsd_sequences.sort(key=lambda x: x.get('tsd_support', 0), reverse=True)
+        valuable.extend(tsd_sequences[:2])
+    
+    if valuable:
+        logger.info(f"Selected {len(valuable)} valuable low-quality sequences for inclusion")
+    
+    return valuable
 
 
 def improve_with_single_copy(seed_seq: Dict, copy: Dict) -> Dict:
@@ -1217,22 +1684,69 @@ def _calculate_consensus_quality_score(self, avg_identity: float, copy_count: in
 
 
 def _filter_and_grade_consensus(self, consensus_list: List[Dict], stats: Dict) -> List[Dict]:
-    """过滤和分级共识序列"""
-    filtered_consensus = []
+    """过滤和分级共识序列 - 增强版本
     
+    改进：
+    1. 增加质量验证层
+    2. 实现动态阈值系统
+    3. 严格的拒绝标准
+    """
+    if not consensus_list:
+        return []
+    
+    # 首先应用质量验证
+    validated_consensus = []
     for consensus in consensus_list:
-        quality_score = consensus.get('quality_score', 0)
+        # 基本长度过滤
         seq_length = len(consensus.get('sequence', ''))
-        
-        # 基本过滤
         if seq_length < self.config.min_length:
             continue
         
-        # 质量分级
-        if quality_score >= 0.8:
+        # 应用生物学验证
+        validations = _validate_consensus_quality(consensus)
+        consensus['validations'] = validations
+        consensus['validation_score'] = sum(validations.values()) / len(validations) if validations else 0
+        
+        # 计算综合质量分数（基础质量 + 验证分数）
+        base_quality = consensus.get('quality_score', 0)
+        validation_score = consensus['validation_score']
+        
+        # 综合评分：基础质量60% + 验证分数40%
+        final_score = base_quality * 0.6 + validation_score * 0.4
+        consensus['final_quality_score'] = final_score
+        
+        validated_consensus.append(consensus)
+    
+    if not validated_consensus:
+        return []
+    
+    # 计算动态阈值
+    quality_scores = [c.get('final_quality_score', 0) for c in validated_consensus]
+    thresholds = _calculate_adaptive_thresholds(quality_scores)
+    
+    logger.info(f"Dynamic quality thresholds: High={thresholds['high']:.3f}, "
+               f"Medium={thresholds['medium']:.3f}, Low={thresholds['low']:.3f}")
+    
+    # 应用动态分级和过滤
+    filtered_consensus = []
+    rejected_count = 0
+    
+    for consensus in validated_consensus:
+        final_score = consensus.get('final_quality_score', 0)
+        validation_score = consensus.get('validation_score', 0)
+        
+        # 严格的拒绝标准
+        if validation_score < 0.3 or final_score < thresholds['low']:
+            rejected_count += 1
+            logger.debug(f"Rejected {consensus['id']}: final_score={final_score:.3f}, "
+                        f"validation={validation_score:.3f}")
+            continue
+        
+        # 动态质量分级
+        if final_score >= thresholds['high']:
             consensus['quality_grade'] = 'high'
             stats['high_quality_consensus'] += 1
-        elif quality_score >= 0.6:
+        elif final_score >= thresholds['medium']:
             consensus['quality_grade'] = 'medium'
             stats['medium_quality_consensus'] += 1
         else:
@@ -1241,10 +1755,20 @@ def _filter_and_grade_consensus(self, consensus_list: List[Dict], stats: Dict) -
         
         filtered_consensus.append(consensus)
     
-    # 按质量分数排序
-    filtered_consensus.sort(key=lambda x: x.get('quality_score', 0), reverse=True)
+    # 记录拒绝统计
+    stats['rejected_consensus'] = rejected_count
     
-    logger.info(f"Filtered and graded {len(filtered_consensus)} consensus sequences")
+    # 按最终质量分数排序
+    filtered_consensus.sort(key=lambda x: x.get('final_quality_score', 0), reverse=True)
+    
+    logger.info(f"Enhanced filtering and grading complete:")
+    logger.info(f"  - Validated: {len(validated_consensus)} sequences")
+    logger.info(f"  - Passed: {len(filtered_consensus)} sequences")
+    logger.info(f"  - Rejected: {rejected_count} sequences")
+    logger.info(f"  - Quality distribution: High={stats.get('high_quality_consensus', 0)}, "
+               f"Medium={stats.get('medium_quality_consensus', 0)}, "
+               f"Low={stats.get('low_quality_consensus', 0)}")
+    
     return filtered_consensus
 
 
@@ -1318,68 +1842,157 @@ def _calculate_sequence_similarity(self, seq1: str, seq2: str) -> float:
 
 def _generate_phase4_compatible_output(self, consensus_sequences: List[Dict], 
                                       stats: Dict, sequence_categories: Dict) -> Dict[str, Any]:
-    """生成Phase 4兼容的输出格式"""
+    """生成Phase 4兼容输出格式（修改版）
+    
+    修改策略：
+    1. 保留所有高质量序列
+    2. 保留所有中等质量序列（不再使用智能选择）
+    3. 丢弃所有低质量序列（不再选择有价值序列）
+    4. Analysis library只包含高质量和中等质量序列
+    """
     
     # 按质量分级分离序列
     high_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'high']
     medium_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'medium']
     low_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'low']
     
-    # 生成masking library（95%去重，用于基因组屏蔽）
-    masking_library = high_quality + medium_quality[:len(medium_quality)//2]  # 取一半medium质量
+    logger.info(f"Quality distribution for modified selection strategy:")
+    logger.info(f"  High: {len(high_quality)}, Medium: {len(medium_quality)}, Low: {len(low_quality)}")
     
-    # 生成analysis library（90%去重，包含更多序列用于分析）
-    analysis_library = consensus_sequences
+    # 修改：全部保留高质量和中等质量序列，丢弃低质量序列
+    masking_library = high_quality.copy()  # 包含所有高质量序列
     
-    # 保存 Analysis library 为 FASTA 文件
-    self._save_analysis_library_fasta(analysis_library)
+    # 全部保留medium序列（不再使用智能选择）
+    if medium_quality:
+        selected_medium = medium_quality  # 直接使用所有中等质量序列
+        masking_library.extend(selected_medium)
+        logger.info(f"Keeping all {len(selected_medium)} medium quality sequences")
+    else:
+        selected_medium = []
+    
+    # 丢弃所有低质量序列（不再选择有价值的低质量序列）
+    valuable_low = []
+    if low_quality:
+        logger.info(f"Discarding {len(low_quality)} low quality sequences")
+    
+    # Analysis library只包含高质量和中等质量序列
+    analysis_library = high_quality + medium_quality
+    
+    # 保存增强的输出文件
+    self._save_enhanced_analysis_library_fasta(analysis_library, stats)
     
     result = {
         'masking_library': masking_library,
         'analysis_library': analysis_library,
         'statistics': stats,
         'phase3_complete': True,
-        'sequence_categories': sequence_categories,  # 传递给Phase 4作参考
+        'sequence_categories': sequence_categories,
         'quality_distribution': {
             'high': len(high_quality),
             'medium': len(medium_quality),
-            'low': len(low_quality)
+            'low': len(low_quality),
+            'masking_selected': {
+                'high': len(high_quality),
+                'medium': len(selected_medium),
+                'low': len(valuable_low)
+            }
+        },
+        'enhancement_metrics': {
+            'adaptive_thresholds_used': True,
+            'intelligent_medium_selection': False,  # 不再使用智能选择
+            'all_medium_retained': len(selected_medium) > 0,  # 全部保留中等质量序列
+            'valuable_low_selection': False,  # 不再选择低质量序列
+            'low_quality_discarded': len(low_quality) > 0,  # 丢弃低质量序列
+            'biological_validation': True,
+            'quality_components_tracked': True
         }
     }
     
-    logger.info(f"Generated Phase 4 compatible output:")
+    logger.info(f"Generated Phase 4 output (modified strategy):")
     logger.info(f"  - Masking library: {len(masking_library)} sequences")
-    logger.info(f"  - Analysis library: {len(analysis_library)} sequences")
+    logger.info(f"    (High: {len(high_quality)}, Medium: {len(selected_medium)} [ALL RETAINED], Low: {len(valuable_low)} [NONE])")
+    logger.info(f"  - Analysis library: {len(analysis_library)} sequences (High + Medium only)")
+    logger.info(f"  - Discarded: {len(low_quality)} low quality sequences")
+    logger.info(f"  - Strategy: Keep all high+medium quality, discard all low quality")
     
     return result
 
 
-def _save_analysis_library_fasta(self, analysis_library: List[Dict]):
-    """保存 Analysis library 为 FASTA 文件"""
+def _save_enhanced_analysis_library_fasta(self, analysis_library: List[Dict], stats: Dict):
+    """保存Analysis library为FASTA文件（修改版：仅包含高质量和中等质量序列）"""
     from pathlib import Path
     
-    # 确定输出文件路径
     output_dir = Path(self.config.output_dir)
-    fasta_file = output_dir / "phase3_analysis_library.fa"
+    
+    # 保存analysis library
+    analysis_file = output_dir / "phase3_analysis_library.fa"
+    stats_file = output_dir / "phase3_quality_statistics.txt"
     
     try:
-        with open(fasta_file, 'w') as f:
+        with open(analysis_file, 'w') as f:
             for seq in analysis_library:
                 seq_id = seq.get('id', 'unknown')
                 sequence = seq.get('sequence', '')
-                quality_grade = seq.get('quality_grade', 'unknown')
-                quality_score = seq.get('quality_score', 0.0)
-                copy_number = seq.get('copy_number', 0)
-                avg_identity = seq.get('avg_identity', 0.0)
-                source_id = seq.get('source_id', 'unknown')
                 
-                # 构建信息丰富的FASTA头部
-                header = f">{seq_id} quality={quality_grade} score={quality_score:.3f} copies={copy_number} identity={avg_identity:.1f}% source={source_id}"
+                # 构建详细的header信息
+                header_parts = [
+                    f">{seq_id}",
+                    f"grade={seq.get('quality_grade', 'unknown')}",
+                    f"final_score={seq.get('final_quality_score', 0):.3f}",
+                    f"base_score={seq.get('quality_score', 0):.3f}",
+                    f"validation={seq.get('validation_score', 0):.3f}",
+                    f"copies={seq.get('copy_number', 0)}",
+                    f"length={len(sequence)}"
+                ]
                 
-                f.write(f"{header}\n")
-                f.write(f"{sequence}\n")
+                if seq.get('tsd'):
+                    header_parts.append(f"tsd={seq['tsd']}")
+                
+                header = " ".join(header_parts)
+                f.write(f"{header}\n{sequence}\n")
         
-        logger.info(f"Saved Analysis library to: {fasta_file}")
+        logger.info(f"Saved analysis library (high+medium quality) to: {analysis_file}")
+        
+        # 保存详细统计信息
+        with open(stats_file, 'w') as f:
+            f.write("Phase 3 Quality Statistics (Modified Strategy)\n")
+            f.write("=" * 50 + "\n\n")
+            
+            f.write("Overall Statistics:\n")
+            for key, value in stats.items():
+                f.write(f"  {key}: {value}\n")
+            
+            f.write("\nQuality Component Analysis:\n")
+            # 统计各质量组件的分布
+            if analysis_library:
+                component_stats = defaultdict(list)
+                for seq in analysis_library:
+                    components = seq.get('quality_components', {})
+                    for comp_name, comp_value in components.items():
+                        component_stats[comp_name].append(comp_value)
+                
+                for comp_name, values in component_stats.items():
+                    if values:
+                        f.write(f"  {comp_name}:\n")
+                        f.write(f"    Mean: {np.mean(values):.3f}\n")
+                        f.write(f"    Std: {np.std(values):.3f}\n")
+                        f.write(f"    Min: {np.min(values):.3f}\n")
+                        f.write(f"    Max: {np.max(values):.3f}\n")
+            
+            f.write("\nValidation Results Summary:\n")
+            validation_counts = defaultdict(int)
+            for seq in analysis_library:
+                validations = seq.get('validations', {})
+                for val_name, val_result in validations.items():
+                    if val_result:
+                        validation_counts[val_name] += 1
+            
+            total_seqs = len(analysis_library)
+            for val_name, count in validation_counts.items():
+                percentage = (count / total_seqs * 100) if total_seqs > 0 else 0
+                f.write(f"  {val_name}: {count}/{total_seqs} ({percentage:.1f}%)\n")
+        
+        logger.info(f"Saved enhanced quality statistics to: {stats_file}")
         logger.info(f"  - Total sequences: {len(analysis_library)}")
         
         # 按质量分级统计
@@ -1388,10 +2001,16 @@ def _save_analysis_library_fasta(self, analysis_library: List[Dict]):
             grade = seq.get('quality_grade', 'unknown')
             quality_counts[grade] = quality_counts.get(grade, 0) + 1
         
-        logger.info(f"  - Quality distribution in FASTA: {quality_counts}")
+        logger.info(f"  - Quality distribution: {quality_counts}")
         
     except Exception as e:
-        logger.error(f"Failed to save Analysis library FASTA: {e}")
+        logger.error(f"Failed to save enhanced analysis files: {e}")
+
+
+def _save_analysis_library_fasta(self, analysis_library: List[Dict]):
+    """保存 Analysis library 为 FASTA 文件 - 保持向后兼容"""
+    # 调用增强版本
+    self._save_enhanced_analysis_library_fasta(analysis_library, {})
 
 
 # 为ConsensusBuilder类添加这些方法 - 在类定义后绑定
@@ -1407,3 +2026,4 @@ ConsensusBuilder._deduplicate_consensus_sequences = _deduplicate_consensus_seque
 ConsensusBuilder._calculate_sequence_similarity = _calculate_sequence_similarity
 ConsensusBuilder._generate_phase4_compatible_output = _generate_phase4_compatible_output
 ConsensusBuilder._save_analysis_library_fasta = _save_analysis_library_fasta
+ConsensusBuilder._save_enhanced_analysis_library_fasta = _save_enhanced_analysis_library_fasta
