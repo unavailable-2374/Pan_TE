@@ -483,6 +483,9 @@ sub run_sampling_track_independent {
                     
                     push @cumulative_consensi, abs_path("consensi.fa");
                     log_message("INFO", "Consensus checkpoint created", "sequences=$consensi_count, file=consensus.ok");
+                    
+                    # Now that consensi.fa is successfully generated, cleanup intermediate files
+                    cleanup_intermediate_files();
                 } else {
                     log_message("WARN", "No consensus sequences generated despite families found");
                 }
