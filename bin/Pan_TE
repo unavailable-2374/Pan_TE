@@ -189,7 +189,7 @@ def parse_arguments():
 class PanTEPipeline:
     """Implementation of the Pan TE Pipeline with step tracking and checkpoints."""
     
-    def __init__(self, genome_file: Optional[str], output_dir: str, threads: int = 4, 
+    def __init__(self, genome_file: Optional[str], output_dir: str, threads: int = 4,
                  model_dir: Optional[str] = None, vcf_dir: Optional[str] = None):
         """Initialize the pipeline with configuration parameters."""
         self.original_genome_file = os.path.abspath(genome_file) if genome_file else None
@@ -200,10 +200,11 @@ class PanTEPipeline:
         self.threads = threads
         self.model_dir = os.path.abspath(model_dir) if model_dir else None
         self.processed_genome = os.path.join(self.output_dir, 'genome', 'genome.fa')
-        
-        # Handle compressed genome file
+
+        # Set genome_file initially to original file path for validation
+        # Actual decompression will happen in process_genome() only if needed
         if self.original_genome_file:
-            self.prepare_genome_file()
+            self.genome_file = self.original_genome_file
 
         # Verify inputs
         if not self.genome_file and not self.vcf_dir:
@@ -353,11 +354,17 @@ class PanTEPipeline:
         """Step 1: Process genome and VCF files if provided."""
         if self.check_checkpoint('genome'):
             logger.info("Genome processing already completed, skipping...")
+            # When genome.ok exists, use the processed genome directly
+            self.genome_file = self.processed_genome
             return
-                
+
         genome_dir = os.path.join(self.output_dir, 'genome')
         processed_genome = os.path.join(genome_dir, 'genome.fa')
         os.makedirs(genome_dir, exist_ok=True)
+
+        # Decompress genome file if needed (only when checkpoint doesn't exist)
+        if self.original_genome_file:
+            self.prepare_genome_file()
             
         # Step 1: Process VCF files if provided
         combined_input = None
