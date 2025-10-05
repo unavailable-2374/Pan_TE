@@ -176,9 +176,17 @@ def run_build_ltr_consensus(rtr_dirs, chunk_files, original_genome, threads, out
     # Collect all .rtr files
     rtr_files = []
     for rtr_dir in rtr_dirs:
-        rtr_path = os.path.join(rtr_dir, "Rtr", "genome.rtr")
-        if os.path.exists(rtr_path):
-            rtr_files.append(rtr_path)
+        # Look for any .rtr file in the Rtr directory
+        rtr_subdir = os.path.join(rtr_dir, "Rtr")
+        if os.path.exists(rtr_subdir):
+            import glob
+            rtr_pattern = os.path.join(rtr_subdir, "*.rtr")
+            found_rtr = glob.glob(rtr_pattern)
+            if found_rtr:
+                rtr_files.extend(found_rtr)
+                print(f"Found {len(found_rtr)} .rtr file(s) in {rtr_subdir}")
+            else:
+                print(f"Warning: No .rtr files found in {rtr_subdir}")
     
     if not rtr_files:
         raise Exception("No .rtr files found from Look4LTRs runs")
@@ -265,12 +273,15 @@ def main():
     # Determine processing strategy based on genome size
     temp_dir = os.path.join(output_dir, "temp_parts")
     os.makedirs(temp_dir, exist_ok=True)
-    
+
+    # Create Look4LTRs directory upfront for all processing modes
+    look4ltrs_dir = os.path.join(output_dir, "Look4LTRs")
+    os.makedirs(look4ltrs_dir, exist_ok=True)
+
     if genome_size_gb <= 5:
         # Run on entire genome
         print("Running Look4LTRs on entire genome")
-        ltr_output_dir = os.path.join(output_dir, "Look4LTRs")
-        result_dirs = [run_look4ltrs_single(fasta_file, threads, ltr_output_dir)]
+        result_dirs = [run_look4ltrs_single(fasta_file, threads, look4ltrs_dir)]
         chunk_files = [fasta_file]  # Use original genome file
         
     elif genome_size_gb <= 10:
@@ -278,16 +289,19 @@ def main():
         print("Splitting genome into 2 parts")
         part_files = split_genome_evenly(fasta_file, 2, temp_dir)
         chunk_files = part_files  # Use split parts
-        
+        num_parts = len(part_files)
+        print(f"Actually generated {num_parts} parts")
+
         # Run Look4LTRs in parallel on parts
         result_dirs = []
-        with ProcessPoolExecutor(max_workers=2) as executor:
+        threads_per_part = max(1, threads // num_parts)
+        with ProcessPoolExecutor(max_workers=num_parts) as executor:
             futures = {}
             for i, part_file in enumerate(part_files):
-                part_output_dir = os.path.join(output_dir, f"Look4LTRs_part_{i+1}")
-                future = executor.submit(run_look4ltrs_single, part_file, threads//2, part_output_dir)
+                part_output_dir = os.path.join(look4ltrs_dir, f"part_{i+1}")
+                future = executor.submit(run_look4ltrs_single, part_file, threads_per_part, part_output_dir)
                 futures[future] = part_output_dir
-            
+
             for future in as_completed(futures):
                 result_dir = futures[future]
                 try:
@@ -302,15 +316,18 @@ def main():
         print("Splitting genome into 3 parts")
         part_files = split_genome_evenly(fasta_file, 3, temp_dir)
         chunk_files = part_files  # Use split parts
-        
+        num_parts = len(part_files)
+        print(f"Actually generated {num_parts} parts")
+
         result_dirs = []
-        with ProcessPoolExecutor(max_workers=3) as executor:
+        threads_per_part = max(1, threads // num_parts)
+        with ProcessPoolExecutor(max_workers=num_parts) as executor:
             futures = {}
             for i, part_file in enumerate(part_files):
-                part_output_dir = os.path.join(output_dir, f"Look4LTRs_part_{i+1}")
-                future = executor.submit(run_look4ltrs_single, part_file, threads//3, part_output_dir)
+                part_output_dir = os.path.join(look4ltrs_dir, f"part_{i+1}")
+                future = executor.submit(run_look4ltrs_single, part_file, threads_per_part, part_output_dir)
                 futures[future] = part_output_dir
-            
+
             for future in as_completed(futures):
                 result_dir = futures[future]
                 try:
@@ -325,15 +342,18 @@ def main():
         print("Splitting genome into 4 parts")
         part_files = split_genome_evenly(fasta_file, 4, temp_dir)
         chunk_files = part_files  # Use split parts
-        
+        num_parts = len(part_files)
+        print(f"Actually generated {num_parts} parts")
+
         result_dirs = []
-        with ProcessPoolExecutor(max_workers=4) as executor:
+        threads_per_part = max(1, threads // num_parts)
+        with ProcessPoolExecutor(max_workers=num_parts) as executor:
             futures = {}
             for i, part_file in enumerate(part_files):
-                part_output_dir = os.path.join(output_dir, f"Look4LTRs_part_{i+1}")
-                future = executor.submit(run_look4ltrs_single, part_file, threads//4, part_output_dir)
+                part_output_dir = os.path.join(look4ltrs_dir, f"part_{i+1}")
+                future = executor.submit(run_look4ltrs_single, part_file, threads_per_part, part_output_dir)
                 futures[future] = part_output_dir
-            
+
             for future in as_completed(futures):
                 result_dir = futures[future]
                 try:
@@ -347,15 +367,18 @@ def main():
         # Sample 4 chunks of ~5GB each
         print("Sampling 4 chunks of ~5GB each")
         chunk_files = sample_genome_chunks(fasta_file, 4, 5, temp_dir)
-        
+        num_chunks = len(chunk_files)
+        print(f"Actually generated {num_chunks} chunks")
+
         result_dirs = []
-        with ProcessPoolExecutor(max_workers=4) as executor:
+        threads_per_chunk = max(1, threads // num_chunks)
+        with ProcessPoolExecutor(max_workers=num_chunks) as executor:
             futures = {}
             for i, chunk_file in enumerate(chunk_files):
-                chunk_output_dir = os.path.join(output_dir, f"Look4LTRs_sample_{i+1}")
-                future = executor.submit(run_look4ltrs_single, chunk_file, threads//4, chunk_output_dir)
+                chunk_output_dir = os.path.join(look4ltrs_dir, f"sample_{i+1}")
+                future = executor.submit(run_look4ltrs_single, chunk_file, threads_per_chunk, chunk_output_dir)
                 futures[future] = chunk_output_dir
-            
+
             for future in as_completed(futures):
                 result_dir = futures[future]
                 try:
@@ -373,11 +396,7 @@ def main():
         sys.exit(1)
     
     print(f"Successfully completed {len(result_dirs)} Look4LTRs runs")
-    
-    # Create Look4LTRs directory for consensus building
-    look4ltrs_dir = os.path.join(output_dir, "Look4LTRs")
-    os.makedirs(look4ltrs_dir, exist_ok=True)
-    
+
     # Run build_ltr_consensus.py serially to combine results in Look4LTRs directory
     try:
         run_build_ltr_consensus(result_dirs, chunk_files, fasta_file, threads, look4ltrs_dir)

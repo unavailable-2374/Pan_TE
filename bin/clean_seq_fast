@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+Fast genome sequence cleaner - optimized for large genomes.
+Combines uppercase conversion and degenerate base cleaning in a single pass.
+"""
+import sys
+import time
+from pathlib import Path
+
+class FastSequenceCleaner:
+    """High-performance sequence cleaner using streaming I/O."""
+
+    def __init__(self):
+        """Initialize translation tables for maximum speed."""
+        # Create translation table for uppercase conversion + degenerate cleaning
+        # All letters to uppercase, degenerate bases to N
+        degenerate = set('WRMKYSHBVDXwrmkyshbvdx')
+
+        # Build single translation table: lowercase->uppercase, degenerate->N
+        trans_list = []
+        for i in range(256):
+            c = chr(i)
+            if c in degenerate:
+                trans_list.append(ord('N'))
+            elif c.islower() and c.isalpha():
+                # Use manual uppercase mapping to avoid multi-char issues
+                trans_list.append(i - 32)  # a-z (97-122) -> A-Z (65-90)
+            else:
+                trans_list.append(i)
+
+        self.trans_table = bytes(trans_list)
+        self.current_chr_num = 1
+
+    def get_next_chr_name(self) -> str:
+        """Get next chromosome name."""
+        chr_name = f"chr{self.current_chr_num}"
+        self.current_chr_num += 1
+        return chr_name
+
+    def process_file(self, input_file: Path, output_file: Path) -> None:
+        """Process input file with streaming I/O for maximum speed."""
+        start_time = time.time()
+        stats = {
+            'sequences': 0,
+            'bases': 0,
+            'bases_cleaned': 0
+        }
+
+        print(f"[FastCleaner] Processing: {input_file}", file=sys.stderr)
+
+        # Use binary mode with manual buffering for speed
+        BUFFER_SIZE = 1024 * 1024  # 1MB buffer
+
+        with open(input_file, 'rb') as inf, open(output_file, 'wb') as outf:
+            current_seq = bytearray()
+            current_header = None
+            last_progress = 0
+
+            for line in inf:
+                if line.startswith(b'>'):
+                    # Write previous sequence if exists
+                    if current_header is not None:
+                        # Translate: uppercase + clean in one pass
+                        original_len = len(current_seq)
+                        translated = current_seq.translate(self.trans_table)
+
+                        # Count cleaned bases
+                        stats['bases_cleaned'] += sum(1 for i in range(original_len)
+                                                     if current_seq[i] != translated[i])
+                        stats['bases'] += original_len
+
+                        # Write sequence with 80 char line wrapping
+                        outf.write(current_header)
+                        for i in range(0, len(translated), 80):
+                            outf.write(translated[i:i+80])
+                            outf.write(b'\n')
+
+                        stats['sequences'] += 1
+
+                        # Progress update every 100 sequences
+                        if stats['sequences'] - last_progress >= 100:
+                            elapsed = time.time() - start_time
+                            rate = stats['sequences'] / elapsed if elapsed > 0 else 0
+                            print(f"[FastCleaner] Processed {stats['sequences']} sequences "
+                                  f"({stats['bases']:,} bp) - {rate:.1f} seq/s",
+                                  file=sys.stderr, end='\r')
+                            last_progress = stats['sequences']
+
+                    # Start new sequence with renamed header
+                    new_id = self.get_next_chr_name()
+                    current_header = f">{new_id}\n".encode('ascii')
+                    current_seq = bytearray()
+                else:
+                    # Accumulate sequence (strip whitespace)
+                    current_seq.extend(line.strip())
+
+            # Write last sequence
+            if current_header is not None:
+                original_len = len(current_seq)
+                translated = current_seq.translate(self.trans_table)
+                stats['bases_cleaned'] += sum(1 for i in range(original_len)
+                                             if current_seq[i] != translated[i])
+                stats['bases'] += original_len
+
+                outf.write(current_header)
+                for i in range(0, len(translated), 80):
+                    outf.write(translated[i:i+80])
+                    outf.write(b'\n')
+                stats['sequences'] += 1
+
+        elapsed = time.time() - start_time
+
+        # Print final statistics
+        print(f"\n[FastCleaner] Completed in {elapsed:.1f}s", file=sys.stderr)
+        print(f"[FastCleaner] Sequences: {stats['sequences']}", file=sys.stderr)
+        print(f"[FastCleaner] Total bases: {stats['bases']:,}", file=sys.stderr)
+        print(f"[FastCleaner] Bases cleaned: {stats['bases_cleaned']:,} "
+              f"({100*stats['bases_cleaned']/stats['bases']:.2f}%)", file=sys.stderr)
+        print(f"[FastCleaner] Speed: {stats['bases']/elapsed/1e6:.1f} Mbp/s", file=sys.stderr)
+
+def main():
+    """Main execution function."""
+    if len(sys.argv) != 3:
+        print("Usage: clean_seq_fast <input_file> <output_file>", file=sys.stderr)
+        sys.exit(1)
+
+    input_file = Path(sys.argv[1])
+    output_file = Path(sys.argv[2])
+
+    if not input_file.exists():
+        print(f"Error: Input file not found: {input_file}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        cleaner = FastSequenceCleaner()
+        cleaner.process_file(input_file, output_file)
+        print(f"[FastCleaner] Output written to: {output_file}", file=sys.stderr)
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
