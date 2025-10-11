@@ -18,6 +18,8 @@ dependencies:
  - bedtools
  - ParaFly
  - Biopython
+ - umap-learn
+ - hdbscan
  - mafft
  - perl-Parallel-ForkManager
  - perl-log-log4perl
