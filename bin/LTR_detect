@@ -846,20 +846,12 @@ def main():
     look4ltrs_dir = os.path.join(output_dir, "Look4LTRs")
     os.makedirs(look4ltrs_dir, exist_ok=True)
 
-    # Check if any checkpoint exists - if so, skip Look4LTRs
-    checkpoint_files = [
-        os.path.join(look4ltrs_dir, "extract.ok"),
-        os.path.join(look4ltrs_dir, "cluster.ok"),
-        os.path.join(look4ltrs_dir, "consensus.ok"),
-        os.path.join(look4ltrs_dir, "refine.ok"),
-        os.path.join(look4ltrs_dir, "chimera.ok"),
-        os.path.join(look4ltrs_dir, "consensi.fa")
-    ]
+    # Define look4ltrs completion checkpoint
+    l4s_checkpoint = os.path.join(look4ltrs_dir, "l4s.ok")
 
-    has_checkpoint = any(os.path.exists(ckpt) for ckpt in checkpoint_files)
-
-    if has_checkpoint:
-        print("Found existing checkpoint, skipping Look4LTRs")
+    # Check if look4ltrs checkpoint exists
+    if os.path.exists(l4s_checkpoint):
+        print("Found l4s.ok checkpoint, skipping Look4LTRs execution")
         result_dirs = []
         # Check for part_* or sample_* subdirectories
         for item in os.listdir(look4ltrs_dir):
@@ -869,8 +861,10 @@ def main():
         # If no subdirectories, use look4ltrs_dir itself
         if not result_dirs:
             result_dirs = [look4ltrs_dir]
+        has_checkpoint = True
     else:
-        print("No checkpoint found, running Look4LTRs")
+        print("No l4s.ok checkpoint found, running Look4LTRs")
+        has_checkpoint = False
 
         # Get genome size
         genome_size_gb = get_file_size_gb(fasta_file)
@@ -983,7 +977,7 @@ def main():
         # Clean up temp_dir after Look4LTRs completes
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
-    
+
     # Only filter and check result_dirs if we ran Look4LTRs
     if not has_checkpoint:
         result_dirs = [d for d in result_dirs if d is not None]
@@ -993,6 +987,14 @@ def main():
             sys.exit(1)
 
         print(f"Successfully completed {len(result_dirs)} Look4LTRs runs\n")
+
+        # Create l4s.ok checkpoint after successful Look4LTRs execution
+        with open(l4s_checkpoint, 'w') as f:
+            f.write(f"Look4LTRs completed successfully\n")
+            f.write(f"Result directories: {len(result_dirs)}\n")
+            for d in result_dirs:
+                f.write(f"  - {d}\n")
+        print(f"Created checkpoint: {l4s_checkpoint}")
 
     try:
         final_consensus = build_ltr_library_with_modules(
