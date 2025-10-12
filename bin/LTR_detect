@@ -285,10 +285,11 @@ def refine_single_boundary(args):
         except Exception as genome_error:
             raise RuntimeError(f"Failed to initialize genome access: {str(genome_error)}")
 
+        # Initialize refiner with new simplified API
         refiner = LTRBoundaryRefiner(
-            advanced_tsd=True,
-            weighted_evidence=True,
-            kmer_boundary=True
+            min_ltr_len=100,
+            max_ltr_len=1500,
+            min_ltr_similarity=0.70
         )
 
         result = refiner.refine_boundaries(
@@ -796,40 +797,105 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
 
             # === Stage 2: Boundary detection using depth + structure ===
             print("\n  === Stage 2: Detecting boundaries using depth profile + LTR structure ===")
+
+            # Check for existing progress (resume capability)
+            progress_file = os.path.join(output_dir, "refine_progress.txt")
+            completed_seq_ids = set()
+
+            if os.path.exists(progress_file):
+                with open(progress_file, 'r') as f:
+                    completed_seq_ids = set(line.strip() for line in f if line.strip())
+                print(f"  Found existing progress: {len(completed_seq_ids)} sequences already refined")
+
+            # Filter out already completed sequences
+            pending_items = []
+            skipped_items = []
+            for item in extended_records_with_coords:
+                seq_id = item['record'].id
+                if seq_id in completed_seq_ids:
+                    skipped_items.append(item)
+                else:
+                    pending_items.append(item)
+
+            if skipped_items:
+                print(f"  Skipping {len(skipped_items)} already refined sequences")
+                print(f"  Processing {len(pending_items)} remaining sequences")
+            else:
+                print(f"  Processing all {len(pending_items)} sequences")
+
             print(f"  Using {threads} threads for parallel processing...")
+
+            # Load already refined sequences
+            refined_records = []
+            if os.path.exists(refined_file):
+                try:
+                    refined_records = list(SeqIO.parse(refined_file, "fasta"))
+                    print(f"  Loaded {len(refined_records)} previously refined sequences")
+                except:
+                    refined_records = []
 
             # Prepare arguments for parallel processing
             # Pass genome_seq_names to avoid each worker scanning the genome
             refine_args = [
                 (item, extended_alignments_by_query, genome_file, genome_seq_names)
-                for item in extended_records_with_coords
+                for item in pending_items
             ]
 
-            # Parallel processing with progress tracking
-            refined_records = []
+            # Parallel processing with progress tracking and incremental saving
             completed = 0
             total = len(refine_args)
 
-            with ProcessPoolExecutor(max_workers=threads) as executor:
-                futures = {executor.submit(refine_single_boundary, arg): i
-                          for i, arg in enumerate(refine_args)}
+            if total > 0:
+                with ProcessPoolExecutor(max_workers=threads) as executor:
+                    futures = {executor.submit(refine_single_boundary, arg): i
+                              for i, arg in enumerate(refine_args)}
 
-                for future in as_completed(futures):
-                    try:
-                        refined_record = future.result()
-                        refined_records.append(refined_record)
-                        completed += 1
+                    # Open files for incremental writing
+                    with open(refined_file, 'a') as refined_fa, \
+                         open(progress_file, 'a') as progress_f:
 
-                        # Progress report every 100 sequences
-                        if completed % 100 == 0 or completed == total:
-                            print(f"    Progress: {completed}/{total} sequences refined ({completed*100//total}%)")
+                        for future in as_completed(futures):
+                            try:
+                                refined_record = future.result()
 
-                    except Exception as e:
-                        idx = futures[future]
-                        seq_id = refine_args[idx][0]['record'].id
-                        print(f"    Error refining {seq_id}: {e}")
-                        # Keep original sequence on error
-                        refined_records.append(refine_args[idx][0]['record'])
+                                # Immediately save to file (incremental)
+                                SeqIO.write([refined_record], refined_fa, "fasta")
+                                refined_fa.flush()  # Force write to disk
+
+                                # Record progress
+                                progress_f.write(f"{refined_record.id}\n")
+                                progress_f.flush()  # Force write to disk
+
+                                refined_records.append(refined_record)
+                                completed += 1
+
+                                # Progress report every 100 sequences
+                                if completed % 100 == 0 or completed == total:
+                                    total_done = len(completed_seq_ids) + completed
+                                    total_all = len(extended_records_with_coords)
+                                    print(f"    Progress: {completed}/{total} (total: {total_done}/{total_all}, {total_done*100//total_all}%)")
+
+                            except Exception as e:
+                                idx = futures[future]
+                                seq_id = refine_args[idx][0]['record'].id
+                                print(f"    Error refining {seq_id}: {e}")
+
+                                # Keep original sequence on error
+                                original_record = refine_args[idx][0]['record']
+
+                                # Save error case too
+                                SeqIO.write([original_record], refined_fa, "fasta")
+                                refined_fa.flush()
+
+                                progress_f.write(f"{original_record.id}\n")
+                                progress_f.flush()
+
+                                refined_records.append(original_record)
+                                completed += 1
+
+                print(f"  ✓ Completed refining {completed} new sequences")
+            else:
+                print(f"  ✓ All sequences already refined, skipping")
 
         print(f"  Refined {len(refined_records)} sequences")
 
