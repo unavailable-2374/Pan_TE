@@ -1937,7 +1937,6 @@ class LTRBoundaryRefiner:
 
             cmd = [
                 'FastGA',
-                '-T4',           # Use 4 threads
                 '-c70',          # Minimum seed chain coverage 70%
                 '-i0.65',        # Minimum alignment identity 65%
                 '-l80',          # Minimum alignment length 80bp

@@ -1305,7 +1305,6 @@ class EnhancedTEClusteringPipeline:
         # Note: FastGA does not have -D flag, so we filter self-matches during parsing
         cmd = [
             "FastGA",
-            f"-T{self.threads}",  # Number of threads
             "-c70",               # Minimum seed chain coverage 70%
             "-i0.75",             # Minimum alignment identity 75% (TE-optimized)
             "-l80",               # Minimum alignment length 80bp

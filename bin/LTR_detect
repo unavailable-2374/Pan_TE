@@ -41,7 +41,6 @@ def align_consensus_to_genome(consensus_file, genome_file, output_paf, threads=4
     """
     cmd = [
         "FastGA",
-        f"-T{threads}",         # Number of threads
         "-c70",                 # Minimum seed chain coverage 70%
         "-i0.65",               # Minimum alignment identity 65%
         "-l80",                 # Minimum alignment length 80bp
