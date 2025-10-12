@@ -2021,9 +2021,31 @@ ConsensusBuilder._build_consensus_sequential = _build_consensus_sequential
 ConsensusBuilder._process_single_sequence_for_consensus = _process_single_sequence_for_consensus
 ConsensusBuilder._create_single_consensus = _create_single_consensus
 ConsensusBuilder._calculate_consensus_quality_score = _calculate_consensus_quality_score
-ConsensusBuilder._filter_and_grade_consensus = _filter_and_grade_consensus
 ConsensusBuilder._deduplicate_consensus_sequences = _deduplicate_consensus_sequences
 ConsensusBuilder._calculate_sequence_similarity = _calculate_sequence_similarity
 ConsensusBuilder._generate_phase4_compatible_output = _generate_phase4_compatible_output
 ConsensusBuilder._save_analysis_library_fasta = _save_analysis_library_fasta
-ConsensusBuilder._save_enhanced_analysis_library_fasta = _save_enhanced_analysis_library_fasta
+
+# STRATIFIED BIOLOGICAL FILTERING INTEGRATION
+# Replace default filtering with stratified biological filtering
+try:
+    from .phase3_stratified_integration import (
+        _filter_and_grade_consensus_stratified,
+        _save_enhanced_analysis_library_fasta_stratified
+    )
+
+    # Replace with stratified versions
+    ConsensusBuilder._filter_and_grade_consensus = _filter_and_grade_consensus_stratified
+    ConsensusBuilder._save_enhanced_analysis_library_fasta = _save_enhanced_analysis_library_fasta_stratified
+
+    logger.info("✓ Stratified biological filtering ENABLED")
+    logger.info("  - Using evidence-based tiered filtering")
+    logger.info("  - Output: high_quality_consensus.fasta (phase4)")
+    logger.info("  - Output: phase3_analysis_library.fa (Combine)")
+
+except ImportError as e:
+    # Fallback to default filtering if stratified module not available
+    logger.warning(f"Stratified filtering module not available: {e}")
+    logger.warning("Using default filtering method")
+    ConsensusBuilder._filter_and_grade_consensus = _filter_and_grade_consensus
+    ConsensusBuilder._save_enhanced_analysis_library_fasta = _save_enhanced_analysis_library_fasta
