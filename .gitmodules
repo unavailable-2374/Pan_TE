@@ -1,6 +1,3 @@
-[submodule "submodule/ClassifyTE"]
-	path = submodule/ClassifyTE
-	url = https://github.com/unavailable-2374/ClassifyTE.git
 [submodule "submodule/Look4LTRs"]
 	path = submodule/Look4LTRs
 	url = https://github.com/unavailable-2374/Look4LTRs.git
