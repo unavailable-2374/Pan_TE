@@ -291,9 +291,9 @@ class EnhancedTEClusteringPipeline:
         # Check clustering tools based on method
         if self.cluster_method == "auto":
             # For auto mode, check all tools
-            clustering_tools = ["minimap2", "mmseqs", "vsearch", "cd-hit-est"]
-        elif self.cluster_method == "minimap2":
-            clustering_tools = ["minimap2"]
+            clustering_tools = ["FastGA", "mmseqs", "vsearch", "cd-hit-est"]
+        elif self.cluster_method == "fastga":
+            clustering_tools = ["FastGA"]
         elif self.cluster_method == "mmseqs":
             clustering_tools = ["mmseqs"]
         elif self.cluster_method == "vsearch":
@@ -429,11 +429,11 @@ class EnhancedTEClusteringPipeline:
         
         # Priority order optimized for TE characteristics
         if diversity_score < 0.3 and length_cv < 0.5:  # Highly conserved TEs (like DNA transposons)
-            method_priority = ["vsearch", "mmseqs", "minimap2", "cd-hit-est"]
+            method_priority = ["vsearch", "mmseqs", "fastga", "cd-hit-est"]
         elif diversity_score < 0.6:  # Moderately diverse TEs (like LTR retrotransposons)
-            method_priority = ["minimap2", "vsearch", "mmseqs", "cd-hit-est"]
+            method_priority = ["fastga", "vsearch", "mmseqs", "cd-hit-est"]
         else:  # Highly diverse/degraded TEs (like ancient LINEs)
-            method_priority = ["minimap2", "cd-hit-est", "vsearch", "mmseqs"]
+            method_priority = ["fastga", "cd-hit-est", "vsearch", "mmseqs"]
             
         # Select first available method from priority list
         for method in method_priority:
@@ -477,8 +477,8 @@ class EnhancedTEClusteringPipeline:
         
         # Run coarse clustering
         method = self.select_clustering_method(sequences)
-        if method == "minimap2":
-            coarse_clusters, _ = self.run_minimap2_clustering(temp_input)
+        if method == "fastga":
+            coarse_clusters, _ = self.run_fastga_clustering(temp_input)
         elif method == "mmseqs":
             coarse_clusters, _ = self.run_mmseqs_clustering(temp_input)
         elif method == "vsearch":
@@ -526,8 +526,8 @@ class EnhancedTEClusteringPipeline:
                     self.coverage_threshold = fine_coverage
                     
                     # Run fine clustering
-                    if method == "minimap2":
-                        fine_clusters, _ = self.run_minimap2_clustering(fine_temp)
+                    if method == "fastga":
+                        fine_clusters, _ = self.run_fastga_clustering(fine_temp)
                     else:
                         # Use CD-HIT for fine clustering as fallback
                         fine_clusters, _ = self.run_cdhit_clustering(fine_temp)
@@ -1133,8 +1133,8 @@ class EnhancedTEClusteringPipeline:
             method = self.cluster_method
             
         # Run selected clustering method
-        if method == "minimap2":
-            return self.run_minimap2_clustering(input_file)
+        if method == "fastga":
+            return self.run_fastga_clustering(input_file)
         elif method == "mmseqs":
             return self.run_mmseqs_clustering(input_file)
         elif method == "vsearch":
@@ -1248,7 +1248,7 @@ class EnhancedTEClusteringPipeline:
             logger.warning(f"Failed to save enhanced statistics: {e}")
             
     # Include all original methods that weren't modified
-    # (preprocess_sequences, run_minimap2_clustering, run_mmseqs_clustering, etc.)
+    # (preprocess_sequences, run_fastga_clustering, run_mmseqs_clustering, etc.)
     # These remain the same as in the original script
     
     def preprocess_sequences(self, input_file):
@@ -1297,77 +1297,81 @@ class EnhancedTEClusteringPipeline:
         logger.info(f"Preprocessing complete: {input_seq_count} input sequences, {output_seq_count} sequences passed filtering")
         return preprocessed_file
         
-    def run_minimap2_clustering(self, input_file):
-        """Use minimap2 for TE-specific clustering"""
-        paf_file = os.path.join(self.temp_dir, f"minimap2_{int(time.time())}.paf")
-        
-        # TE-optimized minimap2 parameters
+    def run_fastga_clustering(self, input_file):
+        """Use FastGA for TE-specific clustering"""
+        paf_file = os.path.join(self.temp_dir, f"fastga_{int(time.time())}.paf")
+
+        # TE-optimized FastGA parameters
+        # Note: FastGA does not have -D flag, so we filter self-matches during parsing
         cmd = [
-            "minimap2",
-            "-x", "map-ont",  # Better for repetitive sequences than asm20
-            "-k", "19",       # Larger k-mer for TE specificity
-            "-w", "5",        # Smaller window for sensitivity
-            "-c",             # Output CIGAR in PAF
-            "-p", "0.7",      # Lower p-value for TE variants
-            "-N", "50",       # Reduce secondary alignments
-            "--cs=long",      # Detailed alignment info
-            "-D",             # Skip self and same matches
-            "-f", "0.0005",   # Lower frequency threshold for repetitive k-mers
-            "-g", "2000",     # Larger gap for nested TEs
-            "-r", "500",      # Bandwidth for TE variants
-            "-t", str(self.threads),
-            "-o", paf_file,
-            input_file, input_file
+            "FastGA",
+            f"-T{self.threads}",  # Number of threads
+            "-c70",               # Minimum seed chain coverage 70%
+            "-i0.75",             # Minimum alignment identity 75% (TE-optimized)
+            "-l80",               # Minimum alignment length 80bp
+            "-pafm",              # PAF output with CIGAR string
+            input_file,           # Target (self-alignment)
+            input_file            # Query (self-alignment)
         ]
-        
+
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            logger.info("minimap2 alignment complete")
-            
-            G = self.parse_minimap2_results(paf_file)
+            with open(paf_file, 'w') as outf:
+                subprocess.run(cmd, check=True, capture_output=True, stdout=outf)
+            logger.info("FastGA alignment complete")
+
+            G = self.parse_fastga_results(paf_file)
             clusters = self.identify_clusters_from_graph(G)
-            
+
             return clusters, input_file
-            
+
         except subprocess.CalledProcessError as e:
-            logger.error(f"minimap2 execution failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            logger.error(f"FastGA execution failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
             raise
             
-    def parse_minimap2_results(self, paf_file):
-        """Parse minimap2 PAF output, build sequence similarity graph"""
+    def parse_fastga_results(self, paf_file):
+        """Parse FastGA PAF output, build sequence similarity graph
+
+        FastGA PAF format: target first, query second
+        For self-alignment, we need to filter self-matches
+        """
         G = nx.Graph()
-        
+
         # TE-specific thresholds - more permissive for ancient/degraded TEs
         min_identity = max(0.7, self.identity_threshold - 0.05)  # Slightly lower for TE variants
         min_coverage = max(0.6, self.coverage_threshold - 0.1)   # More permissive coverage for fragmented TEs
-        
+
         with open(paf_file) as f:
             for line in f:
                 fields = line.strip().split("\t")
                 if len(fields) < 12:
                     continue
-                    
-                query_name = fields[0]
-                target_name = fields[5]
-                
+
+                # FastGA PAF format: target first (0-4), query second (5-9)
+                target_name = fields[0]    # In self-alignment, this is one sequence
+                target_len = int(fields[1])
+                target_start = int(fields[2])
+                target_end = int(fields[3])
+                query_name = fields[5]     # In self-alignment, this is another sequence
+                query_len = int(fields[6])
+                query_start = int(fields[7])
+                query_end = int(fields[8])
+                matches = int(fields[9])
+                alignment_len = int(fields[10])
+
+                # Skip self-matches (same sequence ID)
                 if query_name == target_name:
                     continue
-                    
-                query_len = int(fields[1])
-                target_len = int(fields[6])
-                alignment_len = int(fields[10])
-                matches = int(fields[9])
-                
+
                 identity = matches / alignment_len if alignment_len > 0 else 0
                 q_coverage = alignment_len / query_len if query_len > 0 else 0
                 t_coverage = alignment_len / target_len if target_len > 0 else 0
-                
+
                 # TE-specific coverage calculation - use maximum coverage for fragmented TEs
                 coverage = max(q_coverage, t_coverage) if abs(query_len - target_len) / max(query_len, target_len) > 0.3 else min(q_coverage, t_coverage)
-                
+
                 if identity >= min_identity and coverage >= min_coverage:
                     weight = identity * coverage
-                    
+
                     edge_data = {
                         'weight': weight,
                         'identity': identity,
@@ -1376,21 +1380,22 @@ class EnhancedTEClusteringPipeline:
                         'q_len': query_len,
                         't_len': target_len
                     }
-                    
+
                     if G.has_edge(query_name, target_name):
                         current_weight = G[query_name][target_name]['weight']
                         if weight > current_weight:
                             G[query_name][target_name].update(edge_data)
                     else:
                         G.add_edge(query_name, target_name, **edge_data)
-                        
+
+        # Add all nodes from PAF file (FastGA format: target=field[0], query=field[5])
         for line in open(paf_file):
             fields = line.strip().split("\t")
-            if len(fields) < 2:
+            if len(fields) < 6:
                 continue
-            G.add_node(fields[0])
-            G.add_node(fields[5])
-            
+            G.add_node(fields[0])  # target
+            G.add_node(fields[5])  # query
+
         logger.info(f"Graph built: {len(G.nodes())} nodes, {len(G.edges())} edges")
         return G
         
@@ -1554,8 +1559,8 @@ class EnhancedTEClusteringPipeline:
             
         except subprocess.CalledProcessError as e:
             logger.error(f"MMseqs2 failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
-            logger.info("Falling back to minimap2")
-            return self.run_minimap2_clustering(input_file)
+            logger.info("Falling back to FastGA")
+            return self.run_fastga_clustering(input_file)
         finally:
             if self.cleanup_temp:
                 try:
@@ -1692,8 +1697,8 @@ class EnhancedTEClusteringPipeline:
             
         except subprocess.CalledProcessError as e:
             logger.error(f"vsearch failed: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
-            logger.info("Falling back to minimap2")
-            return self.run_minimap2_clustering(input_file)
+            logger.info("Falling back to FastGA")
+            return self.run_fastga_clustering(input_file)
             
     def parse_vsearch_results(self, cluster_file):
         """Parse vsearch results"""
@@ -2079,7 +2084,7 @@ def main():
     parser.add_argument("input_fasta", help="Input FASTA file")
     parser.add_argument("output_dir", help="Output directory")
     
-    parser.add_argument("--method", choices=["auto", "minimap2", "mmseqs", "vsearch", "cdhit"], 
+    parser.add_argument("--method", choices=["auto", "fastga", "mmseqs", "vsearch", "cdhit"],
                        default="auto", help="Clustering method (default: auto - adaptive selection)")
     parser.add_argument("--identity", type=float, default=0.8,
                        help="Sequence identity threshold (0-1, default: 0.8, optimized for TE clustering)")

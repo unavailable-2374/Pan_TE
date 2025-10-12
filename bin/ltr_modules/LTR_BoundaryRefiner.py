@@ -1932,19 +1932,21 @@ class LTRBoundaryRefiner:
             temp_seq_file = os.path.join(self.temp_dir, f"{seq_id}_extended_{int(time.time())}_{random.randint(1000, 9999)}.fa")
             SeqIO.write([seq_record], temp_seq_file, "fasta")
             
-            # Run minimap2 alignment
+            # Run FastGA alignment
             temp_paf_file = temp_seq_file.replace('.fa', '.paf')
-            
+
             cmd = [
-                'minimap2',
-                '-x', 'map-ont',  # Long-read preset
-                '-c',  # Generate CIGAR
-                '-t', '4',  # Use 4 threads
-                self.genome_file,
-                temp_seq_file
+                'FastGA',
+                '-T4',           # Use 4 threads
+                '-c70',          # Minimum seed chain coverage 70%
+                '-i0.65',        # Minimum alignment identity 65%
+                '-l80',          # Minimum alignment length 80bp
+                '-pafm',         # PAF output with CIGAR string
+                self.genome_file,  # Target (genome) first
+                temp_seq_file      # Query (extended sequence) second
             ]
-            
-            self.logger.debug(f"Running minimap2: {' '.join(cmd)}")
+
+            self.logger.debug(f"Running FastGA: {' '.join(cmd)}")
             
             with open(temp_paf_file, 'w') as f:
                 result = subprocess.run(
@@ -1955,7 +1957,7 @@ class LTRBoundaryRefiner:
                 )
             
             if result.returncode != 0:
-                self.logger.warning(f"minimap2 failed with return code {result.returncode}")
+                self.logger.warning(f"FastGA failed with return code {result.returncode}")
                 return None
             
             # Parse PAF alignments
@@ -1982,70 +1984,70 @@ class LTRBoundaryRefiner:
     
     def _parse_paf_alignments(self, paf_file):
         """
-        Parse PAF format alignment file.
-        
-        PAF format (12 columns minimum):
-        0: Query sequence name
-        1: Query sequence length
-        2: Query start (0-based)
-        3: Query end (0-based)
+        Parse PAF format alignment file from FastGA.
+
+        FastGA PAF format (target first, query second):
+        0: Target sequence name (genome)
+        1: Target sequence length
+        2: Target start (0-based)
+        3: Target end (0-based)
         4: Strand ('+' or '-')
-        5: Target sequence name
-        6: Target sequence length
-        7: Target start (0-based)
-        8: Target end (0-based)
+        5: Query sequence name (extended LTR sequence)
+        6: Query sequence length
+        7: Query start (0-based)
+        8: Query end (0-based)
         9: Number of matching bases
         10: Alignment block length
         11: Mapping quality (0-255)
-        
+
         Args:
-            paf_file: Path to PAF file
-            
+            paf_file: Path to PAF file from FastGA
+
         Returns:
             List of alignment dictionaries
         """
         alignments = []
-        
+
         if not os.path.exists(paf_file) or os.path.getsize(paf_file) == 0:
             return alignments
-        
+
         try:
             with open(paf_file) as f:
                 for line in f:
                     if line.startswith('#'):
                         continue
-                    
+
                     fields = line.strip().split('\t')
                     if len(fields) < 12:
                         continue
-                    
-                    # Parse basic alignment fields
+
+                    # Parse FastGA PAF format (target first, query second)
                     aln = {
-                        'query_name': fields[0],
-                        'query_len': int(fields[1]),
-                        'query_start': int(fields[2]),
-                        'query_end': int(fields[3]),
+                        'target_name': fields[0],    # Genome sequence
+                        'target_len': int(fields[1]),
+                        'target_start': int(fields[2]),
+                        'target_end': int(fields[3]),
                         'strand': fields[4],
-                        'target_name': fields[5],
-                        'target_len': int(fields[6]),
-                        'target_start': int(fields[7]),
-                        'target_end': int(fields[8]),
+                        'query_name': fields[5],     # Extended LTR sequence
+                        'query_len': int(fields[6]),
+                        'query_start': int(fields[7]),
+                        'query_end': int(fields[8]),
                         'num_matches': int(fields[9]),
                         'block_len': int(fields[10]),
                         'mapq': int(fields[11])
                     }
-                    
+
                     # Calculate additional metrics
                     aln['query_cov'] = (aln['query_end'] - aln['query_start']) / aln['query_len']
                     aln['identity'] = aln['num_matches'] / aln['block_len'] if aln['block_len'] > 0 else 0
-                    
+
                     # Filter low-quality alignments
                     if aln['query_cov'] >= 0.5 and aln['identity'] >= 0.7:
                         alignments.append(aln)
-        
+
         except Exception as e:
             self.logger.warning(f"Error parsing PAF file: {e}")
-        
+
         return alignments
     
     
