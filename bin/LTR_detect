@@ -28,7 +28,7 @@ from ltr_modules import (
 
 def align_consensus_to_genome(consensus_file, genome_file, output_paf, threads=4):
     """
-    Align consensus sequences to genome using minimap2.
+    Align consensus sequences to genome using FastGA.
 
     Args:
         consensus_file: Path to consensus FASTA
@@ -40,27 +40,29 @@ def align_consensus_to_genome(consensus_file, genome_file, output_paf, threads=4
         True if successful, False otherwise
     """
     cmd = [
-        "minimap2",
-        "-x", "asm20",           # Tolerates ~20% divergence (for ancient LTRs)
-        "--secondary=yes",       # Report secondary alignments (detect all copies)
-        "-N", "200",            # Max 200 alignments per query
-        "-t", str(threads),
-        "--cs", "--eqx",        # For boundary refinement
-        "-o", output_paf,
-        genome_file,
-        consensus_file
+        "FastGA",
+        f"-T{threads}",         # Number of threads
+        "-c70",                 # Minimum seed chain coverage 70%
+        "-i0.65",               # Minimum alignment identity 65%
+        "-l80",                 # Minimum alignment length 80bp
+        "-pafm",                # PAF output with CIGAR string with ='s
+        genome_file,            # Target (genome) first
+        consensus_file          # Query (consensus) second
     ]
 
     try:
-        subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
+        with open(output_paf, 'w') as out_f:
+            subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=out_f)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"Warning: minimap2 alignment failed: {e}")
+        print(f"Warning: FastGA alignment failed: {e}")
         return False
 
 def parse_paf_alignments(paf_file, min_identity=70, min_coverage=50):
     """
-    Parse PAF file and return alignments grouped by query ID.
+    Parse PAF file from FastGA and return alignments grouped by query ID.
+
+    FastGA PAF format: target (genome) first, query (consensus) second
 
     Args:
         paf_file: Path to PAF file
@@ -84,15 +86,16 @@ def parse_paf_alignments(paf_file, min_identity=70, min_coverage=50):
             if len(fields) < 12:
                 continue
 
-            query_id = fields[0]
-            query_len = int(fields[1])
-            query_start = int(fields[2])
-            query_end = int(fields[3])
+            # FastGA format: target (genome) first, query (consensus) second
+            target_id = fields[0]
+            target_len = int(fields[1])
+            target_start = int(fields[2])
+            target_end = int(fields[3])
             strand = fields[4]
-            target_id = fields[5]
-            target_len = int(fields[6])
-            target_start = int(fields[7])
-            target_end = int(fields[8])
+            query_id = fields[5]
+            query_len = int(fields[6])
+            query_start = int(fields[7])
+            query_end = int(fields[8])
             num_matches = int(fields[9])
             aln_len = int(fields[10])
             mapq = int(fields[11])
@@ -574,7 +577,7 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
         print("[4/5] Refining boundaries...")
 
         # Step 4a: Align consensus to genome
-        print("  Aligning consensus sequences to genome with minimap2...")
+        print("  Aligning consensus sequences to genome with FastGA...")
         paf_file = os.path.join(output_dir, "consensus_to_genome.paf")
         align_success = align_consensus_to_genome(initial_consensus, genome_file, paf_file, threads=threads)
 
@@ -763,19 +766,54 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
         print("[5/5] Skipping (checkpoint exists)")
         split_records = list(SeqIO.parse(chimera_file, "fasta"))
 
-    # Step 6: Quality control
+    # Step 6: Quality control with dual filtering strategy
     if not os.path.exists(ckpt_final):
-        print("[6/6] Quality control...")
+        print("[6/6] Quality control with dual filtering strategy...")
         validator = LTRQualityValidator()
         high_quality_records = []
+        quality_pass_count = 0
+        copy_pass_count = 0
+        both_pass_count = 0
 
         for seq_record in split_records:
             quality = validator.comprehensive_quality_validation(str(seq_record.seq))
-            if quality['valid'] and quality['score'] >= 60:
+
+            # Extract copy number from description
+            # Format: "Cluster_X with Y members" or similar
+            copy_number = 0
+            desc = seq_record.description
+            if "members" in desc:
+                try:
+                    # Extract number before "members"
+                    parts = desc.split()
+                    for i, part in enumerate(parts):
+                        if part == "members" and i > 0:
+                            copy_number = int(parts[i-1])
+                            break
+                except (ValueError, IndexError):
+                    copy_number = 0
+
+            # Dual filtering strategy:
+            # 1. Keep sequences that meet quality requirements
+            quality_pass = quality['valid'] and quality['score'] >= 60
+            # 2. Keep sequences with copy number >= 5
+            copy_pass = copy_number >= 5
+
+            if quality_pass or copy_pass:
                 high_quality_records.append(seq_record)
+                if quality_pass and copy_pass:
+                    both_pass_count += 1
+                elif quality_pass:
+                    quality_pass_count += 1
+                else:
+                    copy_pass_count += 1
 
         SeqIO.write(high_quality_records, ckpt_final, "fasta")
-        print(f"  Final: {len(high_quality_records)} high-quality sequences")
+        print(f"  Filtering results:")
+        print(f"    - Quality pass only: {quality_pass_count}")
+        print(f"    - Copy number pass only (>=5): {copy_pass_count}")
+        print(f"    - Both pass: {both_pass_count}")
+        print(f"    - Total retained: {len(high_quality_records)} sequences")
     else:
         print("[6/6] Using existing final consensus")
 
