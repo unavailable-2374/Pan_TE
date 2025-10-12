@@ -75,15 +75,32 @@ class GenomeSeqkitAccess(GenomeAccess):
 
 
 class GenomeSimpleAccess(GenomeAccess):
-    """Simple genome access using BioPython"""
-    def __init__(self, genome_file, chunk_size):
+    """
+    Simple genome access using BioPython with optimized initialization.
+
+    Supports two modes:
+    1. Fast mode (with seq_names provided): Skip full genome scan
+    2. Fallback mode (no seq_names): Scan genome to get sequence IDs
+    """
+    def __init__(self, genome_file, chunk_size, seq_names=None):
         self.genome_file = genome_file
         self.chunk_size = chunk_size
         self.cache = {}
-        self._scan_genome()
+
+        # OPTIMIZATION: Accept pre-computed sequence names to avoid scanning
+        if seq_names is not None:
+            self.seq_names = set(seq_names) if not isinstance(seq_names, set) else seq_names
+            self.seq_dict = {}
+        else:
+            # Fallback: Scan genome file (slower)
+            self._scan_genome()
 
     def _scan_genome(self):
-        """Scan genome file to build index of sequence IDs"""
+        """
+        Scan genome file to build index of sequence IDs.
+
+        WARNING: This is expensive for large genomes. Prefer passing seq_names to __init__.
+        """
         self.seq_dict = {}
         self.seq_names = set()
 

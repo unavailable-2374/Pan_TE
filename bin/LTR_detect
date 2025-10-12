@@ -238,51 +238,78 @@ def refine_single_boundary(args):
     Worker function for parallel boundary refinement.
 
     Args:
-        args: Tuple of (item, extended_alignments_by_query, genome_file)
+        args: Tuple of (item, extended_alignments_by_query, genome_file, genome_seq_names)
+              genome_seq_names is optional; if None, GenomeSimpleAccess will scan genome
 
     Returns:
         Refined SeqRecord
     """
-    item, extended_alignments_by_query, genome_file = args
+    # Unpack arguments (handle both old and new format for compatibility)
+    if len(args) == 4:
+        item, extended_alignments_by_query, genome_file, genome_seq_names = args
+    else:
+        # Fallback for old format (without genome_seq_names)
+        item, extended_alignments_by_query, genome_file = args
+        genome_seq_names = None
 
     seq_record = item['record']
-    seq_alignments = extended_alignments_by_query.get(seq_record.id, [])
+    seq_id = seq_record.id
 
-    # Import here to avoid pickling issues with multiprocessing
-    from ltr_modules import LTRBoundaryRefiner, GenomeSimpleAccess
+    try:
+        seq_alignments = extended_alignments_by_query.get(seq_id, [])
 
-    if len(seq_alignments) < 2:
-        return seq_record
+        # Import here to avoid pickling issues with multiprocessing
+        from ltr_modules import LTRBoundaryRefiner, GenomeSimpleAccess
 
-    # Calculate depth profile from alignments
-    seq_len = len(seq_record.seq)
-    depth_profile = [0] * seq_len
+        if len(seq_alignments) < 2:
+            return seq_record
 
-    for aln in seq_alignments:
-        q_start = aln.get('query_start', 0)
-        q_end = aln.get('query_end', seq_len)
-        for pos in range(q_start, min(q_end, seq_len)):
-            depth_profile[pos] += 1
+        # Calculate depth profile from alignments
+        seq_len = len(seq_record.seq)
+        depth_profile = [0] * seq_len
 
-    # Find rough boundaries based on depth
-    rough_boundaries = find_boundaries_by_depth(depth_profile, seq_len)
+        for aln in seq_alignments:
+            q_start = aln.get('query_start', 0)
+            q_end = aln.get('query_end', seq_len)
+            for pos in range(q_start, min(q_end, seq_len)):
+                depth_profile[pos] += 1
 
-    # Use refiner for structural refinement
-    genome_seqs = GenomeSimpleAccess(genome_file, chunk_size=1000000)
-    refiner = LTRBoundaryRefiner(
-        advanced_tsd=True,
-        weighted_evidence=True,
-        kmer_boundary=True
-    )
+        # Find rough boundaries based on depth
+        rough_boundaries = find_boundaries_by_depth(depth_profile, seq_len)
 
-    result = refiner.refine_boundaries(
-        seq_record,
-        alignments=seq_alignments,
-        genome_seqs=genome_seqs,
-        iteration=2  # Iteration 2 = precise refinement mode
-    )
+        # Use refiner for structural refinement
+        # OPTIMIZATION: Pass pre-scanned sequence names to avoid repeated genome scanning
+        # Enhanced error handling for genome access
+        try:
+            genome_seqs = GenomeSimpleAccess(genome_file, chunk_size=1000000, seq_names=genome_seq_names)
+        except Exception as genome_error:
+            raise RuntimeError(f"Failed to initialize genome access: {str(genome_error)}")
 
-    return result['refined_record']
+        refiner = LTRBoundaryRefiner(
+            advanced_tsd=True,
+            weighted_evidence=True,
+            kmer_boundary=True
+        )
+
+        result = refiner.refine_boundaries(
+            seq_record,
+            alignments=seq_alignments,
+            genome_seqs=genome_seqs,
+            iteration=2  # Iteration 2 = precise refinement mode
+        )
+
+        if not result or 'refined_record' not in result:
+            raise RuntimeError(f"refine_boundaries returned invalid result: {result}")
+
+        return result['refined_record']
+
+    except Exception as e:
+        import traceback
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        tb_lines = traceback.format_exc().split('\n')
+        # Get last few lines of traceback for context
+        relevant_tb = '\n'.join([line for line in tb_lines[-6:-1] if line.strip()])
+        raise RuntimeError(f"Error processing {seq_id}\n{error_msg}\nTraceback:\n{relevant_tb}")
 
 def get_file_size_gb(file_path):
     """Get file size in GB"""
@@ -575,6 +602,19 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
     if not os.path.exists(ckpt_refine):
         print("[4/5] Refining boundaries...")
 
+        # OPTIMIZATION: Pre-scan genome once in main process to get sequence names
+        # This avoids each worker process scanning the entire genome file
+        print("  Pre-scanning genome for sequence IDs (optimization)...")
+        genome_seq_names = set()
+        try:
+            for record in SeqIO.parse(genome_file, "fasta"):
+                genome_seq_names.add(record.id)
+            print(f"  Found {len(genome_seq_names)} sequences in genome")
+        except Exception as e:
+            print(f"  Warning: Failed to pre-scan genome: {e}")
+            print(f"  Workers will scan genome individually (slower)")
+            genome_seq_names = None
+
         # Step 4a: Align consensus to genome
         print("  Aligning consensus sequences to genome with FastGA...")
         paf_file = os.path.join(output_dir, "consensus_to_genome.paf")
@@ -704,8 +744,9 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
             print(f"  Using {threads} threads for parallel processing...")
 
             # Prepare arguments for parallel processing
+            # Pass genome_seq_names to avoid each worker scanning the genome
             refine_args = [
-                (item, extended_alignments_by_query, genome_file)
+                (item, extended_alignments_by_query, genome_file, genome_seq_names)
                 for item in extended_records_with_coords
             ]
 
