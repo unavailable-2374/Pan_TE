@@ -303,6 +303,14 @@ def refine_single_boundary(args):
 
         return result['refined_record']
 
+    except MemoryError as e:
+        # Handle MemoryError specifically - likely a malformed or oversized sequence
+        import traceback
+        print(f"  MemoryError processing {seq_id} - likely malformed/oversized sequence")
+        print(f"  Sequence length: {len(seq_record.seq):,}bp")
+        # Return original sequence instead of crashing
+        return seq_record
+
     except Exception as e:
         import traceback
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -636,12 +644,16 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
         print("  === Stage 1: Extracting extended sequences from genome ===")
 
         # Fixed extension amount for initial extraction
-        initial_extension = 1500  # ±1500bp should be sufficient for most LTRs
+        initial_extension = 500  # ±500bp for boundary detection
 
         # Prepare BED file for batch extraction with bedtools
         bed_file = os.path.join(output_dir, "extension_regions.bed")
         bed_records = []
         seq_id_to_coords = {}
+
+        # Safety limits to prevent memory issues
+        max_extraction_length = 50000  # Max 50kb per extraction
+        skipped_oversized = 0
 
         for seq_record in consensus_records:
             seq_alignments = alignments_by_query.get(seq_record.id, [])
@@ -660,6 +672,13 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
             extended_start = max(0, genome_start - initial_extension)
             extended_end = genome_end + initial_extension
 
+            # Validate extraction size to prevent memory issues
+            extraction_size = extended_end - extended_start
+            if extraction_size > max_extraction_length:
+                print(f"  Warning: Skipping {seq_record.id} - extraction region too large ({extraction_size:,}bp)")
+                skipped_oversized += 1
+                continue
+
             # Store BED record (0-based, half-open)
             bed_records.append(f"{target_name}\t{extended_start}\t{extended_end}\t{seq_record.id}\n")
 
@@ -669,6 +688,9 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
                 'start': extended_start,
                 'end': extended_end
             }
+
+        if skipped_oversized > 0:
+            print(f"  Skipped {skipped_oversized} sequences due to oversized extraction regions")
 
         # Write BED file
         with open(bed_file, 'w') as f:
@@ -693,11 +715,44 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
             print(f"  Error running bedtools: {e.stderr.decode()}")
             raise
 
-        # Parse extracted sequences
+        # Parse extracted sequences with memory-efficient validation
         extended_records_with_coords = []
-        extracted_seqs = {rec.id: rec for rec in SeqIO.parse(extended_fasta, "fasta")}
+        extracted_seqs = {}
+
+        # Memory-efficient parsing with sequence length validation
+        print("  Loading extracted sequences with validation...")
+        skipped_count = 0
+        max_reasonable_length = 50000  # Max 50kb for LTR elements (reasonable limit)
+
+        try:
+            for rec in SeqIO.parse(extended_fasta, "fasta"):
+                seq_len = len(rec.seq)
+
+                # Validate sequence length
+                if seq_len > max_reasonable_length:
+                    print(f"  Warning: Skipping {rec.id} - sequence too long ({seq_len:,}bp > {max_reasonable_length:,}bp)")
+                    skipped_count += 1
+                    continue
+
+                if seq_len < 100:
+                    print(f"  Warning: Skipping {rec.id} - sequence too short ({seq_len}bp)")
+                    skipped_count += 1
+                    continue
+
+                extracted_seqs[rec.id] = rec
+
+        except MemoryError as e:
+            print(f"  ERROR: MemoryError while parsing sequences")
+            print(f"  This usually means one sequence is extremely long or the FASTA file is malformed")
+            print(f"  Loaded {len(extracted_seqs)} sequences successfully before error")
+            # Continue with what we have
+        except Exception as e:
+            print(f"  Warning: Error parsing some sequences: {e}")
+            print(f"  Continuing with {len(extracted_seqs)} successfully loaded sequences")
 
         print(f"  Extracted {len(extracted_seqs)} sequences from genome")
+        if skipped_count > 0:
+            print(f"  Skipped {skipped_count} sequences (length validation failed)")
 
         for seq_record in consensus_records:
             if seq_record.id in extracted_seqs:
