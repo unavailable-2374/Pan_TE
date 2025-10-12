@@ -4,3 +4,6 @@
 [submodule "submodule/FastGA"]
 	path = submodule/FastGA
 	url = https://github.com/thegenemyers/FASTGA.git
+[submodule "ClassifyTE"]
+	path = ClassifyTE
+	url = https://github.com/unavailable-2374/ClassifyTE.git

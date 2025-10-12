@@ -1,0 +1,57 @@
+#!/bin/bash
+#purpose: run Kmer counter in parallel
+#author: Optimized for parallel processing
+
+# Get number of CPU cores, use 80% to avoid system overload
+MAX_JOBS=$(( $(nproc) * 4 / 5 ))
+echo "Using $MAX_JOBS parallel jobs on $(nproc) cores"
+
+input_path="../input_data/"
+output_path2mer="../output_data/2mer/"
+output_path3mer="../output_data/3mer/"
+output_path4mer="../output_data/4mer/"
+
+# Function to process a single file for all k-mer sizes
+process_file() {
+    local file=$1
+    local input_path=$2
+    local output_path2mer=$3
+    local output_path3mer=$4
+    local output_path4mer=$5
+    
+    echo "Processing file: $file"
+    
+    # Process 2-mer
+    if [ ! -f "$output_path2mer/$file.txt" ]; then
+        java -Xmx1G -jar kanalyze.jar count -k 2 -f fasta -o "$output_path2mer/$file.txt" "$input_path/$file"
+    fi
+    
+    # Process 3-mer
+    if [ ! -f "$output_path3mer/$file.txt" ]; then
+        java -Xmx1G -jar kanalyze.jar count -k 3 -f fasta -o "$output_path3mer/$file.txt" "$input_path/$file"
+    fi
+    
+    # Process 4-mer
+    if [ ! -f "$output_path4mer/$file.txt" ]; then
+        java -Xmx1G -jar kanalyze.jar count -k 4 -f fasta -o "$output_path4mer/$file.txt" "$input_path/$file"
+    fi
+    
+    echo "Completed: $file"
+}
+
+# Export function and variables for parallel execution
+export -f process_file
+export input_path output_path2mer output_path3mer output_path4mer
+
+echo "Starting parallel k-mer feature generation..."
+
+# Use GNU parallel or xargs for parallel processing
+if command -v parallel >/dev/null 2>&1; then
+    # Use GNU parallel if available
+    cat list.txt | parallel -j $MAX_JOBS process_file {} $input_path $output_path2mer $output_path3mer $output_path4mer
+else
+    # Fallback to xargs with parallel processing
+    cat list.txt | xargs -n 1 -P $MAX_JOBS -I {} bash -c 'process_file "$@"' _ {} $input_path $output_path2mer $output_path3mer $output_path4mer
+fi
+
+echo "Parallel k-mer feature generation completed!"

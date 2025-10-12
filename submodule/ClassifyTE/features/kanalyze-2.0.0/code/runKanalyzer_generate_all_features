@@ -1,0 +1,66 @@
+#!/bin/sh
+#purpose: run Kmer counter
+#author: Manisha
+
+input_path="../input_data/"
+
+output_path2mer="../output_data/2mer/"
+output_path3mer="../output_data/3mer/"
+output_path4mer="../output_data/4mer/"
+
+echo "Generating 2mer features"
+
+for file in `cat list.txt`;
+do 
+	#===========================================================================================================
+	#Run kanalyzer to generate k-mer counts
+	
+	if [ -f ./$output_path/$file.txt ];
+	then
+		printf "file exists!!\n";
+	else
+		printf "running kanalyzer...";
+		java -Xmx3G -jar kanalyze.jar count -k 2 -f fasta -o $output_path2mer/$file.txt $input_path/$file;
+		printf "...DONE!!!\n";
+	fi
+	#===========================================================================================================
+done
+
+echo "Generating 3mer features"
+
+for file in `cat list.txt`;
+do 
+	#===========================================================================================================
+	#Run kanalyzer to generate k-mer counts
+	
+	if [ -f ./$output_path/$file.txt ];
+	then
+		printf "file exists!!\n";
+	else
+		printf "running kanalyzer...";
+		java -Xmx3G -jar kanalyze.jar count -k 3 -f fasta -o $output_path3mer/$file.txt $input_path/$file;
+		printf "...DONE!!!\n";
+	fi
+	#===========================================================================================================
+done
+
+
+echo "Generating 4mer features"
+
+for file in `cat list.txt`;
+do 
+	#===========================================================================================================
+	#Run kanalyzer to generate k-mer counts
+	
+	if [ -f ./$output_path/$file.txt ];
+	then
+		printf "file exists!!\n";
+	else
+		printf "running kanalyzer...";
+		java -Xmx3G -jar kanalyze.jar count -k 4 -f fasta -o $output_path4mer/$file.txt $input_path/$file;
+		printf "...DONE!!!\n";
+	fi
+	#===========================================================================================================
+done
+
+

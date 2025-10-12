@@ -1,0 +1,39 @@
+0.9.8
++ Added pre-count k-mer filtering to the count module.
++ Added --stdin, --stdout, and --input options to stream and count modules.
++ Added --lib and --liburl options to load libraries for dynamic classes.
++ Added timed put and take methods to BoundedQueue
+* Updated GUI components to make them more reusable.
+
+0.9.7
++ Added output format to the count module GUI.
++ Added convenience scripts to run the cite module.
++ Added -m option to the stream module.
+* Slight performance improvement to the sequence writer.
+* DEC output format was called INT in some places. Fixed. INT is now an alias for DEC, and either will output k-mers in decimal-integer format.
+* Count GUI's "Output File" field now resolves relative paths to KAnalyze's directory, not the user's home directory. This was a confusing default, and user's could not find their output.
+- Removed files "countgui" (linux package) and "countgui.exe" (windows package). Use count and count.exe to launch the GUI.
+
+0.9.6
+* Fixed a bug causing the stream module to write empty output files.
+* Fixed bad references in the manual.
++ Added FASTA format writer.
++ Added -m (--outfmt) option for selecting the output format.
+
+0.9.5
+* Fixed missing null-pointer checks.
+* Improved build system consitency.
+
+0.9.4
+* Added GNU LGPL to all files.
+* Impproved Javadoc comments.
+* Packages extract into the "kanalyze-<version>" directory.
+
+0.9.3
++ Added count module GUI.
++ Automated thread management with ComponentMonitor.
++ Added split-only mode to the count module.
++ Added keyword "max" to count module argument -g (--segsize).
+
+0.9.2
++ Added compressed file readers (fastagz and fastqgz).
