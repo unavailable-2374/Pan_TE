@@ -238,7 +238,8 @@ class LTRConsensusBuilder:
         if not os.path.exists(in_fa) or os.path.getsize(in_fa) == 0:
             return False
 
-        cmd = [exe, '--auto', '--quiet', in_fa]
+        # Use thread parameter for parallel execution
+        cmd = [exe, '--auto', '--quiet', '--thread', str(max(1, self.threads)), in_fa]
         try:
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   text=True, check=True)

@@ -199,7 +199,13 @@ def find_boundaries_by_depth(depth_profile, seq_len, window_size=50, drop_thresh
 
 def build_single_consensus(args):
     """
-    Worker function for parallel consensus building.
+    Worker function for parallel consensus building using MAFFT MSA.
+
+    Strategy:
+    - Single sequence: return as-is (no consensus needed)
+    - 2-3 sequences: use MSA with MAFFT (fast)
+    - 4+ sequences: use MSA with MAFFT (high quality)
+    - Each MAFFT uses 1 thread, parallelism via multiple processes
 
     Args:
         args: Tuple of (cluster_idx, member_ids, all_sequences_dict)
@@ -221,9 +227,14 @@ def build_single_consensus(args):
     if not cluster_seqs:
         return None
 
-    # Build consensus using LTRConsensusBuilder
-    builder = LTRConsensusBuilder(min_frac_major=0.60, threads=1)  # Single thread per cluster
-    consensus_seq = builder.build_consensus(cluster_seqs, method='weighted')
+    # Optimization: single sequence doesn't need consensus building
+    if len(cluster_seqs) == 1:
+        consensus_seq = cluster_seqs[0]
+    else:
+        # Build consensus using MSA method (MAFFT) with single thread per process
+        # Multiple processes run in parallel to achieve full CPU utilization
+        builder = LTRConsensusBuilder(min_frac_major=0.60, threads=1)  # 1 thread per MAFFT
+        consensus_seq = builder.build_consensus(cluster_seqs, method='msa')
 
     consensus_record = SeqRecord(
         Seq(consensus_seq),
@@ -624,10 +635,16 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
             print(f"  Workers will scan genome individually (slower)")
             genome_seq_names = None
 
-        # Step 4a: Align consensus to genome
-        print("  Aligning consensus sequences to genome with FastGA...")
+        # Step 4a: Align consensus to genome (with checkpoint)
         paf_file = os.path.join(output_dir, "consensus_to_genome.paf")
-        align_success = align_consensus_to_genome(initial_consensus, genome_file, paf_file, threads=threads)
+
+        # Check if alignment already exists
+        if os.path.exists(paf_file) and os.path.getsize(paf_file) > 0:
+            print(f"  Found existing alignment: {paf_file} (skipping FastGA run)")
+            align_success = True
+        else:
+            print("  Aligning consensus sequences to genome with FastGA...")
+            align_success = align_consensus_to_genome(initial_consensus, genome_file, paf_file, threads=threads)
 
         if not align_success:
             print("  Warning: Alignment failed, proceeding without alignments")
@@ -786,7 +803,14 @@ def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
         SeqIO.write(extended_records, extended_consensus_file, "fasta")
 
         extended_paf_file = os.path.join(output_dir, "extended_to_genome.paf")
-        align_success = align_consensus_to_genome(extended_consensus_file, genome_file, extended_paf_file, threads=threads)
+
+        # Check if alignment already exists
+        if os.path.exists(extended_paf_file) and os.path.getsize(extended_paf_file) > 0:
+            print(f"  Found existing extended alignment: {extended_paf_file} (skipping FastGA run)")
+            align_success = True
+        else:
+            print("  Running FastGA alignment for extended sequences...")
+            align_success = align_consensus_to_genome(extended_consensus_file, genome_file, extended_paf_file, threads=threads)
 
         if not align_success:
             print("  Warning: Re-alignment failed, using original sequences")
