@@ -8,13 +8,13 @@ use autodie;
 use File::Path qw(make_path remove_tree);
 use Cwd qw(abs_path);
 use POSIX qw(strftime);
+use File::Spec;
 
 # Constants
 use constant {
     MIN_SEQ_LENGTH => 50,
     DEFAULT_THREADS => 4,
     MAX_RETRIES => 3,
-    TMP_DIR => '.',
 };
 
 our $VERSION = '1.0.0';
@@ -46,14 +46,83 @@ sub init_environment {
     setup_directories();
     setup_logging();
     $config{out_dir} = abs_path($config{out_dir});
-    chdir($config{out_dir}) or die "Cannot change directory to $config{out_dir}: $!\n";
-    print "DEBUG: Changed working directory to $config{out_dir}\n";
+    $config{vcf_file} = abs_path($config{vcf_file});
 }
 
 sub process_data {
-    my $vcf_entries = read_vcf_file($config{vcf_file});
-    my $output_file = File::Spec->catfile($config{out_dir}, "processed.fa");
-    process_vcf_entries($vcf_entries, $output_file);
+    my $base_name = basename($config{vcf_file}, ".vcf");
+    my $output_file = File::Spec->catfile($config{out_dir}, "$base_name.fa");
+
+    log_message("Starting parallel processing with $config{threads} workers");
+
+    # Step 1: Count data lines (single pass)
+    my $total_lines = count_data_lines($config{vcf_file});
+    log_message("VCF has $total_lines data lines");
+
+    # Step 2: Calculate line ranges for each worker
+    my $num_workers = $config{threads};
+    $num_workers = $total_lines if $num_workers > $total_lines;  # Don't create more workers than lines
+
+    my $lines_per_worker = int(($total_lines + $num_workers - 1) / $num_workers);
+
+    # Step 3: Fork workers to process line ranges
+    my @output_files;
+    my @pids;
+
+    for my $i (0 .. $num_workers - 1) {
+        my $start_line = $i * $lines_per_worker;
+        my $end_line = ($i + 1) * $lines_per_worker - 1;
+        $end_line = $total_lines - 1 if $end_line >= $total_lines;
+
+        # Skip if this worker has no lines to process
+        last if $start_line >= $total_lines;
+
+        my $worker_output = File::Spec->catfile($config{out_dir}, "tmp_${base_name}_worker_${i}.fa");
+        push @output_files, $worker_output;
+
+        my $pid = fork();
+        if (!defined $pid) {
+            die "Fork failed: $!\n";
+        } elsif ($pid == 0) {
+            # Child process: read original file, process assigned line range
+            process_line_range($config{vcf_file}, $worker_output, $start_line, $end_line, $i);
+            exit(0);
+        } else {
+            push @pids, $pid;
+        }
+    }
+
+    # Step 4: Wait for all workers
+    for my $pid (@pids) {
+        waitpid($pid, 0);
+        if ($? != 0) {
+            warn "Worker process $pid exited with status $?\n";
+        }
+    }
+
+    # Step 5: Merge outputs
+    merge_outputs(\@output_files, $output_file);
+    log_message("Merged outputs to $output_file");
+
+    # Step 6: Cleanup worker outputs
+    for my $f (@output_files) {
+        unlink $f if -e $f;
+    }
+
+    print STDERR "PROGRESS:100\n";
+}
+
+sub count_data_lines {
+    my $file = shift;
+    my $count = 0;
+
+    open my $fh, '<', $file;
+    while (<$fh>) {
+        $count++ unless /^#/;
+    }
+    close $fh;
+
+    return $count;
 }
 
 ###############################################################################
@@ -102,7 +171,7 @@ sub validate_environment {
 }
 
 sub setup_directories {
-    make_path(TMP_DIR) unless -d TMP_DIR;
+    make_path($config{out_dir}) unless -d $config{out_dir};
 }
 
 sub setup_logging {
@@ -114,148 +183,151 @@ sub setup_logging {
 }
 
 ###############################################################################
-# VCF Processing Functions
+# Worker Processing Functions
 ###############################################################################
 
-sub read_vcf_file {
-    my $file = shift;
-    my @entries;
-    
-    log_message("Reading VCF file: $file");
-    open my $fh, '<', $file;
-    
-    my $total_lines = 0;
-    while (<$fh>) {
-        $total_lines++ unless /^#/;
-    }
-    
-    seek($fh, 0, 0);
-    
-    select((select(STDERR), $| = 1)[0]);
-    
-    my $processed = 0;
-    while (my $line = <$fh>) {
-        next if $line =~ /^#/;  # Skip headers
-        chomp $line;
-        
-        $processed++;
-        if ($processed % 100 == 0) {
-            my $percent = int(($processed / $total_lines) * 100);
-            print STDERR "PROGRESS:$percent\n";
-        }
-        
-        my @fields = split(/\t/, $line);
-        next unless @fields >= 5;  # Ensure minimum fields
-        
-        push @entries, {
-            chrom => $fields[0],
-            pos   => $fields[1],
-            ref   => $fields[3],
-            alt   => $fields[4],
-        };
-    }
-    
-    print STDERR "PROGRESS:100\n";
-    
-    close $fh;
-    log_message("Read " . scalar(@entries) . " VCF entries");
-    return \@entries;
-}
+sub process_line_range {
+    my ($vcf_file, $output_file, $start_line, $end_line, $worker_id) = @_;
+    my $base_name = basename($vcf_file, ".vcf");
+    my $temp_file = File::Spec->catfile($config{out_dir}, "tmp_${base_name}_allele_${worker_id}.fa");
 
-sub process_vcf_entries {
-    my $entries = shift;
-    my $base_name = basename($config{vcf_file}, ".vcf");
-    my $output_file = TMP_DIR . "/$base_name.fa";
-    my $temp_file = TMP_DIR . "/$base_name.tmp.fa";
-    
-    # Force immediate output flush
-    $| = 1;
-    select((select(STDERR), $| = 1)[0]);
-    
-    open my $out_fh, '>>', $output_file;
-    
-    my $total_entries = scalar(@$entries);
+    # Initialize worker output file
+    open my $out_fh, '>', $output_file;
+
+    # Open VCF and skip to our assigned range
+    open my $in_fh, '<', $vcf_file;
+
+    my $current_line = 0;  # Data line counter (excluding headers)
     my $processed = 0;
-    my $last_percent = -1;
-    
-    foreach my $entry (@$entries) {
-        my $alt_allele = $entry->{alt};
-        $processed++;
-        
-        # Calculate and display progress
-        my $percent = int(($processed / $total_entries) * 100);
-        if ($percent != $last_percent) {
-            print STDERR "PROGRESS:$percent\n";  # 特殊格式的进度信息
-            $last_percent = $percent;
+
+    while (my $line = <$in_fh>) {
+        # Skip headers
+        next if $line =~ /^#/;
+
+        # Skip lines before our range
+        if ($current_line < $start_line) {
+            $current_line++;
+            next;
         }
-        
+
+        # Stop after our range
+        last if $current_line > $end_line;
+
+        chomp $line;
+        my @fields = split(/\t/, $line);
+        $current_line++;
+
+        next unless @fields >= 5;
+
+        my $alt_allele = $fields[4];
+        $processed++;
+
+        # Report progress every 1000 entries
+        if ($processed % 1000 == 0) {
+            print STDERR "Worker $worker_id: processed $processed entries\n";
+        }
+
         next unless length($alt_allele) > MIN_SEQ_LENGTH;
-        
+
         if ($alt_allele =~ /,/) {
-            process_multiple_alleles($alt_allele, $base_name, $temp_file);
+            # Multi-allelic: write to temp, refine, append to output
+            process_multiple_alleles_worker($alt_allele, $out_fh, $temp_file);
         } else {
             print_sequence($out_fh, "SV", $alt_allele);
         }
     }
-    
+
+    close $in_fh;
     close $out_fh;
+
+    # Cleanup temp file if exists
+    unlink $temp_file if -e $temp_file;
+
+    print STDERR "Worker $worker_id: completed $processed entries (lines $start_line-$end_line)\n";
 }
 
-sub process_multiple_alleles {
-    my ($alt_allele, $base_name, $temp_file) = @_;
+sub process_multiple_alleles_worker {
+    my ($alt_allele, $out_fh, $temp_file) = @_;
     my @alleles = split(/,/, $alt_allele);
     my $long_alleles = 0;
 
-    my $tmp_dir = TMP_DIR;
-    make_path($tmp_dir) unless -d $tmp_dir;
-    
     open my $tmp_fh, '>', $temp_file;
-    
+
     for my $i (0 .. $#alleles) {
         if (length($alleles[$i]) > MIN_SEQ_LENGTH) {
             print_sequence($tmp_fh, $i, $alleles[$i]);
             $long_alleles++;
         }
     }
-    
+
     close $tmp_fh;
-    
+
     if ($long_alleles > 1) {
-        refine_alleles($temp_file, $base_name);
+        refine_alleles_worker($temp_file, $out_fh);
     } elsif ($long_alleles == 1) {
-        system("cat $temp_file >> " . TMP_DIR . "/$base_name.fa") == 0
-            or die "Failed to append single sequence: $!\n";
+        # Append single allele to output
+        open my $in_fh, '<', $temp_file;
+        while (<$in_fh>) {
+            print $out_fh $_;
+        }
+        close $in_fh;
     }
-    
+
     unlink $temp_file;
 }
 
-sub refine_alleles {
-    my ($temp_file, $base_name) = @_;
+sub refine_alleles_worker {
+    my ($temp_file, $out_fh) = @_;
 
-    $config{out_dir} = abs_path($config{out_dir});
-
-    chdir($config{out_dir}) or die "Cannot change directory to $config{out_dir}: $!\n";
-    
-    my $new_temp_file = File::Spec->catfile($config{out_dir}, "$base_name.tmp.fa");
-    my $output_fasta  = File::Spec->catfile($config{out_dir}, "$base_name.tmp.fa.out");
+    my $refiner_output = "${temp_file}.out";
 
     my $cmd = join(" ",
         "Refiner_for_Graph",
-        $new_temp_file,
-        $output_fasta,
+        $temp_file,
+        $refiner_output,
         "--distance-threshold", "0.8",
-        "-t", $config{threads},
-	"-v"
+        "-t", "1",
+        "-v"
     );
-    
+
     system($cmd) == 0
         or die "Feature Extraction Failure: $?\n";
 
-    my $final_fa = File::Spec->catfile($config{out_dir}, "$base_name.fa");
-    system("cat $output_fasta >> $final_fa")
-        == 0 or die "Failed to append Refine results: $!\n";
+    # Append refiner output to worker output
+    if (-e $refiner_output) {
+        open my $in_fh, '<', $refiner_output;
+        while (<$in_fh>) {
+            print $out_fh $_;
+        }
+        close $in_fh;
+        unlink $refiner_output;
+    }
 }
+
+###############################################################################
+# Output Merge Function
+###############################################################################
+
+sub merge_outputs {
+    my ($output_files, $final_output) = @_;
+
+    open my $out_fh, '>', $final_output;
+
+    for my $file (@$output_files) {
+        next unless -e $file && -s $file;  # Skip empty or non-existent files
+        open my $in_fh, '<', $file;
+        while (<$in_fh>) {
+            print $out_fh $_;
+        }
+        close $in_fh;
+    }
+
+    close $out_fh;
+}
+
+###############################################################################
+# Utility Functions
+###############################################################################
 
 sub print_sequence {
     my ($fh, $id, $sequence) = @_;
