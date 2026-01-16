@@ -356,7 +356,8 @@ sub cleanup_tmp_files {
             } else {
                 unlink($path) or warn "Could not remove file $path: $!";
             }
-            print "Removed $path\n";
+            # Don't print to STDOUT - causes deadlock with parent process
+            log_message("Removed $path") if $config{debug};
         }
     }
     closedir($dh);
