@@ -219,6 +219,7 @@ class PanTEPipeline:
 
         # Pipeline steps and their checkpoints
         self.steps = {
+            'vcf': 'vcf.ok',
             'genome': 'genome.ok',
             'ltr': 'LTR.ok',
             'repeatscout': 'RepeatScout.ok',
@@ -365,43 +366,52 @@ class PanTEPipeline:
         # Decompress genome file if needed (only when checkpoint doesn't exist)
         if self.original_genome_file:
             self.prepare_genome_file()
-            
+
         # Step 1: Process VCF files if provided
         combined_input = None
+        vcf_sequences = os.path.join(genome_dir, 'combined_vcf_sequences.fa')
+
         if self.vcf_dir:
-            logger.info("Processing VCF files...")
-            vcf_processor = VCFProcessor(
-                vcf_dir=self.vcf_dir,
-                output_dir=genome_dir,
-                total_threads=self.threads
-            )
-            try:
-                vcf_sequences = vcf_processor.process_all_vcfs()
-                logger.info(f"VCF processing completed: {vcf_sequences}")
-                
-                # Step 2: Combine VCF results with input genome
+            # Check if VCF processing already completed
+            if self.check_checkpoint('vcf'):
+                logger.info("VCF processing already completed, using cached result...")
+                if os.path.exists(vcf_sequences):
+                    logger.info(f"Using cached VCF sequences: {vcf_sequences}")
+                else:
+                    logger.warning(f"VCF checkpoint exists but sequences file not found: {vcf_sequences}")
+                    vcf_sequences = None
+            else:
+                logger.info("Processing VCF files...")
+                vcf_processor = VCFProcessor(
+                    vcf_dir=self.vcf_dir,
+                    output_dir=genome_dir,
+                    total_threads=self.threads
+                )
+                try:
+                    vcf_sequences = vcf_processor.process_all_vcfs()
+                    logger.info(f"VCF processing completed: {vcf_sequences}")
+
+                    # Create VCF checkpoint after successful processing
+                    self.create_checkpoint('vcf')
+                    logger.info("VCF checkpoint created")
+
+                except Exception as e:
+                    logger.error(f"VCF processing failed: {str(e)}")
+                    raise
+
+            # Combine VCF results with input genome (if VCF sequences exist)
+            if vcf_sequences and os.path.exists(vcf_sequences):
                 logger.info("Combining VCF results with input genome...")
                 combined_input = os.path.join(genome_dir, 'combined_input.fa')
                 # Use cat for faster file concatenation
                 self.run_cmd(f"cat {vcf_sequences} {self.genome_file} > {combined_input}")
-                
-                # Clean up VCF results file (DISABLED - keeping temp files)
-                # os.remove(vcf_sequences)
-                
+
                 # Update genome file path to combined file for processing
                 self.genome_file = combined_input
-                
-            except Exception as e:
-                logger.error(f"VCF processing failed: {str(e)}")
-                raise
 
-        # Step 3: Process the genome file (either combined or original)
+        # Step 2: Process the genome file (either combined or original)
         logger.info("Processing genome file...")
         self.process_single_genome(processed_genome)
-
-        # Clean up temporary files (DISABLED - keeping temp files)
-        # if combined_input and os.path.exists(combined_input):
-        #     os.remove(combined_input)
 
         # Update genome file path to processed version
         self.genome_file = processed_genome
