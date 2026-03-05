@@ -70,6 +70,11 @@ while (<BLST>) {
     }
 }
 
+# Flush last alignment at EOF (BLAST+ 2.14.1+ may omit "Parameters:" line)
+if (&filter) {
+    &report;
+}
+
 sub filter {
     # Basic score and identity filtering
     if ($score <= 0 || $score <= $score_cutoff || $iden <= $iden_cutoff) {

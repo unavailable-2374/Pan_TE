@@ -2,19 +2,19 @@
 use strict;
 use warnings;
 use FindBin;
-use File::Basename;
 use Parallel::ForkManager;
 
-# Simple version of build_for_RECON that avoids RepeatModeler dependencies
-# Focus on core functionality
+# RECON consensus builder: processes RECON families into refined consensus sequences
+# Uses RepeatModeler's Refiner exclusively
 
 our %families = ();
-# Enhanced thresholds for higher quality consensus
-our $familySizeCutoff = 15;          # Process families with 15 or more elements  
-our $minConsensusLength = 50;        # Minimum consensus sequence length (reduced from 100)
+# Balanced threshold for masked genome input where many TE copies are already removed
+# RepeatModeler uses 15 on unmasked genomes; 5 balances sensitivity vs noise on masked genomes
+our $familySizeCutoff = 5;           # Process families with 5+ elements (was 3, original 15)
+our $minConsensusLength = 50;        # Minimum consensus sequence length
 our $minRefinerScore = 150;          # Restored original score threshold
-our $minAlignmentSize = 8;           # Reduced minimum alignment size (from 8 to 5)
-our $maxLowComplexity = 0.55;         # Slightly more permissive for low complexity
+our $minAlignmentSize = 3;           # Allow consensus from fewer aligned copies (was 8)
+our $maxLowComplexity = 0.55;        # Low complexity threshold
 our $DEBUG = 0;  # Disable debug for production
 
 die "Usage: $0 workDir genomeDB total_threads\n" unless @ARGV == 3;
@@ -160,10 +160,6 @@ sub process_families {
     my ($families_ref, $sequences_ref, $workDir) = @_;
     my %refinableFamilies;
     
-    # Open consensus output file - use temporary file to avoid data loss
-    my $temp_consensi = "$workDir/consensi.fa.tmp";
-    open my $fh_cons, '>', $temp_consensi or die "Cannot create $temp_consensi: $!";
-    
     # Process families sorted by size
     my @sortedKeys = sort {
         @{$families_ref->{$b}->{elements}} <=> @{$families_ref->{$a}->{elements}}
@@ -192,15 +188,6 @@ sub process_families {
         if ($success) {
             $refinableFamilies{$familyID}++;
         }
-    }
-    
-    close $fh_cons;
-    
-    # Move temp file to final location only if we have data
-    if (-s $temp_consensi) {
-        rename($temp_consensi, "$workDir/consensi.fa") or die "Cannot rename temp file: $!";
-    } else {
-        unlink $temp_consensi;  # Remove empty temp file
     }
     
     print "Processed $processed_count families for refinement\n";
@@ -288,49 +275,99 @@ sub process_single_family {
     }
 }
 
+sub detect_rm_refiner {
+    # Detect RepeatModeler's purpose-built Refiner binary
+    # It uses iterative pairwise seed alignment with rmblastn, specifically
+    # designed for diverged/fragmented TE sequences
+    my @search_paths;
+
+    # Check CONDA_PREFIX first
+    if ($ENV{CONDA_PREFIX}) {
+        push @search_paths, "$ENV{CONDA_PREFIX}/share/RepeatModeler/Refiner";
+    }
+
+    # Check PATH
+    my $which_refiner = `which Refiner 2>/dev/null`;
+    chomp $which_refiner;
+    push @search_paths, $which_refiner if $which_refiner && -x $which_refiner;
+
+    for my $path (@search_paths) {
+        if (-f $path && -x $path) {
+            # Verify it's the real RM Refiner by checking version output
+            my $check = `$path 2>&1 | head -5`;
+            if ($check =~ /Refiner.*\d+\.\d+/) {
+                print "Detected RepeatModeler Refiner: $path\n";
+                return $path;
+            }
+        }
+    }
+
+    return undef;  # Not found
+}
+
 sub run_parallel_refiners {
     my ($refinableFamilies_ref, $workDir, $threads) = @_;
-    
+
+    # Detect RepeatModeler Refiner (required)
+    my $rm_refiner = detect_rm_refiner();
+    unless (defined $rm_refiner) {
+        die "ERROR: RepeatModeler Refiner not found. Please ensure RepeatModeler is installed and Refiner is accessible via \$CONDA_PREFIX/share/RepeatModeler/Refiner or in PATH.\n";
+    }
+    print "Using RepeatModeler Refiner: $rm_refiner\n";
+
     # More flexible thread allocation for better parallelization
     my $max_parallel;
+    my $threads_per_job;
     if ($threads <= 4) {
-        $max_parallel = 1;  # Single process for small thread counts
+        $max_parallel = 1;
+        $threads_per_job = $threads;
     } elsif ($threads <= 8) {
-        $max_parallel = 2;  # 2 processes, ~2-4 threads each
+        $max_parallel = 2;
+        $threads_per_job = int($threads / 2);
     } elsif ($threads <= 16) {
-        $max_parallel = 4;  # 4 processes, ~2-4 threads each
+        $max_parallel = 4;
+        $threads_per_job = int($threads / 4);
     } else {
-        $max_parallel = int($threads / 4);  # 4 threads per process for large counts
+        $max_parallel = int($threads / 4);
+        $threads_per_job = 4;
     }
-    
+    $threads_per_job = 1 if $threads_per_job < 1;
+
     print "Running Refiner on " . scalar(keys %$refinableFamilies_ref) . " families with max $max_parallel parallel jobs\n";
-    
+
     my $pm = Parallel::ForkManager->new($max_parallel);
-    
+
     my $processed = 0;
     foreach my $familyID (keys %$refinableFamilies_ref) {
         $pm->start and next;
-        
+
         $processed++;
         my $instancesFile = "family-$familyID.fa";
         my $output_file = "$instancesFile.refiner_cons";
-        
-        # Run Refiner with enhanced parameters for higher quality
-        my $cmd = "$FindBin::RealBin/Refiner.py $instancesFile $output_file -t 4 --min-score $minRefinerScore --gap-init 25 --gap-ext 8 2> refine_$familyID.log";
-        
+
+        my $cmd = "$rm_refiner -threads $threads_per_job $instancesFile 2> refine_$familyID.log";
+
         if ($DEBUG && $processed <= 3) {
             print "Running: $cmd\n";
         }
-        
+
         my $result = system($cmd);
-        
-        if ($result != 0 && $DEBUG) {
-            print "WARNING: Refiner failed for family $familyID (exit code: $result)\n";
+
+        if ($result != 0) {
+            my $exit_code = $result >> 8;
+            my $log_file = "$workDir/refine_$familyID.log";
+            my $error_msg = "";
+            if (-f $log_file) {
+                $error_msg = `tail -5 '$log_file' 2>/dev/null`;
+                chomp $error_msg;
+            }
+            print "WARNING: Refiner failed for family $familyID (exit code: $exit_code)\n";
+            print "  Log tail: $error_msg\n" if $error_msg;
         }
-        
+
         $pm->finish;
     }
-    
+
     $pm->wait_all_children;
     print "Completed Refiner processing\n";
 }
@@ -357,29 +394,43 @@ sub process_refined_families {
     
     foreach my $familyID (keys %$refinableFamilies_ref) {
         my $refiner_cons = "$workDir/family-$familyID.fa.refiner_cons";
-        
+
         next unless -s $refiner_cons;  # Skip empty files
-        
+
         open my $fh_in, '<', $refiner_cons or next;
         my ($cons, $maSize) = ('', 1);
         my $in_sequence = 0;
-        
+        my $is_rm_refiner = 0;
+
         while (<$fh_in>) {
             if (/^>.*consensus from (\d+) copies, method=(\w+)/) {
+                # Refiner.py format: >gi|1_consensus consensus from 28 copies, method=mafft
                 $maSize = $1;
                 my $method = $2;
                 $in_sequence = 1;
-                # Enhanced Refiner provides method information
                 if ($DEBUG && $consensus_count < 3) {
                     print "Family $familyID: consensus built using method '$method' from $maSize copies\n";
                 }
                 next;
             } elsif (/^>.*consensus from (\d+) copies/) {
+                # Refiner.py format without method
                 $maSize = $1;
                 $in_sequence = 1;
                 next;
             } elsif (/^>/) {
+                # RM Refiner format: >family-N_consensus or other header
+                # Estimate copy count from input FASTA sequence count
+                $is_rm_refiner = 1;
                 $in_sequence = 1;
+                my $family_fa = "$workDir/family-$familyID.fa";
+                if (-f $family_fa) {
+                    my $seq_count = `grep -c '^>' '$family_fa' 2>/dev/null || echo 1`;
+                    chomp $seq_count;
+                    $maSize = $seq_count || 1;
+                }
+                if ($DEBUG && $consensus_count < 3) {
+                    print "Family $familyID: RM Refiner consensus, estimated $maSize copies from input\n";
+                }
                 next;
             } elsif ($in_sequence && !/^>/) {
                 chomp;

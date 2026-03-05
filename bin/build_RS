@@ -154,51 +154,44 @@ sub setup_environment {
 }
 
 sub run_pipeline {
-    $logger->info("Starting multi-parameter RepeatScout pipeline...");
+    $logger->info("Starting mdl-repeat pipeline...");
 
-    # Get genome size and determine strategy
+    # Get genome size and determine sampling strategy
     my $genome_size = -s $config{genome_file};
     my $readable_size = sprintf("%.2f", $genome_size/1e9) . " GB";
     $logger->info("Processing genome of size: $readable_size");
 
-    # Determine multi-parameter strategy based on genome size
-    my ($strategy, $data_size, $lmer_sizes_ref, $copy_thresholds_ref, $num_samples) = determine_strategy($genome_size);
-    
-    $logger->info("Strategy: $strategy");
-    $logger->info("Data size per sample: " . sprintf("%.2f", $data_size/1e6) . " MB");
-    $logger->info("Number of samples: $num_samples");
-    $logger->info("L-mer sizes: " . join(", ", @$lmer_sizes_ref));
-    $logger->info("Copy thresholds: " . join(", ", @$copy_thresholds_ref));
-    
-    my $total_jobs = $num_samples * scalar(@$lmer_sizes_ref);
-    $logger->info("Total RepeatScout jobs: $total_jobs");
+    my ($strategy, $data_size) = determine_strategy($genome_size);
 
-    # Check for existing RepeatScout checkpoint
+    $logger->info("Strategy: $strategy");
+    $logger->info("Data size: " . sprintf("%.2f", $data_size/1e6) . " MB");
+
+    # Check for existing mdl-repeat checkpoint
     my $rs_output = "$config{tmp_dir}/repeats.fa";
     my $repeatscout_checkpoint = "repeatscout_complete";
-    
+
     if (check_checkpoint($repeatscout_checkpoint) && -s $rs_output && !$config{force_overwrite}) {
-        $logger->info("Found existing RepeatScout checkpoint and results, skipping to refinement...");
+        $logger->info("Found existing mdl-repeat checkpoint and results, skipping to refinement...");
     } elsif (-s $rs_output && !$config{force_overwrite}) {
-        $logger->info("Found existing RepeatScout results without checkpoint, creating checkpoint...");
+        $logger->info("Found existing mdl-repeat results without checkpoint, creating checkpoint...");
         create_checkpoint($repeatscout_checkpoint);
     } else {
-        # Run multi-parameter RepeatScout
-        run_multi_parameter_repeatscout($strategy, $data_size, $lmer_sizes_ref, $copy_thresholds_ref, $num_samples);
-        
-        # Create checkpoint after successful RepeatScout completion
+        # Run mdl-repeat
+        run_mdl_repeat($strategy, $data_size);
+
+        # Create checkpoint after successful completion
         if (-s $rs_output) {
             create_checkpoint($repeatscout_checkpoint);
-            $logger->info("RepeatScout completion checkpoint created successfully");
+            $logger->info("mdl-repeat completion checkpoint created successfully");
         } else {
-            $logger->error("RepeatScout did not produce output file: $rs_output");
-            die "RepeatScout pipeline failed\n";
+            $logger->error("mdl-repeat did not produce output file: $rs_output");
+            die "mdl-repeat pipeline failed\n";
         }
     }
-    
+
     # Run Refiner pipeline
     refine_consensus();
-    
+
     # Final cleanup of tmp directory - remove all HTML and remaining part files
     cleanup_tmp_directory();
 
@@ -207,186 +200,79 @@ sub run_pipeline {
 
 sub determine_strategy {
     my ($genome_size) = @_;
-    
-    my $mb_200 = 200 * 1024 * 1024;    # 200MB
-    my $mb_800 = 400 * 1024 * 1024;   # 400MB  
-    my $gb_1 = 1 * 1024 * 1024 * 1024; # 1GB
-    my $gb_2 = 2 * 1024 * 1024 * 1024; # 2GB
-    my $gb_3 = 3 * 1024 * 1024 * 1024; # 3GB
-    my $gb_5 = 5 * 1024 * 1024 * 1024; # 5GB
-    
-    my (@lmer_sizes, @copy_thresholds, $strategy, $data_size, $num_samples);
-    
-    if ($genome_size < $mb_200) {
-        # Small genomes <200MB: use full genome
-        @lmer_sizes = (14, 16);
-        @copy_thresholds = (5, 3);
-        $strategy = "small_genome_parallel";
+
+    my $mb_800 = 400 * 1024 * 1024;   # 400MB
+
+    my ($strategy, $data_size);
+
+    if ($genome_size < $mb_800) {
+        # Small/medium genomes: use full genome
+        $strategy = "full_genome";
         $data_size = $genome_size;
-        $num_samples = 1;
+    } else {
+        # Large genomes: sample ~800MB
+        $strategy = "sampled";
+        $data_size = $mb_800;
     }
-    elsif ($genome_size >= $mb_200 && $genome_size < $gb_1) {
-        # Medium genomes 200MB-1GB
-        @lmer_sizes = (14, 16, 18);
-        @copy_thresholds = (5, 5, 3);
-        if ($genome_size < $mb_800) {
-            $strategy = "medium_genome_full";
-            $data_size = $genome_size;
-            $num_samples = 1;
-        } else {
-            $strategy = "medium_genome_sampled";
-            $data_size = $mb_800;  # Sample 800MB
-            $num_samples = 1;
-        }
-    }
-    elsif ($genome_size >= $gb_1 && $genome_size < $gb_2) {
-        # Large genomes 1-2GB: single 800MB sample
-        @lmer_sizes = (14, 16, 18);
-        @copy_thresholds = (5, 5, 3);
-        $strategy = "large_genome_sampled";
-        $data_size = $mb_800;  # Sample 800MB
-        $num_samples = 1;
-    }
-    elsif ($genome_size >= $gb_2 && $genome_size < $gb_3) {
-        # Very large genomes 2-3GB: 2 samples of 800MB each (6 total jobs: 2 samples × 3 lmers)
-        @lmer_sizes = (14, 16, 18);
-        @copy_thresholds = (5, 5, 3);
-        $strategy = "very_large_genome_multi_sampled";
-        $data_size = $mb_800;  # Each sample 800MB
-        $num_samples = 2;
-    }
-    elsif ($genome_size >= $gb_3 && $genome_size < $gb_5) {
-        # Huge genomes 3-5GB: 3 samples of 800MB each (9 total jobs: 3 samples × 3 lmers)
-        @lmer_sizes = (14, 16, 18);
-        @copy_thresholds = (5, 5, 3);
-        $strategy = "huge_genome_multi_sampled";
-        $data_size = $mb_800;  # Each sample 800MB
-        $num_samples = 3;
-    }
-    else {
-        # Massive genomes >=5GB: 4 samples of 800MB each (12 total jobs: 4 samples × 3 lmers)
-        @lmer_sizes = (14, 16, 18);
-        @copy_thresholds = (5, 5, 3);
-        $strategy = "massive_genome_multi_sampled";
-        $data_size = $mb_800;  # Each sample 800MB
-        $num_samples = 4;
-    }
-    
-    return ($strategy, $data_size, \@lmer_sizes, \@copy_thresholds, $num_samples);
+
+    return ($strategy, $data_size);
 }
 
-sub run_multi_parameter_repeatscout {
-    my ($strategy, $data_size, $lmer_sizes_ref, $copy_thresholds_ref, $num_samples) = @_;
-    
-    my @lmer_sizes = @$lmer_sizes_ref;
-    my @copy_thresholds = @$copy_thresholds_ref;
-    
-    $logger->info("Running multi-parameter RepeatScout analysis...");
-    
+sub run_mdl_repeat {
+    my ($strategy, $data_size) = @_;
+
+    $logger->info("Running mdl-repeat analysis...");
+
     # Check for dust_trf_masking checkpoint first
     my $masking_checkpoint = "dust_trf_masking";
-    my @working_genomes;
-    
+    my $working_genome;
+
     if (check_checkpoint($masking_checkpoint) && !$config{force_overwrite}) {
-        $logger->info("Found existing dust and TRF masking checkpoint, looking for masked files...");
-        
-        # Try to find existing masked files based on strategy
-        if ($strategy =~ /multi_sampled/) {
-            # Look for multiple masked sample files
-            for my $sample_id (1..$num_samples) {
-                my $masked_file = "$config{tmp_dir}/genome_sample_${sample_id}_masked.fa";
-                if (-s $masked_file) {
-                    push @working_genomes, $masked_file;
-                    $logger->info("Found existing masked sample $sample_id: $masked_file");
-                }
-            }
-        } elsif ($strategy =~ /sampled/) {
-            # Look for single masked sample file
+        $logger->info("Found existing dust and TRF masking checkpoint, looking for masked file...");
+
+        if ($strategy eq "sampled") {
             my $masked_file = "$config{tmp_dir}/genome_sample_masked.fa";
             if (-s $masked_file) {
-                push @working_genomes, $masked_file;
+                $working_genome = $masked_file;
                 $logger->info("Found existing masked sample: $masked_file");
             }
         } else {
-            # Look for full genome masked file
             my $masked_file = "$config{tmp_dir}/tmp_masked.fa";
             if (-s $masked_file) {
-                push @working_genomes, $masked_file;
+                $working_genome = $masked_file;
                 $logger->info("Found existing masked genome: $masked_file");
             }
         }
     }
-    
-    # If we found all expected masked files, use them; otherwise create new ones
-    if (@working_genomes == $num_samples || (@working_genomes == 1 && $num_samples == 1)) {
-        $logger->info("Using existing masked files from checkpoint");
-    } else {
-        $logger->info("Creating new genome samples with masking...");
-        @working_genomes = ();  # Clear any partial results
-        
-        # Prepare working genomes (multiple samples for large genomes)
-        if ($strategy =~ /multi_sampled/) {
-            # Create multiple non-overlapping samples for large genomes
-            $logger->info("Creating $num_samples non-overlapping samples of " . sprintf("%.1f MB each", $data_size/1e6));
-            @working_genomes = create_non_overlapping_genome_samples($data_size, $num_samples);
-        } elsif ($strategy =~ /sampled/) {
-            # Single sample for medium genomes
-            my $working_genome = create_genome_sample($data_size);
-            push @working_genomes, $working_genome;
+
+    # If no cached masked file, create one
+    unless ($working_genome && -s $working_genome) {
+        $logger->info("Preparing genome for mdl-repeat...");
+
+        if ($strategy eq "sampled") {
+            $working_genome = create_genome_sample($data_size);
         } else {
-            # Full genome for small genomes
-            my $working_genome = "$config{tmp_dir}/tmp.fa";
-            run_cmd("cp $config{genome_file} $working_genome");
-            
-            # Apply masking to full genome
-            my @masked_files = apply_soft_masking_to_samples($working_genome);
-            @working_genomes = @masked_files;
+            my $tmp_genome = "$config{tmp_dir}/tmp.fa";
+            run_cmd("cp $config{genome_file} $tmp_genome");
+            my @masked_files = apply_soft_masking_to_samples($tmp_genome);
+            $working_genome = $masked_files[0];
         }
     }
-    
-    # Run parallel RepeatScout with different sample×lmer combinations
-    my $pm = Parallel::ForkManager->new($config{threads});
-    my @result_files;
-    
-    my $job_id = 0;
-    for my $sample_idx (0..$#working_genomes) {
-        my $sample_genome = $working_genomes[$sample_idx];
-        
-        for my $lmer_idx (0..$#lmer_sizes) {
-            $pm->start and next;
-            
-            my $lmer = $lmer_sizes[$lmer_idx];
-            my $threshold = $copy_thresholds[$lmer_idx];
-            
-            # Include sample ID in job naming for multi-sample strategies
-            # run_single_repeatscout_job now includes filtering
-            my $result_file;
-            if ($strategy =~ /multi_sampled/) {
-                $result_file = run_single_repeatscout_job($sample_genome, $lmer, $threshold, $job_id, $sample_idx + 1);
-            } else {
-                $result_file = run_single_repeatscout_job($sample_genome, $lmer, $threshold, $job_id);
-            }
-            
-            $pm->finish(0, { result_file => $result_file });
-            $job_id++;
-        }
+
+    # Run mdl-repeat (single invocation with 4 threads)
+    my $output = "$config{tmp_dir}/repeats.fa";
+    my $mdl_cmd = "mdl-repeat -sequence $working_genome -output $output -threads 4";
+    $logger->info("Running: $mdl_cmd");
+    run_cmd($mdl_cmd);
+
+    if (-s $output) {
+        my $seq_count = `grep -c '^>' '$output' 2>/dev/null || echo 0`;
+        chomp($seq_count);
+        $logger->info("mdl-repeat completed: $seq_count repeat families discovered");
+    } else {
+        $logger->error("mdl-repeat produced no output");
+        die "mdl-repeat failed\n";
     }
-    
-    # Collect results from parallel processes
-    $pm->run_on_finish(sub {
-        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data) = @_;
-        if ($data && $data->{result_file} && -s $data->{result_file}) {
-            push @result_files, $data->{result_file};
-        }
-    });
-    
-    $pm->wait_all_children;
-    
-    # Results are already filtered, just merge them
-    merge_repeatscout_results(\@result_files, "$config{tmp_dir}/repeats.fa");
-    
-    $logger->info("Multi-parameter RepeatScout analysis completed ($num_samples samples × " . scalar(@lmer_sizes) . " lmers = " . scalar(@result_files) . " jobs)");
-    $logger->info("All RepeatScout jobs completed with immediate filtering, results merged and ready for Refiner pipeline");
 }
 
 sub create_genome_sample {
@@ -437,7 +323,7 @@ sub create_genome_sample {
     
     my $actual_size = -s $masked_sample;
     $logger->info("BED-based sample created and masked: " . sprintf("%.1f MB", $actual_size/1e6));
-    $logger->info("Returning masked file for RepeatScout: $masked_sample");
+    $logger->info("Returning masked file for mdl-repeat: $masked_sample");
     
     return $masked_sample;
 }
@@ -515,7 +401,7 @@ sub create_non_overlapping_genome_samples {
     for my $i (0..$#masked_files) {
         my $actual_size = -s $masked_files[$i];
         $logger->info("Progressive BED-based sample " . ($i + 1) . " created and masked: " . sprintf("%.1f MB", $actual_size/1e6));
-        $logger->info("Returning masked file " . ($i + 1) . " for RepeatScout: $masked_files[$i]");
+        $logger->info("Returning masked file " . ($i + 1) . " for mdl-repeat: $masked_files[$i]");
     }
     
     return @masked_files;
@@ -2053,6 +1939,60 @@ sub filter_repeatscout_results {
     return @filtered_files;
 }
 
+sub dedup_before_refiner {
+    my ($input_file) = @_;
+
+    $logger->info("Running pre-Refiner deduplication with CD-HIT-EST...");
+
+    # Count sequences before dedup
+    my $before_count = `grep -c '^>' '$input_file' 2>/dev/null || echo 0`;
+    chomp($before_count);
+    $logger->info("Sequences before deduplication: $before_count");
+
+    # Skip if too few sequences
+    if ($before_count <= 1) {
+        $logger->info("Too few sequences for deduplication, skipping");
+        return;
+    }
+
+    my $dedup_output = "${input_file}.cdhit";
+
+    # Run CD-HIT-EST: 80% identity, 80% shorter sequence coverage, both strands
+    my $cdhit_cmd = "cd-hit-est -i '$input_file' -o '$dedup_output' " .
+                    "-c 0.80 -n 5 -aS 0.8 -d 0 -T $config{threads} -M 0 " .
+                    "2>&1";
+
+    eval {
+        run_cmd($cdhit_cmd);
+    };
+
+    if ($@ || !-s $dedup_output) {
+        $logger->warn("CD-HIT-EST deduplication failed: $@");
+        $logger->warn("Continuing with original (non-deduplicated) input");
+        # Clean up failed output
+        unlink($dedup_output) if -f $dedup_output;
+        unlink("${dedup_output}.clstr") if -f "${dedup_output}.clstr";
+        return;
+    }
+
+    # Count sequences after dedup
+    my $after_count = `grep -c '^>' '$dedup_output' 2>/dev/null || echo 0`;
+    chomp($after_count);
+
+    my $removed = $before_count - $after_count;
+    my $reduction_pct = $before_count > 0 ? sprintf("%.1f", ($removed / $before_count) * 100) : "0.0";
+
+    $logger->info("Pre-Refiner deduplication: $before_count -> $after_count sequences ($removed removed, ${reduction_pct}% reduction)");
+
+    # Replace input file with deduplicated output
+    run_cmd("mv '$dedup_output' '$input_file'");
+
+    # Clean up CD-HIT cluster file
+    unlink("${dedup_output}.clstr") if -f "${dedup_output}.clstr";
+
+    $logger->info("Pre-Refiner deduplication complete");
+}
+
 sub refine_consensus {
     $logger->info("Refining consensus sequences with Refiner pipeline...");
 
@@ -2063,9 +2003,12 @@ sub refine_consensus {
     # Create required directories
     make_path($config{work_dir}) unless -d $config{work_dir};
     make_path($refiner_output_dir) unless -d $refiner_output_dir;
-    
+
     # Ensure all input files exist
     die "Input file missing: $input\n" unless -f $input;
+
+    # Early deduplication before expensive Refiner pipeline
+    dedup_before_refiner($input);
     die "Refiner script missing: $refiner_script\n" unless -x $refiner_script;
 
     # Determine which genome file to use for Refiner
@@ -2073,12 +2016,17 @@ sub refine_consensus {
     $logger->info("Using genome file for Refiner: $genome_for_refiner");
 
     # Build command for Refiner/main.py
+    # Enable genome masking only for large genomes (>=1GB) where RECON uses masked genome
+    my $genome_size = -s $config{genome_file};
+    my $enable_masking = ($genome_size >= 1_000_000_000) ? "--enable-masking" : "";
+
     my $cmd = join(" ",
         "python3 '$refiner_script'",
         "--repeatscout '$input'",
-        "--genome '$genome_for_refiner'", 
+        "--genome '$genome_for_refiner'",
         "--output '$refiner_output_dir'",
-        "--threads $config{threads}"
+        "--threads $config{threads}",
+        $enable_masking
     );
 
     run_cmd($cmd);
@@ -2098,15 +2046,26 @@ sub refine_consensus {
 }
 
 sub determine_genome_for_refiner {
-    # Priority order:
-    # 1. Merged samples if multiple exist (up to 2)
-    # 2. Single sample if only one exists
-    # 3. Full genome masked if available
-    # 4. Original genome file as fallback
-    
-    # Find all available genome samples
+    # Priority order (updated):
+    # 1. Full processed genome from pipeline Step 1 (most accurate copy numbers)
+    # 2. Merged samples if multiple exist (up to 2)
+    # 3. Single sample if only one exists
+    # 4. Full genome masked if available (small genome case)
+    # 5. Original genome file as fallback
+
+    # NEW: Check for full processed genome from pipeline Step 1
+    # This is the cleaned, indexed genome at <output_dir>/genome/genome.fa
+    my $full_processed_genome = "$config{work_dir}/../genome/genome.fa";
+    if (-s $full_processed_genome) {
+        my $genome_size = -s $full_processed_genome;
+        $logger->info("Using full processed genome for Refiner: $full_processed_genome");
+        $logger->info("  Size: " . sprintf("%.1f MB", $genome_size/1e6) . " (accurate copy number estimation)");
+        return $full_processed_genome;
+    }
+
+    # Find all available genome samples (fallback for backward compatibility)
     my @sample_files;
-    
+
     # Check for numbered samples (multi-sample case)
     for my $sample_id (1..10) {  # Check up to 10 samples
         my $sample_masked = "$config{tmp_dir}/genome_sample_${sample_id}_masked.fa";
@@ -2114,26 +2073,26 @@ sub determine_genome_for_refiner {
             push @sample_files, $sample_masked;
         }
     }
-    
+
     # Check for single sample (single-sample case)
     my $single_sample_masked = "$config{tmp_dir}/genome_sample_masked.fa";
     if (-s $single_sample_masked) {
         push @sample_files, $single_sample_masked;
     }
-    
+
     # Determine what to use based on number of samples found
     if (@sample_files >= 2) {
         # Multiple samples found - merge the first 2
         my $merged_file = "$config{tmp_dir}/genome_merged_for_refiner.fa";
         $logger->info("Found " . scalar(@sample_files) . " genome samples, merging first 2 for Refiner");
         $logger->info("Samples to merge: $sample_files[0], $sample_files[1]");
-        
+
         # Merge the first two samples
         my $merge_cmd = "cat '$sample_files[0]' '$sample_files[1]' > '$merged_file'";
         eval {
             run_cmd($merge_cmd);
         };
-        
+
         if ($@ || !-s $merged_file) {
             $logger->warn("Failed to merge samples, using first sample: $sample_files[0]");
             return $sample_files[0];
@@ -2147,14 +2106,14 @@ sub determine_genome_for_refiner {
         $logger->info("Using single masked sample for Refiner: $sample_files[0]");
         return $sample_files[0];
     }
-    
+
     # Check for full genome masked (small genome case)
     my $full_masked = "$config{tmp_dir}/tmp_masked.fa";
     if (-s $full_masked) {
         $logger->info("Using full masked genome for Refiner (small genome strategy)");
         return $full_masked;
     }
-    
+
     # Fallback to original genome
     $logger->warn("No masked sample found, falling back to original genome for Refiner");
     $logger->warn("This may affect Refiner performance - consider checking sample generation");
@@ -2426,7 +2385,7 @@ __END__
 
 =head1 NAME
 
-build_RS - Multi-parameter RepeatScout Pipeline for Pan_TE
+build_RS - mdl-repeat Pipeline for Pan_TE
 
 =head1 SYNOPSIS
 
@@ -2434,10 +2393,9 @@ build_RS --genome GENOME.fa --tmp TMP_DIR --workdir WORK_DIR [OPTIONS]
 
 =head1 DESCRIPTION
 
-This script implements a multi-parameter RepeatScout pipeline that runs 
-RepeatScout with different l-mer sizes and copy thresholds in parallel,
-then merges the results and passes them to the Refiner pipeline for
-consensus building.
+This script runs mdl-repeat for de novo repeat discovery, with genome
+sampling and dust/TRF masking for large genomes, then passes the results
+to the Refiner pipeline for consensus building.
 
 =head1 REQUIRED ARGUMENTS
 

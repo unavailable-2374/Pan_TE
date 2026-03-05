@@ -2,8 +2,16 @@
 import logging
 import argparse
 import json
+import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Any
+
+# Set multiprocessing start method once at module load, before any forking.
+# 'spawn' is safer for subprocess-heavy pipelines (avoids fork+exec issues).
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set by another module or previous call
 
 from config import PipelineConfig
 from phase1_screening_optimized import SequenceScreenerOptimized
@@ -37,23 +45,117 @@ class TEConsensusPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.runner = RobustRunner(config)
-        
+
         logger.info("Initializing restructured TE Consensus Pipeline:")
         logger.info("  Phase 1: Candidate identification")
         logger.info("  Phase 2: Chimera detection & splitting")
         logger.info("  Phase 3: Comprehensive consensus building")
         logger.info("  Phase 4: Genome masking preparation")
-        
+
+        # Build genome BLAST database for Phase 3 BLASTN-based copy recruitment
+        self._setup_genome_blast_db(config)
+
         self.phase1 = SequenceScreenerOptimized(config)
         self.phase2 = ChimeraSplitter(config)
         self.phase3 = ConsensusBuilder(config)
         self.phase4 = GenomeMasker(config)
-        
+
         # 创建必要的目录
-        for dir_path in [config.output_dir, config.temp_dir, 
+        for dir_path in [config.output_dir, config.temp_dir,
                         config.cache_dir, config.checkpoint_dir]:
             Path(dir_path).mkdir(parents=True, exist_ok=True)
     
+    def _setup_genome_blast_db(self, config: PipelineConfig):
+        """Build genome BLAST database and detect RMBlast + scoring matrices
+        for Phase 3 copy recruitment with RepeatMasker-level sensitivity."""
+        import subprocess
+        import os
+        import shutil
+
+        # --- Step 1: Detect rmblastn and scoring matrices ---
+        self._detect_rmblast_environment(config)
+
+        # --- Step 2: Build genome BLAST database ---
+        genome_file = config.genome_file
+        db_path = os.path.join(config.temp_dir or "temp_work", "genome_blastdb", "genome")
+        db_dir = os.path.dirname(db_path)
+
+        # Check if DB already exists
+        if os.path.exists(db_path + ".nhr") or os.path.exists(db_path + ".nsq"):
+            logger.info(f"Genome BLAST database already exists: {db_path}")
+            config.genome_blast_db = db_path
+            return
+
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            cmd = [
+                config.makeblastdb_exe,
+                "-in", genome_file,
+                "-dbtype", "nucl",
+                "-out", db_path,
+                "-parse_seqids"
+            ]
+            logger.info(f"Building genome BLAST database: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+            if result.returncode == 0:
+                config.genome_blast_db = db_path
+                logger.info(f"Genome BLAST database built successfully: {db_path}")
+            else:
+                logger.warning(f"makeblastdb failed (rc={result.returncode}): {result.stderr}")
+                logger.warning("Copy recruitment will fall back to RepeatMasker")
+                config.genome_blast_db = ""
+        except Exception as e:
+            logger.warning(f"Failed to build genome BLAST database: {e}")
+            logger.warning("Copy recruitment will fall back to RepeatMasker")
+            config.genome_blast_db = ""
+
+    def _detect_rmblast_environment(self, config: PipelineConfig):
+        """Detect rmblastn binary and RepeatMasker scoring matrices.
+
+        RMBlast + RM scoring matrices provide RepeatMasker-level sensitivity
+        for copy recruitment, unlike generic blastn which lacks:
+        - Divergence-specific scoring matrices (14p/18p/20p/25p)
+        - Complexity-adjusted scoring (-complexity_adjust)
+        - Appropriate gap penalties for TE detection
+        """
+        import shutil
+        import os
+
+        # Detect rmblastn
+        rmblastn_path = shutil.which(config.rmblastn_exe)
+        if rmblastn_path:
+            config.rmblastn_exe = rmblastn_path
+            logger.info(f"Found rmblastn: {rmblastn_path}")
+        else:
+            logger.info("rmblastn not in PATH, copy recruitment will use standard blastn (lower sensitivity)")
+
+        # Detect RepeatMasker scoring matrix directory
+        # Search common locations relative to RepeatMasker installation
+        rm_path = shutil.which(config.repeatmasker_exe)
+        candidate_dirs = []
+        if rm_path:
+            rm_dir = os.path.dirname(os.path.realpath(rm_path))
+            # RepeatMasker installed via conda: share/RepeatMasker/Matrices/ncbi/nt/
+            for base in [rm_dir, os.path.join(rm_dir, '..', 'share', 'RepeatMasker')]:
+                candidate_dirs.append(os.path.join(base, 'Matrices', 'ncbi', 'nt'))
+                candidate_dirs.append(os.path.join(base, 'Libraries', 'Matrices', 'ncbi', 'nt'))
+
+        # Also check conda env
+        conda_prefix = os.environ.get('CONDA_PREFIX', '')
+        if conda_prefix:
+            candidate_dirs.append(os.path.join(conda_prefix, 'share', 'RepeatMasker', 'Matrices', 'ncbi', 'nt'))
+
+        for d in candidate_dirs:
+            d = os.path.normpath(d)
+            test_matrix = os.path.join(d, '20p41g.matrix')
+            if os.path.isfile(test_matrix):
+                config.rmblast_matrix_dir = d
+                logger.info(f"Found RepeatMasker scoring matrices: {d}")
+                return
+
+        logger.info("RepeatMasker scoring matrices not found; rmblastn will use default matrix")
+
     def run(self) -> Dict[str, Any]:
         """执行完整流程"""
         logger.info("="*60)
@@ -98,7 +200,8 @@ class TEConsensusPipeline:
             logger.info(f"  - Low quality: {phase3_stats.get('low_quality_consensus', 0)}")
             
             # Phase 4: 基因组Masking（可选）
-            if self.config.__dict__.get('enable_masking', True):
+            # Changed default to False to avoid RepeatMasker issues
+            if self.config.__dict__.get('enable_masking', False):
                 logger.info("\n>>> Phase 4: Genome Masking")
                 phase4_output = self.runner.run_with_checkpoint(
                     lambda: self.phase4.run(phase1_output, phase3_output),
@@ -132,17 +235,14 @@ class TEConsensusPipeline:
     def cleanup_temp_files(self):
         """清理临时文件"""
         logger.info("Cleaning up temporary files...")
-        # 清理临时目录
-        temp_dir = Path(self.config.temp_dir)
-        if temp_dir.exists():
-            for file in temp_dir.glob("*"):
-                file.unlink()
-        
-        # 可选：清理检查点
-        if not self.config.__dict__.get('keep_checkpoints', False):
-            self.runner.cleanup_checkpoints()
-        
-        logger.info("Cleanup complete")
+        try:
+            temp_dir = Path(self.config.temp_dir)
+            if temp_dir.exists():
+                import shutil
+                shutil.rmtree(temp_dir)
+            logger.info("Cleanup complete")
+        except Exception as e:
+            logger.warning(f"Cleanup failed (non-fatal): {e}")
 
 def main():
     """命令行接口"""
@@ -166,13 +266,15 @@ def main():
     parser.add_argument('--keep-temp', action='store_true',
                        help='Keep temporary files')
     parser.add_argument('--keep-checkpoints', action='store_true',
-                       help='Keep checkpoint files')
+                       help='(Deprecated) Checkpoints are now always kept')
     parser.add_argument('--resume', action='store_true',
                        help='Resume from checkpoints if available')
     parser.add_argument('--clear-cache', action='store_true',
                        help='Clear cache before running')
     parser.add_argument('--repeatmasker-quick', action='store_true',
                        help='Enable RepeatMasker quick mode (-q flag)')
+    parser.add_argument('--enable-masking', action='store_true',
+                       help='Enable Phase 4 genome masking (disabled by default)')
     
     args = parser.parse_args()
     
@@ -194,8 +296,9 @@ def main():
     
     # 添加额外的配置选项
     config.__dict__['keep_temp'] = args.keep_temp
-    config.__dict__['keep_checkpoints'] = args.keep_checkpoints
+    # keep_checkpoints is deprecated - checkpoints are always kept
     config.__dict__['repeatmasker_quick'] = args.repeatmasker_quick
+    config.__dict__['enable_masking'] = args.enable_masking
     
     # 确保输出目录存在
     output_dir = Path(args.output)

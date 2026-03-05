@@ -260,13 +260,17 @@ class GenomeMasker:
     
     def _run_repeatmasker_soft_masking(self, genome_file: str, consensus_library: str) -> str:
         """使用高质量consensus运行RepeatMasker硬屏蔽"""
-        output_dir = Path(self.config.output_dir)
+        output_dir = Path(self.config.output_dir).resolve()
         hard_masked_file = output_dir / "genome_hard_masked.fa"
-        
+
+        # CRITICAL: Use absolute paths since we change cwd to output_dir
+        consensus_library_abs = str(Path(consensus_library).resolve())
+        genome_file_abs = str(Path(genome_file).resolve())
+
         # RepeatMasker硬屏蔽参数
         cmd = [
             'RepeatMasker',
-            '-lib', consensus_library,    # 使用自定义consensus库
+            '-lib', consensus_library_abs,    # 使用自定义consensus库（绝对路径）
             # 移除 -xsmall 参数以启用硬屏蔽模式（N字符）
             '-nolow',                     # 不屏蔽低复杂度区域
             '-no_is',                     # 不搜索interspersed repeats
@@ -274,18 +278,17 @@ class GenomeMasker:
             '-parallel', str(self.config.threads),  # 并行线程数
             '-dir', str(output_dir),      # 输出目录
             '-cutoff', str(int(self.min_rm_score)),  # 最小分数阈值
-            genome_file
+            genome_file_abs  # 使用绝对路径
         ]
-        
+
         logger.info(f"Running RepeatMasker hard masking with command: {' '.join(cmd)}")
-        
+
         try:
             result = subprocess.run(
                 cmd,
                 cwd=output_dir,
                 capture_output=True,
-                text=True,
-                timeout=7200  # 2小时超时
+                text=True
             )
             
             if result.returncode != 0:
@@ -305,9 +308,6 @@ class GenomeMasker:
             else:
                 raise RuntimeError(f"RepeatMasker output not found: {rm_output}")
             
-        except subprocess.TimeoutExpired:
-            logger.error("RepeatMasker timeout (2 hours)")
-            raise RuntimeError("RepeatMasker execution timeout")
         except Exception as e:
             logger.error(f"RepeatMasker execution error: {e}")
             raise

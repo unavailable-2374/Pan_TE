@@ -9,6 +9,7 @@ use RECON::Logger;
 
 our @EXPORT = qw(
     run_cmd create_seq_name_list split_fasta_by_size rename_fasta_ids
+    rename_and_fragment_fasta
     perform_adaptive_sampling calculate_bed_size perform_sampling
     calculate_available_size filter_self_hits
     run_trf_masking run_repeatmasker create_blast_database
@@ -76,75 +77,77 @@ sub create_seq_name_list {
 
 sub split_fasta_by_size {
     my ($input_file, $output_prefix, $max_size_mb) = @_;
-    $max_size_mb ||= 100; # Default 100MB chunks
-    
+    $max_size_mb ||= 100;
+
     my $max_size_bytes = $max_size_mb * 1024 * 1024;
-    my $current_size = 0;
-    my $file_count = 1;
-    my $current_output;
     my @output_files;
+    my $file_count = 0;
+    my $current_output;
+    my $current_size = 0;
     my $current_record = "";
-    my $in_sequence = 0;
-    
+
     open(my $input_fh, '<', $input_file) or die "Cannot open $input_file: $!\n";
-    
+
     while (my $line = <$input_fh>) {
         if ($line =~ /^>/) {
-            # Header line - start of new sequence
-            
-            # If we have a previous record and size limit reached, create new chunk
-            if ($current_record && $current_size >= $max_size_bytes) {
-                # Write current record to current chunk
-                print $current_output $current_record if $current_output;
-                close($current_output) if $current_output;
-                
-                # Start new chunk
-                my $output_file = "${output_prefix}_part${file_count}.fa";
-                open($current_output, '>', $output_file) or die "Cannot create $output_file: $!\n";
-                push @output_files, $output_file;
-                $file_count++;
-                $current_size = 0;
-                $current_record = "";
-            }
-            
-            # If no current output file, create first one
-            if (!$current_output) {
-                my $output_file = "${output_prefix}_part${file_count}.fa";
-                open($current_output, '>', $output_file) or die "Cannot create $output_file: $!\n";
-                push @output_files, $output_file;
-                $file_count++;
-            }
-            
-            # Write previous record if exists
-            if ($current_record) {
+            # Flush previous record
+            if ($current_record ne "") {
+                my $record_size = length($current_record);
+
+                # Would this record push chunk over limit? Start new chunk
+                # ($current_size > 0 ensures at least one record per chunk)
+                if ($current_size + $record_size > $max_size_bytes && $current_size > 0) {
+                    close($current_output) if $current_output;
+                    $current_output = undef;
+                    $current_size = 0;
+                }
+
+                # Create chunk file if needed
+                if (!$current_output) {
+                    my $outfile = "${output_prefix}_part${file_count}.fa";
+                    open($current_output, '>', $outfile) or die "Cannot create $outfile: $!\n";
+                    push @output_files, $outfile;
+                    $file_count++;
+                }
+
                 print $current_output $current_record;
-                $current_size += length($current_record);
+                $current_size += $record_size;
             }
-            
+
             # Start new record
             $current_record = $line;
-            $in_sequence = 1;
-        } elsif ($in_sequence) {
-            # Sequence line
-            $current_record .= $line;
         } else {
-            # Non-FASTA line (shouldn't happen in proper FASTA)
             $current_record .= $line;
         }
     }
-    
-    # Write final record
-    if ($current_record && $current_output) {
+
+    # Flush last record
+    if ($current_record ne "") {
+        my $record_size = length($current_record);
+
+        if ($current_size + $record_size > $max_size_bytes && $current_size > 0) {
+            close($current_output) if $current_output;
+            $current_output = undef;
+            $current_size = 0;
+        }
+
+        if (!$current_output) {
+            my $outfile = "${output_prefix}_part${file_count}.fa";
+            open($current_output, '>', $outfile) or die "Cannot create $outfile: $!\n";
+            push @output_files, $outfile;
+            $file_count++;
+        }
+
         print $current_output $current_record;
     }
-    
+
     close($input_fh);
     close($current_output) if $current_output;
-    
-    log_message("INFO", "FASTA file split by complete records", 
-                "input=$input_file, chunks=" . scalar(@output_files) . 
-                ", target_size_mb=$max_size_mb");
-    
+
+    log_message("INFO", "FASTA split by size",
+                "input=$input_file, chunks=" . scalar(@output_files) .
+                ", max_per_chunk=${max_size_mb}MB");
+
     return @output_files;
 }
 
@@ -178,27 +181,102 @@ sub rename_fasta_ids {
     return $seq_count - 1;
 }
 
-sub perform_adaptive_sampling {
-    my ($genome_file, $exclusion_bed, $accumulated_mask, $output_file, $sample_size_mb, $fragment_size) = @_;
-    
-    log_message("INFO", "Starting adaptive sampling", 
-                "target_size=${sample_size_mb}MB, fragment_size=$fragment_size");
-    
-    # Use bedtools to exclude regions and sample
-    my $cmd = "bedtools random -l $fragment_size -n " . int($sample_size_mb * 1000000 / $fragment_size) . 
-              " -g ${genome_file}.fai";
-    
-    if ($exclusion_bed && -s $exclusion_bed) {
-        $cmd .= " | bedtools subtract -a stdin -b $exclusion_bed";
+sub rename_and_fragment_fasta {
+    my ($input_file, $output_file, $max_size_mb) = @_;
+    $max_size_mb ||= 20;
+    my $max_size = $max_size_mb * 1024 * 1024;
+
+    open(my $in_fh, '<', $input_file) or die "Cannot open $input_file: $!\n";
+    open(my $out_fh, '>', $output_file) or die "Cannot create $output_file: $!\n";
+
+    my $gi_count = 1;
+    my $seq = "";
+    my $in_seq = 0;
+    my $orig_seqs = 0;
+
+    my $flush_seq = sub {
+        return unless length($seq) > 0;
+        if (length($seq) <= $max_size) {
+            # Fits in one entry
+            print $out_fh ">gi|$gi_count\n";
+            for (my $i = 0; $i < length($seq); $i += 80) {
+                print $out_fh substr($seq, $i, 80) . "\n";
+            }
+            $gi_count++;
+        } else {
+            # Split into ≤max_size fragments, each gets its own gi|N
+            for (my $offset = 0; $offset < length($seq); $offset += $max_size) {
+                my $piece = substr($seq, $offset, $max_size);
+                print $out_fh ">gi|$gi_count\n";
+                for (my $i = 0; $i < length($piece); $i += 80) {
+                    print $out_fh substr($piece, $i, 80) . "\n";
+                }
+                $gi_count++;
+            }
+        }
+        $orig_seqs++;
+    };
+
+    while (my $line = <$in_fh>) {
+        if ($line =~ /^>/) {
+            $flush_seq->();
+            $seq = "";
+            $in_seq = 1;
+        } elsif ($in_seq) {
+            chomp $line;
+            $seq .= $line;
+        }
     }
-    
-    $cmd .= " | bedtools getfasta -fi $genome_file -bed stdin > $output_file";
-    
-    run_cmd($cmd);
-    
+    $flush_seq->();
+
+    close($in_fh);
+    close($out_fh);
+
+    my $total_gi = $gi_count - 1;
+    log_message("INFO", "Rename and fragment completed",
+                "input_seqs=$orig_seqs, output_seqs=$total_gi, max_fragment=${max_size_mb}MB");
+
+    return $total_gi;
+}
+
+sub perform_adaptive_sampling {
+    my ($genome_file, $exclusion_bed, $accumulated_mask, $output_file,
+        $sample_size_mb, $fragment_size, $sampled_bed_output) = @_;
+
+    log_message("INFO", "Starting adaptive sampling",
+                "target_size=${sample_size_mb}MB, fragment_size=$fragment_size");
+
+    # Step 1: Generate BED of sampled regions
+    my $bed_cmd = "bedtools random -l $fragment_size -n " .
+                  int($sample_size_mb * 1000000 / $fragment_size) .
+                  " -g ${genome_file}.fai";
+
+    if ($exclusion_bed && -s $exclusion_bed) {
+        $bed_cmd .= " | bedtools subtract -a stdin -b $exclusion_bed";
+    }
+
+    my $bed_file = $sampled_bed_output || "${output_file}.regions.bed";
+    $bed_cmd .= " > $bed_file";
+    run_cmd($bed_cmd);
+
+    # Step 2: Extract FASTA from BED
+    if (-s $bed_file) {
+        run_cmd("bedtools getfasta -fi $genome_file -bed $bed_file > $output_file");
+    } else {
+        open(my $fh, '>', $output_file);
+        close($fh);
+    }
+
+    # Clean up temp BED if no explicit output path requested
+    if (!$sampled_bed_output && -f $bed_file) {
+        unlink($bed_file);
+    }
+
     my $actual_size = -s $output_file || 0;
-    log_message("INFO", "Adaptive sampling completed", 
-                "output_size=" . format_size($actual_size) . ", file=$output_file");
+    my $bed_regions = -s $bed_file ? `wc -l < $bed_file` : 0;
+    chomp $bed_regions if $bed_regions;
+    log_message("INFO", "Adaptive sampling completed",
+                "output_size=" . format_size($actual_size) . ", bed_regions=$bed_regions, file=$output_file");
 }
 
 sub calculate_available_size {
@@ -297,16 +375,21 @@ sub run_trf_masking {
 }
 
 sub run_repeatmasker {
-    my ($input_file, $library_file, $output_file, $threads) = @_;
+    my ($input_file, $library_file, $output_file, $threads, $soft_mask) = @_;
     $threads ||= 4;
-    
+    $soft_mask ||= 0;
+
     my $success = 0;
-    my $cmd = "RepeatMasker -lib $library_file -nolow -no_is -norna -parallel $threads -dir . $input_file";
+    my $mask_flag = $soft_mask ? "-xsmall" : "";
+    my $cmd = "RepeatMasker -lib $library_file $mask_flag -nolow -no_is -norna -parallel $threads -dir . $input_file";
     
     eval {
         run_cmd($cmd);
         if (-f "${input_file}.masked") {
-            run_cmd("mv ${input_file}.masked $output_file");
+            # Skip mv if RepeatMasker output is already at desired path
+            if ("${input_file}.masked" ne $output_file) {
+                run_cmd("mv ${input_file}.masked $output_file");
+            }
             $success = 1;
         }
     };

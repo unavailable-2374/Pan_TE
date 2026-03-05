@@ -162,31 +162,44 @@ class SequenceScreenerOptimized:
     def load_and_filter(self):
         """加载序列并进行基础过滤"""
         from Bio import SeqIO
+        import re
         sequences = []
-        
+
         logger.info(f"Loading sequences from {self.config.repeatscout_file}")
         
         for record in SeqIO.parse(self.config.repeatscout_file, "fasta"):
             seq_str = str(record.seq).upper()
             seq_len = len(seq_str)
-            
+
             # 长度过滤
             if seq_len < self.config.min_length or seq_len > self.config.max_length:
                 continue
-            
+
             # N含量过滤
             n_count = seq_str.count('N')
             if n_count / seq_len > self.config.max_n_percent:
                 continue
-            
+
             # 极端GC含量过滤
             gc_count = seq_str.count('G') + seq_str.count('C')
             gc_content = gc_count / seq_len
             if gc_content < 0.1 or gc_content > 0.9:
                 continue
-            
+
+            # CRITICAL FIX: Use full unique ID to distinguish sequences from different RepeatScout runs
+            # record.id only returns part before first space (e.g., "R=0")
+            # record.description contains full header with run suffix (e.g., "R=0 (RR=1...)_l20_t3_set0")
+            # Extract unique ID: "R=X_suffix" format
+            full_desc = record.description
+            suffix_match = re.search(r'_(l\d+_t\d+_set\d+)$', full_desc)
+            if suffix_match:
+                unique_id = f"{record.id}_{suffix_match.group(1)}"
+            else:
+                unique_id = record.id  # Fallback if no suffix found
+
             sequences.append({
-                'id': record.id,
+                'id': unique_id,
+                'original_id': record.id,  # Keep original R= ID for reference
                 'sequence': seq_str,
                 'length': seq_len,
                 'gc_content': gc_content
@@ -253,74 +266,104 @@ class SequenceScreenerOptimized:
         try:
             import os
             genome_size = os.path.getsize(self.config.genome_file)
-        except:
+        except (OSError, AttributeError) as e:
+            logger.debug(f"Could not get genome size: {e}")
             genome_size = 1e9  # 默认1Gb
-        
+
         from adaptive_scoring import AdaptiveTEScorer
         adaptive_scorer = AdaptiveTEScorer(genome_size)
-        
+
         # 基于TE生物学特征的覆盖度评分
         for seq_id, rm_data in rm_results.items():
             copy_number = rm_data.get('copy_number', 0)
             avg_identity = rm_data.get('avg_identity', 0)
-            
+
             # 找到对应序列的长度
             seq_length = None
             for seq_data in self.sequences:
                 if seq_data['id'] == seq_id:
                     seq_length = len(seq_data['sequence'])
                     break
-            
+
             if seq_length is None:
                 logger.warning(f"Could not find sequence length for {seq_id}")
                 seq_length = 1000  # 默认长度
-            
-            # 处理低拷贝数序列 - 小于3个拷贝的全部当成噪音
-            if copy_number < 3:
-                logger.debug(f"{seq_id}: Low copy number ({copy_number}) sequence treated as noise")
-                copy_score = 0.01  # 极低分数，基本排除
-                identity_score = 0.01
-            else:
-                # 使用自适应拷贝数评分（限制最大期望为15）
-                copy_score = adaptive_scorer.calculate_adaptive_copy_score(copy_number, seq_length)
-                
-                # 使用自适应一致性评分
+
+            # Processing low copy number sequences
+            # Key insight: RepeatScout already filtered sequences with <10 k-mer occurrences
+            # Low RepeatMasker copy count may indicate:
+            # 1. Ancient/divergent TE (RM can't detect all copies)
+            # 2. Young TE with few copies
+            # 3. RM parameters not sensitive enough
+            # Therefore, we should NOT use copy number as a veto mechanism
+            if copy_number < 2:
+                # Single copy: give base score, let biological features decide
+                logger.debug(f"{seq_id}: Single copy - using base score with biological validation")
+                copy_score = 0.35  # Base score for single copy (not a death sentence)
                 identity_score = adaptive_scorer.calculate_adaptive_identity_score(
                     avg_identity, seq_length, copy_number
                 )
-            
+            elif copy_number < 3:
+                # 2 copies: moderate score, RepeatScout found it so it's likely real
+                logger.debug(f"{seq_id}: Low copy number ({copy_number}) - trusting RepeatScout detection")
+                copy_score = 0.45  # Reasonable base score
+                identity_score = adaptive_scorer.calculate_adaptive_identity_score(
+                    avg_identity, seq_length, copy_number
+                )
+            else:
+                # 3+ copies: use adaptive scoring
+                copy_score = adaptive_scorer.calculate_adaptive_copy_score(copy_number, seq_length)
+                identity_score = adaptive_scorer.calculate_adaptive_identity_score(
+                    avg_identity, seq_length, copy_number
+                )
+
             if seq_id not in self.scores:
                 self.scores[seq_id] = {}
-            
+
             # 分别保存拷贝数和一致性分数，用于最终评分
             self.scores[seq_id]['copy_score'] = copy_score
             self.scores[seq_id]['identity_score'] = identity_score
             self.scores[seq_id]['copy_number'] = copy_number
             self.scores[seq_id]['avg_identity'] = avg_identity
-        
+
+        # Populate default scores for sequences not in RM results
+        # (e.g., RepeatMasker timed out or returned partial results)
+        missing_count = 0
+        for seq_data in self.sequences:
+            seq_id = seq_data['id']
+            if seq_id not in self.scores:
+                self.scores[seq_id] = {}
+            if 'copy_number' not in self.scores[seq_id]:
+                missing_count += 1
+                # RepeatScout already validated these as repetitive — trust that
+                self.scores[seq_id]['copy_score'] = 0.35
+                self.scores[seq_id]['identity_score'] = 0.3
+                self.scores[seq_id]['copy_number'] = 0
+                self.scores[seq_id]['avg_identity'] = 0
+        if missing_count > 0:
+            logger.warning(f"RepeatMasker returned no results for {missing_count}/{len(self.sequences)} sequences — using default scores")
+
         # 输出拷贝数和一致性统计
         copy_numbers = [self.scores[seq_id]['copy_number'] for seq_id in self.scores]
         identities = [self.scores[seq_id]['avg_identity'] for seq_id in self.scores]
         
-        # 统计噪音序列
-        noise_sequences = [seq_id for seq_id in self.scores if self.scores[seq_id]['copy_number'] < 3]
-        valid_sequences = [seq_id for seq_id in self.scores if self.scores[seq_id]['copy_number'] >= 3]
-        
-        logger.info(f"Copy number filtering results:")
-        logger.info(f"  Valid sequences (≥3 copies): {len(valid_sequences)}")
-        logger.info(f"  Noise sequences (<3 copies): {len(noise_sequences)}")
-        logger.info(f"  Noise ratio: {len(noise_sequences)/len(self.scores)*100:.1f}%")
+        # Statistics by copy number tiers (no longer treating low-copy as noise)
+        single_copy_seqs = [seq_id for seq_id in self.scores if self.scores[seq_id]['copy_number'] < 2]
+        low_copy_seqs = [seq_id for seq_id in self.scores if 2 <= self.scores[seq_id]['copy_number'] < 5]
+        medium_copy_seqs = [seq_id for seq_id in self.scores if 5 <= self.scores[seq_id]['copy_number'] < 20]
+        high_copy_seqs = [seq_id for seq_id in self.scores if self.scores[seq_id]['copy_number'] >= 20]
+
+        logger.info(f"Copy number distribution (RepeatMasker detection):")
+        logger.info(f"  Single copy (<2): {len(single_copy_seqs)} - potential young/divergent TEs")
+        logger.info(f"  Low copy (2-4): {len(low_copy_seqs)} - may need biological validation")
+        logger.info(f"  Medium copy (5-19): {len(medium_copy_seqs)} - typical TEs")
+        logger.info(f"  High copy (≥20): {len(high_copy_seqs)} - well-supported TEs")
         
         if copy_numbers:
             logger.info(f"Copy numbers - Min: {min(copy_numbers)}, Max: {max(copy_numbers)}, "
                        f"Mean: {np.mean(copy_numbers):.1f}")
             logger.info(f"Identities - Min: {min(identities):.1f}%, Max: {max(identities):.1f}%, "
                        f"Mean: {np.mean(identities):.1f}%")
-        
-        if valid_sequences:
-            valid_copy_numbers = [self.scores[seq_id]['copy_number'] for seq_id in valid_sequences]
-            logger.info(f"Valid sequences copy numbers - Min: {min(valid_copy_numbers)}, "
-                       f"Max: {max(valid_copy_numbers)}, Mean: {np.mean(valid_copy_numbers):.1f}")
     
     def calculate_final_scores(self):
         """计算自适应综合分数"""
@@ -330,12 +373,13 @@ class SequenceScreenerOptimized:
         try:
             import os
             genome_size = os.path.getsize(self.config.genome_file)
-        except:
+        except (OSError, AttributeError) as e:
+            logger.debug(f"Could not get genome size: {e}")
             genome_size = 1e9  # 默认1Gb
-        
+
         from adaptive_scoring import AdaptiveTEScorer
         adaptive_scorer = AdaptiveTEScorer(genome_size)
-        
+
         for seq_data in self.sequences:
             seq_id = seq_data['id']
             
@@ -370,12 +414,13 @@ class SequenceScreenerOptimized:
         try:
             import os
             genome_size = os.path.getsize(self.config.genome_file)
-        except:
+        except (OSError, AttributeError) as e:
+            logger.debug(f"Could not get genome size: {e}")
             genome_size = 1e9  # 默认1Gb
-        
+
         from adaptive_scoring import AdaptiveTEScorer
         adaptive_scorer = AdaptiveTEScorer(genome_size)
-        
+
         # 获取自适应阈值
         A_THRESHOLD, B_THRESHOLD = adaptive_scorer.get_adaptive_thresholds(self.sequences)
         
@@ -463,9 +508,72 @@ class SequenceScreenerOptimized:
                        f"Identity {np.mean(a_identities):.1f}±{np.std(a_identities):.1f}%")
         
         # 步骤7: 识别需要构建共识的候选序列
-        # 策略：A类和B类序列都是共识构建的候选，C类序列质量太低跳过
-        consensus_candidates = a_sequences + b_sequences
-        
+        # Strategy change: Rescue C-class sequences that have biological evidence
+        # Rationale: RepeatScout already filtered by copy number (≥10 k-mer occurrences)
+        # C-class may contain real TEs that:
+        # - Are ancient/divergent (low RM detection)
+        # - Have structural features (TIR, LTR, poly-A)
+        # - Are long enough to be functional
+
+        rescued_c_sequences = []
+        unrescued_c_sequences = []
+
+        for seq in c_sequences:
+            seq_id = seq['id']
+            score_data = self.scores[seq_id]
+            sequence = seq['sequence']
+            seq_length = len(sequence)
+            copy_number = score_data.get('copy_number', 0)
+
+            # C-class rescue conditions - AGGRESSIVE STRATEGY
+            # Rationale: RepeatScout already requires ≥10 k-mer occurrences
+            # These sequences ARE repetitive, just not detected well by RepeatMasker
+            # Default: RESCUE unless obviously problematic
+
+            should_rescue = True  # Default to rescue
+            rescue_reason = ["repeatscout_trusted"]
+            should_reject = False
+            reject_reason = []
+
+            complexity = score_data.get('complexity', 0)
+
+            # Only reject if BOTH conditions are met:
+            # 1. Very short (<80bp) - might be artifact
+            # 2. Low complexity (<0.3) - might be simple repeat
+            if seq_length < 80 and complexity < 0.3:
+                should_reject = True
+                reject_reason.append(f"short_low_complexity({seq_length}bp,{complexity:.2f})")
+
+            # Additional rescue evidence (for logging)
+            if seq_length >= 200:
+                rescue_reason.append(f"moderate_length({seq_length}bp)")
+            if complexity >= 0.4:
+                rescue_reason.append(f"reasonable_complexity({complexity:.2f})")
+            if copy_number >= 1:
+                rescue_reason.append(f"has_copies({copy_number})")
+            if self._has_te_structural_features(sequence):
+                rescue_reason.append("structural_features")
+            if seq_length >= 500:
+                rescue_reason.append(f"long_seq({seq_length}bp)")
+
+            # Final decision
+            should_rescue = should_rescue and not should_reject
+
+            if should_rescue:
+                seq['quality_class'] = 'C_rescued'
+                seq['rescue_reason'] = ','.join(rescue_reason)
+                rescued_c_sequences.append(seq)
+                logger.debug(f"Rescued C-class sequence {seq_id}: {seq['rescue_reason']}")
+            else:
+                unrescued_c_sequences.append(seq)
+
+        if rescued_c_sequences:
+            logger.info(f"C-class rescue: {len(rescued_c_sequences)} sequences rescued, "
+                       f"{len(unrescued_c_sequences)} remain filtered")
+
+        # Combine A, B, and rescued C sequences
+        consensus_candidates = a_sequences + b_sequences + rescued_c_sequences
+
         # 为候选序列添加质量分类标记
         for seq in consensus_candidates:
             seq_score = self.scores[seq['id']]['final']
@@ -476,40 +584,83 @@ class SequenceScreenerOptimized:
             else:
                 seq['quality_class'] = 'C'
         
-        # 过滤掉质量过低的序列
+        # Filter sequences - with relaxed criteria to improve sensitivity
         filtered_candidates = []
         filtered_out_sequences = []
-        
+
+        # Relaxed identity threshold (from 50 to 40)
+        # Rationale: Ancient TEs can have <50% identity but still be real
+        MIN_IDENTITY_THRESHOLD = 40.0
+
         for seq in consensus_candidates:
             seq_id = seq['id']
             score_data = self.scores[seq_id]
-            
-            # 基本过滤条件
+            sequence = seq['sequence']
+
             copy_number = score_data.get('copy_number', 0)
             avg_identity = score_data.get('avg_identity', 0)
-            seq_length = len(seq['sequence'])
-            
-            # 过滤条件：拷贝数太少、相似度太低或序列太短的不适合构建共识
-            if (copy_number < 2 and seq['quality_class'] != 'A') or avg_identity < 50 or seq_length < self.config.min_length:
-                seq['filter_reason'] = f"copy_num={copy_number}, identity={avg_identity:.1f}%, length={seq_length}bp"
+            seq_length = len(sequence)
+            quality_class = seq.get('quality_class', 'C')
+
+            # Determine if sequence should pass filter
+            should_filter = False
+            filter_reason = []
+
+            # Check minimum length
+            if seq_length < self.config.min_length:
+                should_filter = True
+                filter_reason.append(f"too_short({seq_length}bp)")
+
+            # Check identity - but with biological evidence override
+            # RELAXED: Trust RepeatScout - if it found the sequence with ≥10 k-mers, it's likely real
+            if avg_identity < MIN_IDENTITY_THRESHOLD:
+                # Low identity is acceptable if:
+                # 1. Sequence is long (>500bp) - likely real TE even if divergent
+                # 2. Has structural features
+                # 3. Is A-class (high score from other factors)
+                # 4. Is C_rescued (already passed RepeatScout's filter)
+                has_override = (
+                    seq_length >= 500 or
+                    quality_class in ['A', 'C_rescued'] or
+                    self._has_te_structural_features(sequence)
+                )
+                if not has_override:
+                    should_filter = True
+                    filter_reason.append(f"low_identity({avg_identity:.1f}%)")
+
+            # Check copy number - VERY lenient
+            # Trust RepeatScout: only filter extremely short sequences with no evidence
+            # C_rescued are always allowed (RepeatScout already validated them)
+            if copy_number < 1 and quality_class not in ['A', 'B', 'C_rescued'] and seq_length < 200:
+                should_filter = True
+                filter_reason.append(f"no_copies_and_short")
+
+            if should_filter:
+                seq['filter_reason'] = ','.join(filter_reason)
                 filtered_out_sequences.append(seq)
             else:
-                # 添加RepeatMasker结果以供Phase2使用
+                # Add RepeatMasker results for Phase2
                 if seq_id in self.rm_detailed_results:
                     seq['rm_hits'] = self.rm_detailed_results[seq_id].get('hits', [])
                     seq['rm_coverage'] = self.rm_detailed_results[seq_id].get('coverage', 0)
                 else:
                     seq['rm_hits'] = []
                     seq['rm_coverage'] = 0
-                
+
                 filtered_candidates.append(seq)
-        
+
+        # Updated logging to reflect new categories
+        a_count = len([s for s in filtered_candidates if s.get('quality_class') == 'A'])
+        b_count = len([s for s in filtered_candidates if s.get('quality_class') == 'B'])
+        c_rescued_count = len([s for s in filtered_candidates if s.get('quality_class') == 'C_rescued'])
+
         logger.info(f"Consensus candidate selection:")
-        logger.info(f"  - A-class candidates: {len([s for s in filtered_candidates if s['quality_class'] == 'A'])}")
-        logger.info(f"  - B-class candidates: {len([s for s in filtered_candidates if s['quality_class'] == 'B'])}")
+        logger.info(f"  - A-class candidates: {a_count}")
+        logger.info(f"  - B-class candidates: {b_count}")
+        logger.info(f"  - C-class rescued: {c_rescued_count}")
         logger.info(f"  - Total candidates for Phase2: {len(filtered_candidates)}")
-        logger.info(f"  - Filtered out (too low quality): {len(filtered_out_sequences)}")
-        logger.info(f"  - C-class sequences (skipped): {len(c_sequences)}")
+        logger.info(f"  - Filtered out: {len(filtered_out_sequences)}")
+        logger.info(f"  - C-class not rescued: {len(unrescued_c_sequences)}")
         
         # 候选序列统计
         if filtered_candidates:
@@ -519,14 +670,127 @@ class SequenceScreenerOptimized:
                        f"Identity {np.mean(candidate_identities):.1f}±{np.std(candidate_identities):.1f}%")
         
         return {
-            'consensus_candidates': filtered_candidates,  # 所有需要Phase2处理的序列
-            'filtered_out_sequences': filtered_out_sequences,  # 过滤掉的低质量序列
-            'c_class_sequences': c_sequences,  # C类序列（仅记录，不处理）
+            'consensus_candidates': filtered_candidates,  # All sequences for Phase2
+            'filtered_out_sequences': filtered_out_sequences,  # Filtered low-quality sequences
+            'c_class_sequences': unrescued_c_sequences,  # C-class not rescued (for reference)
+            'rescued_c_sequences': rescued_c_sequences,  # C-class rescued sequences
             'scores': self.scores,
-            'rm_detailed_results': self.rm_detailed_results,  # 传递给Phase 2重用
-            'summary': f"Candidates:{len(filtered_candidates)} (A:{len([s for s in filtered_candidates if s['quality_class'] == 'A'])}, B:{len([s for s in filtered_candidates if s['quality_class'] == 'B'])}), Filtered:{len(filtered_out_sequences)}, C-class:{len(c_sequences)}"
+            'rm_detailed_results': self.rm_detailed_results,  # Pass to Phase 2 for reuse
+            'summary': f"Candidates:{len(filtered_candidates)} (A:{a_count}, B:{b_count}, C_rescued:{c_rescued_count}), Filtered:{len(filtered_out_sequences)}, C_unrescued:{len(unrescued_c_sequences)}"
         }
-    
+
+    def _has_te_structural_features(self, sequence: str) -> bool:
+        """
+        Check if sequence has TE structural features.
+
+        Features checked:
+        1. Terminal Inverted Repeats (TIR) - DNA transposon signature
+        2. Long Terminal Repeats (LTR) - Retrotransposon signature
+        3. Poly-A tail - LINE/SINE signature
+        4. Target Site Duplication patterns
+
+        Returns:
+            True if any structural feature is detected
+        """
+        if not sequence or len(sequence) < 50:
+            return False
+
+        sequence = sequence.upper()
+        seq_len = len(sequence)
+
+        # 1. Check for Terminal Inverted Repeats (TIR)
+        # TIR typically 10-40bp at both ends, allowing 2 mismatches
+        if self._has_terminal_inverted_repeat(sequence, min_len=10, max_mismatch=2):
+            return True
+
+        # 2. Check for Long Terminal Repeats (LTR)
+        # LTR typically 100-500bp, >80% identity
+        if seq_len >= 500 and self._has_long_terminal_repeat(sequence, min_len=80, min_identity=0.75):
+            return True
+
+        # 3. Check for poly-A tail (LINE/SINE signature)
+        # Look for poly-A (≥6 A's) at 3' end
+        tail_region = sequence[-50:] if seq_len >= 50 else sequence
+        if 'AAAAAA' in tail_region:
+            return True
+
+        # 4. Check for common TSD patterns at boundaries
+        # Many TEs have characteristic boundary sequences
+        if self._has_characteristic_boundaries(sequence):
+            return True
+
+        return False
+
+    def _has_terminal_inverted_repeat(self, sequence: str, min_len: int = 10, max_mismatch: int = 2) -> bool:
+        """Check for Terminal Inverted Repeats (TIR)"""
+        seq_len = len(sequence)
+        if seq_len < min_len * 2:
+            return False
+
+        # Check TIR lengths from 10 to 40bp
+        for tir_len in range(min_len, min(41, seq_len // 4)):
+            left_tir = sequence[:tir_len]
+            right_tir = sequence[-tir_len:]
+
+            # Reverse complement of right TIR
+            complement = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G', 'N': 'N'}
+            right_tir_rc = ''.join(complement.get(b, 'N') for b in reversed(right_tir))
+
+            # Count mismatches
+            mismatches = sum(1 for a, b in zip(left_tir, right_tir_rc) if a != b)
+
+            if mismatches <= max_mismatch:
+                return True
+
+        return False
+
+    def _has_long_terminal_repeat(self, sequence: str, min_len: int = 80, min_identity: float = 0.75) -> bool:
+        """Check for Long Terminal Repeats (LTR)"""
+        seq_len = len(sequence)
+        if seq_len < min_len * 2 + 100:  # Need space for internal region
+            return False
+
+        # Check LTR lengths from 80 to 500bp
+        for ltr_len in range(min_len, min(501, seq_len // 3)):
+            left_ltr = sequence[:ltr_len]
+            right_ltr = sequence[-ltr_len:]
+
+            # Calculate identity
+            matches = sum(1 for a, b in zip(left_ltr, right_ltr) if a == b)
+            identity = matches / ltr_len
+
+            if identity >= min_identity:
+                return True
+
+        return False
+
+    def _has_characteristic_boundaries(self, sequence: str) -> bool:
+        """Check for characteristic TE boundary patterns"""
+        if len(sequence) < 20:
+            return False
+
+        # Common TE boundary patterns
+        # TA dinucleotide (common TSD for many DNA transposons)
+        if sequence[:2] == 'TA' and sequence[-2:] == 'TA':
+            return True
+
+        # TG...CA pattern (LTR retrotransposons often have TG...CA)
+        if sequence[:2] == 'TG' and sequence[-2:] == 'CA':
+            return True
+
+        # Check for simple direct repeats at boundaries (potential TSD)
+        left_10bp = sequence[:10]
+        right_10bp = sequence[-10:]
+
+        # Look for 4-8bp direct repeats
+        for repeat_len in range(4, 9):
+            left_motif = sequence[:repeat_len]
+            # Check if same motif appears near the end
+            if left_motif in sequence[-20:]:
+                return True
+
+        return False
+
     def _calculate_boundary_quality(self, seq_data):
         """计算序列边界质量指标"""
         sequence = seq_data['sequence']
@@ -593,12 +857,12 @@ class SequenceScreenerOptimized:
             reverse=True
         )
         
-        logger.info(f"Running CD-HIT with 70% threshold on {len(sorted_sequences)} sequences")
-        
-        # 运行CD-HIT去冗余（70%阈值 - 更激进的去冗余）
+        logger.info(f"Running CD-HIT with 80% identity threshold on {len(sorted_sequences)} sequences")
+
+        # 运行CD-HIT去冗余（80%相似度阈值）
         deduplicated = run_cdhit_optimized_phase1(
             sorted_sequences,
-            threshold=0.80,  # 降低到70%阈值，更激进的去冗余
+            threshold=0.80,  # 80% sequence identity threshold
             threads=self.config.threads,
             config=self.config,
             label="phase1_prefilter"
@@ -807,8 +1071,12 @@ def run_cdhit_optimized_phase1(sequences: List[Dict], threshold: float, threads:
         logger.info(f"Input file: {input_path} ({input_size} bytes, {len(sequences)} sequences)")
         logger.debug(f"CD-HIT command: {' '.join(cmd)}")
         
-        # 运行CD-HIT (无timeout限制)
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # 运行CD-HIT
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        except subprocess.TimeoutExpired:
+            logger.error(f"CD-HIT {label} timed out after 30 minutes")
+            raise RuntimeError(f"CD-HIT {label} timed out")
         
         # Check output
         if os.path.exists(output_path):

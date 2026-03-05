@@ -45,10 +45,10 @@ class ChimeraSplitter:
             available_memory_gb = mem.available / (1024**3)
             total_memory_gb = mem.total / (1024**3)
             logger.info(f"System memory: {available_memory_gb:.1f}GB available / {total_memory_gb:.1f}GB total")
-        except:
+        except Exception as e:
             available_memory_gb = 16
             total_memory_gb = 32
-            logger.warning("Could not detect system memory, assuming 16GB available")
+            logger.warning(f"Could not detect system memory ({e}), assuming 16GB available")
         
         # 设置并行处理workers - 嵌合体拆分主要是I/O密集型（RepeatMasker调用）
         cpu_count = mp.cpu_count()
@@ -352,24 +352,274 @@ class ChimeraSplitter:
             logger.error(f"Error processing candidate {candidate.get('id', 'unknown')}: {e}")
             return self._handle_processing_failure(candidate, f"processing_error: {str(e)}")
     
+    def _build_coverage_profile(self, rm_hits: List[Dict], seq_length: int) -> np.ndarray:
+        """Build per-base coverage profile from RM hits across genomic copies.
+
+        Each hit contributes +1 to the coverage at positions it aligns to
+        on the query (consensus) coordinate.  Returns an array of shape
+        (seq_length,) with integer counts.
+        """
+        coverage = np.zeros(seq_length, dtype=np.int32)
+        for hit in rm_hits:
+            qs = hit.get('query_start', 0)
+            qe = hit.get('query_end', 0)
+            if qs == 0 and qe == 0:
+                continue
+            # Clamp to valid range
+            start = max(0, min(qs, qe) - 1)  # 0-based
+            end = min(seq_length, max(qs, qe))
+            if start < end:
+                coverage[start:end] += 1
+        return coverage
+
+    def _find_coverage_valleys(self, coverage: np.ndarray, min_flank: int = 50) -> List[Tuple[int, float]]:
+        """Find coverage valleys (candidate chimera breakpoints).
+
+        A valley is a local minimum where coverage drops significantly
+        relative to the flanking regions.
+
+        Returns list of (position, valley_depth_ratio) sorted by depth
+        (deepest first).  valley_depth_ratio = valley_cov / mean_flank_cov.
+        Lower ratio = deeper valley = stronger breakpoint candidate.
+        """
+        seq_length = len(coverage)
+        if seq_length < min_flank * 3:
+            return []
+
+        # Smooth coverage with a 50bp window to reduce noise
+        window = min(50, seq_length // 10)
+        if window < 5:
+            smoothed = coverage.astype(np.float64)
+        else:
+            kernel = np.ones(window) / window
+            smoothed = np.convolve(coverage, kernel, mode='same')
+
+        valleys = []
+        # Scan for local minima (skip edges)
+        scan_start = min_flank
+        scan_end = seq_length - min_flank
+
+        for pos in range(scan_start, scan_end):
+            # Check if this is a local minimum in a 20bp window
+            w = 10
+            local_start = max(0, pos - w)
+            local_end = min(seq_length, pos + w + 1)
+            if smoothed[pos] > np.min(smoothed[local_start:local_end]) + 0.01:
+                continue
+
+            # Compute mean coverage of flanking regions (100bp each side)
+            flank_size = min(100, min_flank)
+            left_flank = smoothed[max(0, pos - flank_size):pos]
+            right_flank = smoothed[pos + 1:min(seq_length, pos + flank_size + 1)]
+
+            if len(left_flank) == 0 or len(right_flank) == 0:
+                continue
+
+            mean_left = np.mean(left_flank)
+            mean_right = np.mean(right_flank)
+            mean_flank = (mean_left + mean_right) / 2.0
+
+            if mean_flank < 1.0:
+                continue  # Not enough coverage to judge
+
+            valley_ratio = smoothed[pos] / mean_flank
+            # A valley where coverage drops to <50% of flanks is significant
+            if valley_ratio < 0.50:
+                valleys.append((pos, valley_ratio))
+
+        # Deduplicate nearby valleys (keep deepest within 100bp)
+        if not valleys:
+            return []
+
+        valleys.sort(key=lambda x: x[1])  # Sort by depth (lowest ratio first)
+        merged = []
+        used = set()
+        for pos, ratio in valleys:
+            if any(abs(pos - p) < 100 for p, _ in merged):
+                continue
+            merged.append((pos, ratio))
+
+        return merged
+
+    def _analyze_copy_distribution_chimera(self, candidate: Dict) -> Optional[Dict[str, Any]]:
+        """Coverage-profile-based chimera detection.
+
+        Builds a per-base coverage profile from RM hits and identifies
+        coverage valleys as candidate breakpoints.  A deep valley indicates
+        that genomic copies consistently lack sequence at that position,
+        which is the hallmark of a chimeric junction.
+
+        Requires rm_hits with query_start/query_end fields.
+        Returns chimera analysis dict or None if insufficient data.
+        """
+        candidate_id = candidate.get('id', 'unknown')
+        rm_hits = candidate.get('rm_hits', [])
+
+        if not rm_hits or len(rm_hits) < 4:
+            return None
+
+        seq_length = len(candidate.get('sequence', ''))
+        if seq_length < 200:
+            return None
+
+        # Build coverage profile and find valleys
+        coverage = self._build_coverage_profile(rm_hits, seq_length)
+        valleys = self._find_coverage_valleys(coverage, min_flank=50)
+
+        if not valleys:
+            return None
+
+        # Use the deepest valley as the primary breakpoint
+        best_pos, best_ratio = valleys[0]
+
+        logger.debug(f"{candidate_id}: Coverage valley at pos {best_pos} "
+                     f"(depth_ratio={best_ratio:.2f}, {len(valleys)} valleys found)")
+
+        # Also verify locus non-overlap around the breakpoint
+        five_prime_loci = set()
+        three_prime_loci = set()
+        for hit in rm_hits:
+            qs = hit.get('query_start', 0)
+            qe = hit.get('query_end', 0)
+            if qs == 0 and qe == 0:
+                continue
+            hit_center = (qs + qe) / 2.0
+            chrom = hit.get('chrom', '')
+            locus = f"{chrom}:{hit.get('start', 0) // 500}"  # 500bp resolution
+            if hit_center < best_pos:
+                five_prime_loci.add(locus)
+            else:
+                three_prime_loci.add(locus)
+
+        union = five_prime_loci | three_prime_loci
+        overlap = five_prime_loci & three_prime_loci
+        overlap_ratio = len(overlap) / len(union) if union else 1.0
+
+        # Report breakpoint with evidence
+        breakpoints = [best_pos]
+        # Add secondary breakpoints if they are also deep
+        for pos, ratio in valleys[1:3]:  # At most 2 additional
+            if ratio < 0.30:  # Very deep valley
+                breakpoints.append(pos)
+
+        return {
+            'is_chimeric': True,
+            'is_splittable': True,
+            'breakpoints': sorted(breakpoints),
+            'confidence': 1.0 - best_ratio,
+            'overlap_ratio': overlap_ratio,
+            'reason': f'coverage_valley(depth={best_ratio:.2f},pos={best_pos},'
+                     f'overlap={overlap_ratio:.2f},'
+                     f'5prime={len(five_prime_loci)},3prime={len(three_prime_loci)})',
+            'analysis_source': 'copy_distribution'
+        }
+
     def _analyze_for_chimera(self, candidate: Dict) -> Dict[str, Any]:
-        """分析序列是否为嵌合体"""
+        """Chimera detection with cross-validation.
+
+        Uses two independent methods:
+        1. Coverage-valley analysis (from RM hits)
+        2. Phase 1 RepeatMasker gap-based breakpoints
+
+        A sequence is called chimeric only if at least one method finds
+        a breakpoint with strong evidence, OR if both methods agree on
+        an approximate breakpoint region (within 200bp).
+
+        The self-alignment method (aligning sequence against itself) has
+        been removed as it provides no information — a sequence always
+        matches itself perfectly, making breakpoint detection circular.
+        """
         try:
             candidate_id = candidate.get('id', 'unknown')
-            
-            # 优先检查是否可以今Phase 1的RepeatMasker结果分析嵌合体
+
+            # Method 1: Coverage-valley chimera detection
+            copy_dist_result = self._analyze_copy_distribution_chimera(candidate)
+
+            # Method 2: Phase 1 RepeatMasker gap-based breakpoints
             phase1_result = self._try_analyze_with_phase1_results(candidate)
-            if phase1_result is not None:
-                logger.debug(f"Using Phase 1 RepeatMasker results for {candidate_id}")
-                phase1_result['analysis_source'] = 'phase1_reused'
-                return phase1_result
+
+            # Cross-validation logic
+            if copy_dist_result and phase1_result:
+                # Both methods found chimera evidence — check if breakpoints agree
+                cd_bps = set(copy_dist_result.get('breakpoints', []))
+                p1_bps = set(phase1_result.get('breakpoints', []))
+
+                # Find agreeing breakpoints (within 200bp)
+                agreeing_bps = []
+                for bp1 in cd_bps:
+                    for bp2 in p1_bps:
+                        if abs(bp1 - bp2) <= 200:
+                            # Use the coverage-valley position (more precise)
+                            agreeing_bps.append(bp1)
+                            break
+
+                if agreeing_bps:
+                    logger.debug(f"{candidate_id}: Cross-validated chimera "
+                                f"({len(agreeing_bps)} agreeing breakpoints)")
+                    return {
+                        'is_chimeric': True,
+                        'is_splittable': True,
+                        'breakpoints': sorted(set(agreeing_bps)),
+                        'reason': f'cross_validated({len(agreeing_bps)}_agreeing_breakpoints)',
+                        'analysis_source': 'cross_validated'
+                    }
+
+                # Methods disagree on breakpoint location — use coverage valley
+                # only if it has very strong evidence
+                if copy_dist_result.get('confidence', 0) >= 0.7:
+                    logger.debug(f"{candidate_id}: Strong coverage valley despite "
+                                f"method disagreement (conf={copy_dist_result['confidence']:.2f})")
+                    copy_dist_result['analysis_source'] = 'copy_distribution_strong'
+                    return copy_dist_result
+
+                # Not enough agreement — mark as non-chimeric
+                logger.debug(f"{candidate_id}: Methods disagree on breakpoints, "
+                            f"keeping as non-chimeric")
+                return {
+                    'is_chimeric': False,
+                    'is_splittable': False,
+                    'breakpoints': [],
+                    'reason': f'methods_disagree(cd_bps={list(cd_bps)},p1_bps={list(p1_bps)})',
+                    'analysis_source': 'cross_validation_disagreement'
+                }
+
+            elif copy_dist_result:
+                # Only coverage-valley found evidence
+                # Require strong confidence when single-method
+                if copy_dist_result.get('confidence', 0) >= 0.6:
+                    logger.debug(f"{candidate_id}: Coverage-valley chimera "
+                                f"(single method, conf={copy_dist_result['confidence']:.2f})")
+                    return copy_dist_result
+                else:
+                    logger.debug(f"{candidate_id}: Weak coverage valley, not splitting")
+                    return {
+                        'is_chimeric': False,
+                        'is_splittable': False,
+                        'breakpoints': [],
+                        'reason': f'weak_coverage_valley(conf={copy_dist_result.get("confidence", 0):.2f})',
+                        'analysis_source': 'copy_distribution_weak'
+                    }
+
+            elif phase1_result:
+                # Only Phase 1 found evidence — accept if it found clear breakpoints
+                if phase1_result.get('is_chimeric', False) and phase1_result.get('is_splittable', False):
+                    logger.debug(f"{candidate_id}: Using Phase 1 breakpoints (single method)")
+                    phase1_result['analysis_source'] = 'phase1_reused'
+                    return phase1_result
+                else:
+                    phase1_result['analysis_source'] = 'phase1_reused'
+                    return phase1_result
+
             else:
-                # 如果Phase 1结果不可用，进行新的RepeatMasker自比对分析
-                logger.debug(f"Running new RepeatMasker analysis for {candidate_id}")
-                chimera_result = self._analyze_chimera_with_repeatmasker(candidate)
-                chimera_result['analysis_source'] = 'new_analysis'
-                return chimera_result
-                
+                # Neither method found chimera evidence
+                return {
+                    'is_chimeric': False,
+                    'is_splittable': False,
+                    'breakpoints': [],
+                    'reason': 'no_chimera_evidence',
+                    'analysis_source': 'no_evidence'
+                }
+
         except Exception as e:
             logger.error(f"Error analyzing chimera for {candidate.get('id', 'unknown')}: {e}")
             return {
@@ -528,39 +778,32 @@ class ChimeraSplitter:
         return separated_sequences
     
     def _process_single_chimera(self, chimera: Dict) -> List[Dict]:
-        """处理单个嵌合体序列 - 保守策略：只有高度确定时才拆分"""
+        """Process a single chimeric sequence — conservative strategy.
+
+        Uses the cross-validated _analyze_for_chimera() which combines
+        coverage-valley and Phase 1 gap-based methods.  Self-alignment
+        method has been removed (circular logic).
+        """
         try:
             chimera_id = chimera.get('id', 'unknown')
             sequence = chimera.get('sequence', '')
-            
+
             if not sequence:
                 logger.warning(f"Empty sequence for chimera {chimera_id}")
                 return self._handle_unsplit_chimera(chimera, "empty_sequence")
-            
-            # 优先检查是否可以从Phase 1的RepeatMasker结果分析嵌合体
-            phase1_result = self._try_analyze_with_phase1_results(chimera)
-            if phase1_result is not None:
-                logger.debug(f"Using Phase 1 RepeatMasker results for {chimera_id}")
-                split_result = phase1_result
-                # 标记为重用Phase 1结果
-                chimera['_analysis_source'] = 'phase1_reused'
-            else:
-                # 如果Phase 1结果不可用，进行新的RepeatMasker自比对分析
-                logger.debug(f"Running new RepeatMasker analysis for {chimera_id}")
-                split_result = self._analyze_chimera_with_repeatmasker(chimera)
-                # 标记为新分析
-                chimera['_analysis_source'] = 'new_analysis'
-            
-            if split_result['is_splittable']:
-                # 执行拆分
+
+            # Use cross-validated chimera analysis
+            split_result = self._analyze_for_chimera(chimera)
+            chimera['_analysis_source'] = split_result.get('analysis_source', 'unknown')
+
+            if split_result.get('is_splittable', False):
                 segments = self._split_sequence_by_breakpoints(chimera, split_result['breakpoints'])
                 logger.debug(f"Split {chimera_id} into {len(segments)} segments")
                 return segments
             else:
-                # 不拆分，标记为完整序列
-                logger.debug(f"Sequence {chimera_id} not split: {split_result['reason']}")
-                return self._handle_unsplit_chimera(chimera, split_result['reason'])
-                
+                logger.debug(f"Sequence {chimera_id} not split: {split_result.get('reason', 'unknown')}")
+                return self._handle_unsplit_chimera(chimera, split_result.get('reason', 'unknown'))
+
         except Exception as e:
             logger.error(f"Error processing chimera {chimera.get('id', 'unknown')}: {e}")
             return self._handle_unsplit_chimera(chimera, f"processing_error: {str(e)}")
@@ -630,143 +873,62 @@ class ChimeraSplitter:
             logger.debug(f"Error extracting breakpoints from hits: {e}")
             return []
     
-    def _analyze_chimera_with_repeatmasker(self, chimera: Dict) -> Dict[str, Any]:
-        """使用RepeatMasker分析嵌合体序列的可拆分性"""
-        try:
-            # 创建临时文件
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as temp_fa:
-                temp_fa.write(f">{chimera['id']}\n{chimera['sequence']}\n")
-                temp_fa_path = temp_fa.name
-            
-            # 运行RepeatMasker进行自比对分析
-            temp_dir = Path(temp_fa_path).parent
-            rm_cmd = [
-                "RepeatMasker",
-                "-no_is",  # 不检查简单重复
-                "-nolow",  # 不屏蔽低复杂度
-                "-s",      # 慢速但准确
-                "-pa", str(self.threads_per_worker),  # 指定RepeatMasker使用的线程数
-                "-dir", str(temp_dir),
-                "-lib", temp_fa_path,  # 使用自身作为库进行比对
-                temp_fa_path
-            ]
-            
-            result = self.runner.run_command(
-                rm_cmd,
-                timeout=120,  # 2分钟超时
-                description=f"RepeatMasker analysis for chimera {chimera['id']}"
-            )
-            
-            # 解析RepeatMasker输出寻找拆分点
-            rm_out_path = temp_fa_path + ".out"
-            breakpoints = []
-            
-            if os.path.exists(rm_out_path):
-                breakpoints = self._parse_repeatmasker_for_breakpoints(rm_out_path)
-            
-            # 清理临时文件
-            for temp_file in [temp_fa_path, rm_out_path, temp_fa_path + ".masked", temp_fa_path + ".cat"]:
-                if os.path.exists(temp_file):
-                    os.unlink(temp_file)
-            
-            # 决定是否拆分
-            if len(breakpoints) >= 2:  # 至少需要2个拆分点才能产生有意义的片段
-                return {
-                    'is_chimeric': True,
-                    'is_splittable': True,
-                    'breakpoints': breakpoints,
-                    'reason': f'found_{len(breakpoints)}_breakpoints'
-                }
-            else:
-                return {
-                    'is_chimeric': False,
-                    'is_splittable': False,
-                    'breakpoints': [],
-                    'reason': 'insufficient_breakpoints'
-                }
-                
-        except Exception as e:
-            logger.debug(f"RepeatMasker analysis failed for {chimera['id']}: {e}")
-            return {
-                'is_chimeric': False,
-                'is_splittable': False,
-                'breakpoints': [],
-                'reason': f'analysis_failed: {str(e)}'
-            }
-    
-    def _parse_repeatmasker_for_breakpoints(self, rm_out_path: str) -> List[int]:
-        """解析RepeatMasker输出文件寻找潜在的拆分点"""
-        breakpoints = []
-        
-        try:
-            with open(rm_out_path, 'r') as f:
-                lines = f.readlines()
-            
-            # 跳过头部信息
-            data_start = 0
-            for i, line in enumerate(lines):
-                if line.strip().startswith('SW') or line.strip().startswith('score'):
-                    data_start = i + 1
-                    break
-            
-            hits = []
-            for line in lines[data_start:]:
-                if line.strip() and not line.startswith('There were no'):
-                    parts = line.split()
-                    if len(parts) >= 7:
-                        try:
-                            start = int(parts[5])
-                            end = int(parts[6])
-                            hits.append((start, end))
-                        except (ValueError, IndexError):
-                            continue
-            
-            # 寻找重复区域之间的间隙作为潜在拆分点
-            if len(hits) >= 2:
-                hits.sort()  # 按起始位置排序
-                
-                for i in range(len(hits) - 1):
-                    current_end = hits[i][1]
-                    next_start = hits[i + 1][0]
-                    
-                    # 如果两个重复区域之间有足够的间隙（>50bp），则在间隙中点拆分
-                    gap_size = next_start - current_end
-                    if gap_size > 50:
-                        breakpoint = current_end + gap_size // 2
-                        breakpoints.append(breakpoint)
-        
-        except Exception as e:
-            logger.debug(f"Error parsing RepeatMasker output {rm_out_path}: {e}")
-        
-        return sorted(breakpoints)
-    
+    # NOTE: _analyze_chimera_with_repeatmasker and _parse_repeatmasker_for_breakpoints
+    # have been removed.  Self-alignment (aligning a sequence against itself as both
+    # query and library) is circular — the sequence always matches itself perfectly,
+    # so any gaps found are artifacts of the RM engine, not biological chimera signals.
+    # Chimera detection now relies on coverage-valley analysis and Phase 1 gap-based
+    # breakpoints with cross-validation.
+
     def _split_sequence_by_breakpoints(self, chimera: Dict, breakpoints: List[int]) -> List[Dict]:
-        """根据拆分点将序列分割成片段"""
+        """Split sequence at breakpoints, preserving relevant RM hits per segment."""
         sequence = chimera['sequence']
         chimera_id = chimera['id']
-        
-        # 确保拆分点在合理范围内
+
         valid_breakpoints = [bp for bp in breakpoints if 50 <= bp <= len(sequence) - 50]
-        
         if not valid_breakpoints:
             return self._handle_unsplit_chimera(chimera, "no_valid_breakpoints")
-        
-        # 添加序列起始和结束位置
+
         positions = [0] + sorted(valid_breakpoints) + [len(sequence)]
-        
+        original_rm_hits = chimera.get('rm_hits', [])
+
         segments = []
         for i in range(len(positions) - 1):
             start_pos = positions[i]
             end_pos = positions[i + 1]
-            
-            # 确保片段有合理的长度
-            if end_pos - start_pos < 50:  # 最小片段长度50bp
+
+            if end_pos - start_pos < 50:
                 continue
-            
+
             segment_seq = sequence[start_pos:end_pos]
             segment_id = f"{chimera_id}_seg{i+1}"
-            
-            # 创建片段记录
+
+            # Preserve RM hits that overlap this segment, adjusting coordinates
+            segment_rm_hits = []
+            for hit in original_rm_hits:
+                qs = hit.get('query_start', 0)
+                qe = hit.get('query_end', 0)
+                if qs == 0 and qe == 0:
+                    # Hit without query coords — keep for all segments
+                    segment_rm_hits.append(dict(hit))
+                    continue
+
+                hit_start = min(qs, qe)
+                hit_end = max(qs, qe)
+
+                # Check if hit overlaps this segment (>50% of hit within segment)
+                overlap_start = max(hit_start, start_pos)
+                overlap_end = min(hit_end, end_pos)
+                overlap_len = max(0, overlap_end - overlap_start)
+                hit_len = hit_end - hit_start
+
+                if hit_len > 0 and overlap_len / hit_len >= 0.5:
+                    # Adjust query coordinates relative to segment
+                    adjusted_hit = dict(hit)
+                    adjusted_hit['query_start'] = max(0, qs - start_pos)
+                    adjusted_hit['query_end'] = max(0, qe - start_pos)
+                    segment_rm_hits.append(adjusted_hit)
+
             segment = {
                 'id': segment_id,
                 'sequence': segment_seq,
@@ -775,19 +937,21 @@ class ChimeraSplitter:
                 'segment_start': start_pos,
                 'segment_end': end_pos,
                 'original_length': len(sequence),
-                'quality_class': chimera.get('quality_class', 'B'),  # 继承或默认为B类
+                'quality_class': chimera.get('quality_class', 'B'),
+                'source': 'chimera_split',
                 'note': f'chimera_segment_from_{chimera_id}',
-                'rm_hits': [],  # 重置RepeatMasker结果，需要重新分析
-                'phase1_scores': {},  # 重置Phase1分数，将在Phase3重新计算
-                '_analysis_source': chimera.get('_analysis_source', 'unknown')  # 继承分析来源
+                'rm_hits': segment_rm_hits,
+                'phase1_scores': {},
+                '_analysis_source': chimera.get('_analysis_source', 'unknown')
             }
-            
+
             segments.append(segment)
-        
-        # 确保至少产生了有效的片段
+
         if not segments:
             return self._handle_unsplit_chimera(chimera, "no_valid_segments_generated")
-        
+
+        logger.debug(f"{chimera_id}: Split into {len(segments)} segments, "
+                     f"preserved {sum(len(s['rm_hits']) for s in segments)} total RM hits")
         return segments
     
     def _handle_unsplit_chimera(self, chimera: Dict, reason: str) -> List[Dict]:

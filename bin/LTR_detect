@@ -5,354 +5,34 @@ import sys
 import argparse
 import subprocess
 import multiprocessing as mp
-from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from Bio import SeqIO
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
 import shutil
-import math
-import tempfile
-import csv
-import logging
 
-# Import ltr_modules for high-quality LTR library building
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from ltr_modules import (
-    LTRConsensusBuilder,
-    LTRBoundaryRefiner,
-    LTRChimeraDetector,
-    LTRQualityValidator,
-    GenomeSimpleAccess
-)
-
-def align_consensus_to_genome(consensus_file, genome_file, output_paf, threads=4):
-    """
-    Align consensus sequences to genome using FastGA.
-
-    Args:
-        consensus_file: Path to consensus FASTA
-        genome_file: Path to genome FASTA
-        output_paf: Path to output PAF file
-        threads: Number of threads
-
-    Returns:
-        True if successful, False otherwise
-    """
-    cmd = [
-        "FastGA",
-        "-c70",                 # Minimum seed chain coverage 70%
-        "-i0.65",               # Minimum alignment identity 65%
-        "-l80",                 # Minimum alignment length 80bp
-        "-pafm",                # PAF output with CIGAR string with ='s
-        genome_file,            # Target (genome) first
-        consensus_file          # Query (consensus) second
-    ]
-
-    try:
-        with open(output_paf, 'w') as out_f:
-            subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=out_f)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Warning: FastGA alignment failed: {e}")
-        return False
-
-def parse_paf_alignments(paf_file, min_identity=70, min_coverage=50):
-    """
-    Parse PAF file from FastGA and return alignments grouped by query ID.
-
-    FastGA PAF format: target (genome) first, query (consensus) second
-
-    Args:
-        paf_file: Path to PAF file
-        min_identity: Minimum alignment identity (%)
-        min_coverage: Minimum query coverage (%)
-
-    Returns:
-        Dictionary: {query_id: [alignment_dict, ...]}
-    """
-    alignments_by_query = {}
-
-    if not os.path.exists(paf_file):
-        return alignments_by_query
-
-    with open(paf_file, 'r') as f:
-        for line in f:
-            if line.startswith('#'):
-                continue
-
-            fields = line.strip().split('\t')
-            if len(fields) < 12:
-                continue
-
-            # FastGA format: target (genome) first, query (consensus) second
-            target_id = fields[0]
-            target_len = int(fields[1])
-            target_start = int(fields[2])
-            target_end = int(fields[3])
-            strand = fields[4]
-            query_id = fields[5]
-            query_len = int(fields[6])
-            query_start = int(fields[7])
-            query_end = int(fields[8])
-            num_matches = int(fields[9])
-            aln_len = int(fields[10])
-            mapq = int(fields[11])
-
-            # Calculate identity and coverage
-            identity = (num_matches / aln_len * 100) if aln_len > 0 else 0
-            coverage = ((query_end - query_start) / query_len * 100) if query_len > 0 else 0
-
-            # Filter by identity and coverage
-            if identity < min_identity or coverage < min_coverage:
-                continue
-
-            alignment = {
-                'query_id': query_id,
-                'query_len': query_len,
-                'query_start': query_start,
-                'query_end': query_end,
-                'strand': strand,
-                'target_name': target_id,  # Use 'target_name' to match LTR_BoundaryRefiner expectations
-                'target_len': target_len,
-                'target_start': target_start,
-                'target_end': target_end,
-                'num_matches': num_matches,
-                'alignment_len': aln_len,
-                'mapq': mapq,
-                'identity': identity,
-                'coverage': coverage
-            }
-
-            if query_id not in alignments_by_query:
-                alignments_by_query[query_id] = []
-            alignments_by_query[query_id].append(alignment)
-
-    return alignments_by_query
-
-def find_boundaries_by_depth(depth_profile, seq_len, window_size=50, drop_threshold=0.5):
-    """
-    Find rough boundaries based on alignment depth profile.
-
-    Strategy:
-    1. Smooth depth profile using sliding window
-    2. Find peak depth region (core element)
-    3. Detect boundaries where depth drops below threshold
-
-    Args:
-        depth_profile: List of depth values at each position
-        seq_len: Length of sequence
-        window_size: Window size for smoothing (default: 50bp)
-        drop_threshold: Threshold for depth drop (default: 0.5 = 50% of max)
-
-    Returns:
-        Dictionary with boundary information or None
-    """
-    if not depth_profile or seq_len == 0:
-        return None
-
-    # Calculate smoothed depth using sliding window
-    smoothed_depth = []
-    half_window = window_size // 2
-
-    for i in range(seq_len):
-        start = max(0, i - half_window)
-        end = min(seq_len, i + half_window + 1)
-        window_depth = depth_profile[start:end]
-        avg_depth = sum(window_depth) / len(window_depth) if window_depth else 0
-        smoothed_depth.append(avg_depth)
-
-    # Find maximum depth (core region)
-    max_depth = max(smoothed_depth) if smoothed_depth else 0
-
-    if max_depth == 0:
-        return None
-
-    # Find threshold for boundary detection
-    threshold = max_depth * drop_threshold
-
-    # Find 5' boundary (left to right, where depth rises above threshold)
-    boundary_5prime = 0
-    for i in range(seq_len):
-        if smoothed_depth[i] >= threshold:
-            boundary_5prime = i
-            break
-
-    # Find 3' boundary (right to left, where depth rises above threshold)
-    boundary_3prime = seq_len - 1
-    for i in range(seq_len - 1, -1, -1):
-        if smoothed_depth[i] >= threshold:
-            boundary_3prime = i
-            break
-
-    # Calculate average depth in core region
-    core_depth = smoothed_depth[boundary_5prime:boundary_3prime + 1]
-    avg_core_depth = sum(core_depth) / len(core_depth) if core_depth else 0
-
-    return {
-        'start': boundary_5prime,
-        'end': boundary_3prime,
-        'avg_depth': avg_core_depth,
-        'max_depth': max_depth,
-        'threshold': threshold
-    }
-
-def build_single_consensus(args):
-    """
-    Worker function for parallel consensus building using MAFFT MSA.
-
-    Strategy:
-    - Single sequence: return as-is (no consensus needed)
-    - 2-3 sequences: use MSA with MAFFT (fast)
-    - 4+ sequences: use MSA with MAFFT (high quality)
-    - Each MAFFT uses 1 thread, parallelism via multiple processes
-
-    Args:
-        args: Tuple of (cluster_idx, member_ids, all_sequences_dict)
-
-    Returns:
-        Tuple of (cluster_idx, consensus_record) or None if empty cluster
-    """
-    cluster_idx, member_ids, all_sequences_dict = args
-
-    # Import here to avoid pickling issues with multiprocessing
-    from ltr_modules import LTRConsensusBuilder
-
-    # Extract sequences for this cluster
-    cluster_seqs = []
-    for member_id in member_ids:
-        if member_id in all_sequences_dict:
-            cluster_seqs.append(str(all_sequences_dict[member_id].seq))
-
-    if not cluster_seqs:
-        return None
-
-    # Optimization: single sequence doesn't need consensus building
-    if len(cluster_seqs) == 1:
-        consensus_seq = cluster_seqs[0]
-    else:
-        # Build consensus using MSA method (MAFFT) with single thread per process
-        # Multiple processes run in parallel to achieve full CPU utilization
-        builder = LTRConsensusBuilder(min_frac_major=0.60, threads=1)  # 1 thread per MAFFT
-        consensus_seq = builder.build_consensus(cluster_seqs, method='msa')
-
-    consensus_record = SeqRecord(
-        Seq(consensus_seq),
-        id=f"LTR_consensus_{cluster_idx}",
-        description=f"Cluster_{cluster_idx} with {len(cluster_seqs)} members"
-    )
-
-    return (cluster_idx, consensus_record)
-
-def refine_single_boundary(args):
-    """
-    Worker function for parallel boundary refinement.
-
-    Args:
-        args: Tuple of (item, extended_alignments_by_query, genome_file, genome_seq_names)
-              genome_seq_names is optional; if None, GenomeSimpleAccess will scan genome
-
-    Returns:
-        Refined SeqRecord
-    """
-    # Unpack arguments (handle both old and new format for compatibility)
-    if len(args) == 4:
-        item, extended_alignments_by_query, genome_file, genome_seq_names = args
-    else:
-        # Fallback for old format (without genome_seq_names)
-        item, extended_alignments_by_query, genome_file = args
-        genome_seq_names = None
-
-    seq_record = item['record']
-    seq_id = seq_record.id
-
-    try:
-        seq_alignments = extended_alignments_by_query.get(seq_id, [])
-
-        # Import here to avoid pickling issues with multiprocessing
-        from ltr_modules import LTRBoundaryRefiner, GenomeSimpleAccess
-
-        if len(seq_alignments) < 2:
-            return seq_record
-
-        # Calculate depth profile from alignments
-        seq_len = len(seq_record.seq)
-        depth_profile = [0] * seq_len
-
-        for aln in seq_alignments:
-            q_start = aln.get('query_start', 0)
-            q_end = aln.get('query_end', seq_len)
-            for pos in range(q_start, min(q_end, seq_len)):
-                depth_profile[pos] += 1
-
-        # Find rough boundaries based on depth
-        rough_boundaries = find_boundaries_by_depth(depth_profile, seq_len)
-
-        # Use refiner for structural refinement
-        # OPTIMIZATION: Pass pre-scanned sequence names to avoid repeated genome scanning
-        # Enhanced error handling for genome access
-        try:
-            genome_seqs = GenomeSimpleAccess(genome_file, chunk_size=1000000, seq_names=genome_seq_names)
-        except Exception as genome_error:
-            raise RuntimeError(f"Failed to initialize genome access: {str(genome_error)}")
-
-        # Initialize refiner with new simplified API
-        refiner = LTRBoundaryRefiner(
-            min_ltr_len=100,
-            max_ltr_len=1500,
-            min_ltr_similarity=0.70
-        )
-
-        result = refiner.refine_boundaries(
-            seq_record,
-            alignments=seq_alignments,
-            genome_seqs=genome_seqs,
-            iteration=2  # Iteration 2 = precise refinement mode
-        )
-
-        if not result or 'refined_record' not in result:
-            raise RuntimeError(f"refine_boundaries returned invalid result: {result}")
-
-        return result['refined_record']
-
-    except MemoryError as e:
-        # Handle MemoryError specifically - likely a malformed or oversized sequence
-        import traceback
-        print(f"  MemoryError processing {seq_id} - likely malformed/oversized sequence")
-        print(f"  Sequence length: {len(seq_record.seq):,}bp")
-        # Return original sequence instead of crashing
-        return seq_record
-
-    except Exception as e:
-        import traceback
-        error_msg = f"{type(e).__name__}: {str(e)}"
-        tb_lines = traceback.format_exc().split('\n')
-        # Get last few lines of traceback for context
-        relevant_tb = '\n'.join([line for line in tb_lines[-6:-1] if line.strip()])
-        raise RuntimeError(f"Error processing {seq_id}\n{error_msg}\nTraceback:\n{relevant_tb}")
 
 def get_file_size_gb(file_path):
     """Get file size in GB"""
     return os.path.getsize(file_path) / (1024 ** 3)
+
 
 def split_genome_evenly(fasta_file, num_parts, output_dir):
     """Split genome into equal parts while maintaining sequence integrity"""
     sequences = list(SeqIO.parse(fasta_file, "fasta"))
     total_length = sum(len(seq.seq) for seq in sequences)
     target_length_per_part = total_length / num_parts
-    
+
     parts = []
     current_part = []
     current_length = 0
-    
+
     for seq in sequences:
         seq_len = len(seq.seq)
-        
+
         # If adding this sequence would exceed target by more than current shortage, start new part
         if current_part and current_length > 0:
             excess_if_added = (current_length + seq_len) - target_length_per_part
             current_shortage = target_length_per_part - current_length
-            
+
             if excess_if_added > current_shortage:
                 parts.append(current_part)
                 current_part = [seq]
@@ -363,11 +43,11 @@ def split_genome_evenly(fasta_file, num_parts, output_dir):
         else:
             current_part.append(seq)
             current_length += seq_len
-    
+
     # Add the last part
     if current_part:
         parts.append(current_part)
-    
+
     # Write parts to files
     part_files = []
     for i, part in enumerate(parts):
@@ -376,64 +56,59 @@ def split_genome_evenly(fasta_file, num_parts, output_dir):
             SeqIO.write(part, f, "fasta")
         part_files.append(part_file)
         print(f"Part {i+1}: {len(part)} sequences, {sum(len(seq.seq) for seq in part):,} bp -> {part_file}")
-    
+
     return part_files
+
 
 def sample_genome_chunks(fasta_file, num_chunks, target_size_gb, output_dir):
     """Sample genome into chunks of approximately target_size_gb each"""
     sequences = list(SeqIO.parse(fasta_file, "fasta"))
-    total_length = sum(len(seq.seq) for seq in sequences)
-    target_length_per_chunk = int(target_size_gb * 1024 ** 3 / 4)  # Assuming 4 bytes per base (rough estimate)
-    
+    target_length_per_chunk = int(target_size_gb * 1024 ** 3 / 4)
+
     chunks = []
     used_sequences = set()
-    
+
     for chunk_idx in range(num_chunks):
         chunk = []
         chunk_length = 0
-        
-        # Randomly sample sequences until we reach target size
+
         while chunk_length < target_length_per_chunk:
-            available_seqs = [i for i, seq in enumerate(sequences) 
-                            if i not in used_sequences and len(seq.seq) > 1000]
-            
+            available_seqs = [i for i, seq in enumerate(sequences)
+                              if i not in used_sequences and len(seq.seq) > 1000]
+
             if not available_seqs:
                 break
-                
-            # Select sequence that gets us closest to target without excessive overshoot
+
             best_seq_idx = None
             best_score = float('inf')
-            
+
             for seq_idx in available_seqs:
                 seq = sequences[seq_idx]
                 new_length = chunk_length + len(seq.seq)
-                
+
                 if new_length <= target_length_per_chunk:
-                    # Prefer sequences that get us closer to target
                     score = target_length_per_chunk - new_length
                 else:
-                    # Penalize overshoot but still consider if we're far from target
                     overshoot = new_length - target_length_per_chunk
                     current_shortage = target_length_per_chunk - chunk_length
                     if overshoot <= current_shortage:
                         score = overshoot
                     else:
-                        continue  # Too much overshoot
-                
+                        continue
                 if score < best_score:
                     best_score = score
                     best_seq_idx = seq_idx
-            
+
             if best_seq_idx is not None:
                 chunk.append(sequences[best_seq_idx])
                 chunk_length += len(sequences[best_seq_idx].seq)
                 used_sequences.add(best_seq_idx)
             else:
                 break
-        
+
         if chunk:
             chunks.append(chunk)
-    
+
     # Write chunks to files
     chunk_files = []
     for i, chunk in enumerate(chunks):
@@ -442,43 +117,47 @@ def sample_genome_chunks(fasta_file, num_chunks, target_size_gb, output_dir):
             SeqIO.write(chunk, f, "fasta")
         chunk_files.append(chunk_file)
         chunk_size_gb = sum(len(seq.seq) for seq in chunk) * 4 / (1024 ** 3)
-        print(f"Sample {i+1}: {len(chunk)} sequences, {sum(len(seq.seq) for seq in chunk):,} bp (~{chunk_size_gb:.1f}GB) -> {chunk_file}")
-    
+        print(f"Sample {i+1}: {len(chunk)} sequences, "
+              f"{sum(len(seq.seq) for seq in chunk):,} bp "
+              f"(~{chunk_size_gb:.1f}GB) -> {chunk_file}")
+
     return chunk_files
+
+
+LOOK4LTRS = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    '..', 'submodule', 'Look4LTRs', 'bin', 'look4ltrs')
+
 
 def run_look4ltrs_single(genome_file, threads, output_dir):
     """Run Look4LTRs on a single genome file"""
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Create a dedicated input directory for this Look4LTRs run
-    # Look4LTRs reads all .fa files in the input directory
+
     input_dir = os.path.join(output_dir, "input")
     os.makedirs(input_dir, exist_ok=True)
-    
-    # Copy the genome file to the input directory with a .fa extension
+
     genome_basename = os.path.basename(genome_file)
     if not genome_basename.endswith('.fa'):
         genome_basename = os.path.splitext(genome_basename)[0] + '.fa'
-    
+
     input_genome_path = os.path.join(input_dir, genome_basename)
     shutil.copy2(genome_file, input_genome_path)
-    
-    # Create conda environment command - input is the directory, not the file
+
     look4ltrs_cmd = [
-        "look4ltrs", 
-        "-f", input_dir,  # Input directory, not file
+        LOOK4LTRS,
+        "-f", input_dir,
         "-o", output_dir,
         "-pa", str(threads)
     ]
-    
+
     log_file = os.path.join(output_dir, "ltr.log")
-    
+
     print(f"Running Look4LTRs on {genome_file} (copied to {input_genome_path})")
     print(f"Command: {' '.join(look4ltrs_cmd)}")
-    
+
     try:
         with open(log_file, 'w') as log_f:
-            result = subprocess.run(
+            subprocess.run(
                 look4ltrs_cmd,
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
@@ -490,579 +169,32 @@ def run_look4ltrs_single(genome_file, threads, output_dir):
         print(f"Look4LTRs failed for {genome_file}: {e}")
         return None
 
-def build_ltr_library_with_modules(rtr_dirs, genome_file, threads, output_dir):
-    """Build high-quality LTR library using ltr_modules with checkpoint support"""
-    import glob
-
-    print("Building high-quality LTR library using ltr_modules")
-
-    # Define checkpoint files
-    ckpt_extract = os.path.join(output_dir, "extract.ok")
-    ckpt_cluster = os.path.join(output_dir, "cluster.ok")
-    ckpt_consensus = os.path.join(output_dir, "consensus.ok")
-    ckpt_refine = os.path.join(output_dir, "refine.ok")
-    ckpt_chimera = os.path.join(output_dir, "chimera.ok")
-    ckpt_final = os.path.join(output_dir, "consensi.fa")
-
-    temp_ltr_file = os.path.join(output_dir, "extracted_ltrs.fa")
-    initial_consensus = os.path.join(output_dir, "initial_consensus.fa")
-    refined_file = os.path.join(output_dir, "refined_consensus.fa")
-    chimera_file = os.path.join(output_dir, "chimera_split.fa")
-
-    # Collect .rtr files
-    rtr_files = []
-    for rtr_dir in rtr_dirs:
-        rtr_subdir = os.path.join(rtr_dir, "Rtr")
-        if os.path.exists(rtr_subdir):
-            found_rtr = glob.glob(os.path.join(rtr_subdir, "*.rtr"))
-            rtr_files.extend(found_rtr)
-
-    if not rtr_files:
-        raise Exception("No .rtr files found from Look4LTRs output")
-
-    print(f"Found {len(rtr_files)} .rtr file(s)")
-
-    # Step 1: Extract sequences
-    if not os.path.exists(ckpt_extract):
-        print("[1/5] Extracting LTR sequences...")
-
-        # Convert .rtr to BED format
-        bed_file = os.path.join(output_dir, "ltr_regions.bed")
-        convert_rtr_to_bed(rtr_files, bed_file)
-
-        # Try bedtools first (faster), fallback to seqkit
-        success = extract_sequences_with_bedtools(genome_file, bed_file, temp_ltr_file)
-        if not success:
-            success = extract_sequences_with_seqkit(genome_file, bed_file, temp_ltr_file)
-
-        if not success:
-            raise Exception("Failed to extract sequences (bedtools and seqkit both unavailable)")
-
-        all_sequences = list(SeqIO.parse(temp_ltr_file, "fasta"))
-        if not all_sequences:
-            raise Exception("No sequences extracted from .rtr files")
-
-        open(ckpt_extract, 'w').close()
-        print(f"  Extracted {len(all_sequences)} sequences")
-    else:
-        print("[1/5] Skipping (checkpoint exists)")
-        all_sequences = list(SeqIO.parse(temp_ltr_file, "fasta"))
-
-    # Step 2: Clustering
-    if not os.path.exists(ckpt_cluster):
-        print("[2/5] Clustering sequences...")
-        builder = LTRConsensusBuilder(min_frac_major=0.60, threads=threads)
-        cluster_file = builder.cluster_sequences(
-            temp_ltr_file,
-            os.path.join(output_dir, "clusters"),
-            identity=0.85,
-            coverage=0.80
-        )
-        open(ckpt_cluster, 'w').close()
-        print(f"  Clustering complete")
-    else:
-        print("[2/5] Skipping (checkpoint exists)")
-        builder = LTRConsensusBuilder(min_frac_major=0.60, threads=threads)
-        cluster_file = os.path.join(output_dir, "clusters.clstr")
-
-    # Step 3: Build consensus (PARALLEL)
-    if not os.path.exists(ckpt_consensus):
-        print(f"[3/5] Building consensus sequences...")
-        clusters = builder.parse_clusters(cluster_file)
-
-        # Create dictionary for fast sequence lookup
-        all_sequences_dict = {seq.id: seq for seq in all_sequences}
-
-        print(f"  Using {threads} threads for parallel consensus building...")
-        print(f"  Processing {len(clusters)} clusters...")
-
-        # Prepare arguments for parallel processing
-        consensus_args = [
-            (cluster_idx, member_ids, all_sequences_dict)
-            for cluster_idx, member_ids in enumerate(clusters, 1)
-        ]
-
-        # Parallel processing with progress tracking
-        consensus_results = []
-        completed = 0
-        total = len(consensus_args)
-
-        with ProcessPoolExecutor(max_workers=threads) as executor:
-            futures = {executor.submit(build_single_consensus, arg): i
-                      for i, arg in enumerate(consensus_args)}
-
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    if result is not None:
-                        consensus_results.append(result)
-                    completed += 1
-
-                    # Progress report every 100 clusters or at completion
-                    if completed % 100 == 0 or completed == total:
-                        print(f"    Progress: {completed}/{total} clusters processed ({completed*100//total}%)")
-
-                except Exception as e:
-                    idx = futures[future]
-                    cluster_idx = consensus_args[idx][0]
-                    print(f"    Error building consensus for cluster {cluster_idx}: {e}")
-
-        # Sort by cluster index to maintain order
-        consensus_results.sort(key=lambda x: x[0])
-        consensus_records = [record for _, record in consensus_results]
-
-        SeqIO.write(consensus_records, initial_consensus, "fasta")
-        open(ckpt_consensus, 'w').close()
-        print(f"  Built {len(consensus_records)} consensus sequences")
-    else:
-        print("[3/5] Skipping (checkpoint exists)")
-        consensus_records = list(SeqIO.parse(initial_consensus, "fasta"))
-
-    # Step 4: Refine boundaries
-    if not os.path.exists(ckpt_refine):
-        print("[4/5] Refining boundaries...")
-
-        # OPTIMIZATION: Pre-scan genome once in main process to get sequence names
-        # This avoids each worker process scanning the entire genome file
-        print("  Pre-scanning genome for sequence IDs (optimization)...")
-        genome_seq_names = set()
-        try:
-            for record in SeqIO.parse(genome_file, "fasta"):
-                genome_seq_names.add(record.id)
-            print(f"  Found {len(genome_seq_names)} sequences in genome")
-        except Exception as e:
-            print(f"  Warning: Failed to pre-scan genome: {e}")
-            print(f"  Workers will scan genome individually (slower)")
-            genome_seq_names = None
-
-        # Step 4a: Align consensus to genome (with checkpoint)
-        paf_file = os.path.join(output_dir, "consensus_to_genome.paf")
-
-        # Check if alignment already exists
-        if os.path.exists(paf_file) and os.path.getsize(paf_file) > 0:
-            print(f"  Found existing alignment: {paf_file} (skipping FastGA run)")
-            align_success = True
-        else:
-            print("  Aligning consensus sequences to genome with FastGA...")
-            align_success = align_consensus_to_genome(initial_consensus, genome_file, paf_file, threads=threads)
-
-        if not align_success:
-            print("  Warning: Alignment failed, proceeding without alignments")
-            alignments_by_query = {}
-        else:
-            # Step 4b: Parse alignments
-            print("  Parsing alignment results...")
-            alignments_by_query = parse_paf_alignments(paf_file, min_identity=70, min_coverage=50)
-            print(f"  Found alignments for {len(alignments_by_query)} sequences")
-
-        # Step 4c: Two-stage boundary detection strategy
-        # Stage 1 (Iteration 1): Extend sequence from genome (no boundary detection)
-        # Stage 2 (Iteration 2): Detect boundaries using depth profile + structural features
-
-        print("  === Stage 1: Extracting extended sequences from genome ===")
-
-        # Fixed extension amount for initial extraction
-        initial_extension = 500  # ±500bp for boundary detection
-
-        # Prepare BED file for batch extraction with bedtools
-        bed_file = os.path.join(output_dir, "extension_regions.bed")
-        bed_records = []
-        seq_id_to_coords = {}
-
-        # Safety limits to prevent memory issues
-        max_extraction_length = 50000  # Max 50kb per extraction
-        skipped_oversized = 0
-
-        for seq_record in consensus_records:
-            seq_alignments = alignments_by_query.get(seq_record.id, [])
-
-            if not seq_alignments:
-                continue
-
-            # Find best alignment (highest identity × coverage)
-            best_aln = max(seq_alignments, key=lambda a: a['identity'] * a['coverage'])
-
-            # Calculate extended region coordinates
-            target_name = best_aln['target_name']
-            genome_start = best_aln['target_start']
-            genome_end = best_aln['target_end']
-
-            extended_start = max(0, genome_start - initial_extension)
-            extended_end = genome_end + initial_extension
-
-            # Validate extraction size to prevent memory issues
-            extraction_size = extended_end - extended_start
-            if extraction_size > max_extraction_length:
-                print(f"  Warning: Skipping {seq_record.id} - extraction region too large ({extraction_size:,}bp)")
-                skipped_oversized += 1
-                continue
-
-            # Store BED record (0-based, half-open)
-            bed_records.append(f"{target_name}\t{extended_start}\t{extended_end}\t{seq_record.id}\n")
-
-            # Store coordinates for later use
-            seq_id_to_coords[seq_record.id] = {
-                'target_name': target_name,
-                'start': extended_start,
-                'end': extended_end
-            }
-
-        if skipped_oversized > 0:
-            print(f"  Skipped {skipped_oversized} sequences due to oversized extraction regions")
-
-        # Write BED file
-        with open(bed_file, 'w') as f:
-            f.writelines(bed_records)
-
-        print(f"  Generated BED file with {len(bed_records)} regions")
-
-        # Extract sequences using bedtools getfasta
-        extended_fasta = os.path.join(output_dir, "extended_from_genome.fa")
-        bedtools_cmd = [
-            "bedtools", "getfasta",
-            "-fi", genome_file,
-            "-bed", bed_file,
-            "-fo", extended_fasta,
-            "-name"  # Use 4th column (seq_id) as sequence name
-        ]
-
-        print("  Extracting sequences with bedtools getfasta...")
-        try:
-            subprocess.run(bedtools_cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            print(f"  Error running bedtools: {e.stderr.decode()}")
-            raise
-
-        # Parse extracted sequences with memory-efficient validation
-        extended_records_with_coords = []
-        extracted_seqs = {}
-
-        # Memory-efficient parsing with sequence length validation
-        print("  Loading extracted sequences with validation...")
-        skipped_count = 0
-        max_reasonable_length = 50000  # Max 50kb for LTR elements (reasonable limit)
-
-        try:
-            for rec in SeqIO.parse(extended_fasta, "fasta"):
-                seq_len = len(rec.seq)
-
-                # Validate sequence length
-                if seq_len > max_reasonable_length:
-                    print(f"  Warning: Skipping {rec.id} - sequence too long ({seq_len:,}bp > {max_reasonable_length:,}bp)")
-                    skipped_count += 1
-                    continue
-
-                if seq_len < 100:
-                    print(f"  Warning: Skipping {rec.id} - sequence too short ({seq_len}bp)")
-                    skipped_count += 1
-                    continue
-
-                extracted_seqs[rec.id] = rec
-
-        except MemoryError as e:
-            print(f"  ERROR: MemoryError while parsing sequences")
-            print(f"  This usually means one sequence is extremely long or the FASTA file is malformed")
-            print(f"  Loaded {len(extracted_seqs)} sequences successfully before error")
-            # Continue with what we have
-        except Exception as e:
-            print(f"  Warning: Error parsing some sequences: {e}")
-            print(f"  Continuing with {len(extracted_seqs)} successfully loaded sequences")
-
-        print(f"  Extracted {len(extracted_seqs)} sequences from genome")
-        if skipped_count > 0:
-            print(f"  Skipped {skipped_count} sequences (length validation failed)")
-
-        for seq_record in consensus_records:
-            if seq_record.id in extracted_seqs:
-                extended_record = extracted_seqs[seq_record.id]
-                coords = seq_id_to_coords[seq_record.id]
-
-                # Update description
-                extended_record.description = (
-                    f"Extended from {coords['target_name']}:{coords['start']}-{coords['end']} "
-                    f"(±{initial_extension}bp)"
-                )
-
-                extended_records_with_coords.append({
-                    'record': extended_record,
-                    'genome_coords': coords
-                })
-            else:
-                # No alignment or extraction failed, keep original
-                extended_records_with_coords.append({
-                    'record': seq_record,
-                    'genome_coords': None
-                })
-
-        print(f"  Prepared {len(extended_records_with_coords)} extended sequences")
-
-        # Write extended sequences and align to genome
-        print("\n  === Stage 1 Complete: Re-aligning extended sequences to genome ===")
-        extended_consensus_file = os.path.join(output_dir, "extended_consensus.fa")
-        extended_records = [item['record'] for item in extended_records_with_coords]
-        SeqIO.write(extended_records, extended_consensus_file, "fasta")
-
-        extended_paf_file = os.path.join(output_dir, "extended_to_genome.paf")
-
-        # Check if alignment already exists
-        if os.path.exists(extended_paf_file) and os.path.getsize(extended_paf_file) > 0:
-            print(f"  Found existing extended alignment: {extended_paf_file} (skipping FastGA run)")
-            align_success = True
-        else:
-            print("  Running FastGA alignment for extended sequences...")
-            align_success = align_consensus_to_genome(extended_consensus_file, genome_file, extended_paf_file, threads=threads)
-
-        if not align_success:
-            print("  Warning: Re-alignment failed, using original sequences")
-            refined_records = extended_records
-        else:
-            extended_alignments_by_query = parse_paf_alignments(extended_paf_file, min_identity=70, min_coverage=50)
-            print(f"  Found alignments for {len(extended_alignments_by_query)} extended sequences")
-
-            # === Stage 2: Boundary detection using depth + structure ===
-            print("\n  === Stage 2: Detecting boundaries using depth profile + LTR structure ===")
-
-            # Check for existing progress (resume capability)
-            progress_file = os.path.join(output_dir, "refine_progress.txt")
-            completed_seq_ids = set()
-
-            if os.path.exists(progress_file):
-                with open(progress_file, 'r') as f:
-                    completed_seq_ids = set(line.strip() for line in f if line.strip())
-                print(f"  Found existing progress: {len(completed_seq_ids)} sequences already refined")
-
-            # Filter out already completed sequences
-            pending_items = []
-            skipped_items = []
-            for item in extended_records_with_coords:
-                seq_id = item['record'].id
-                if seq_id in completed_seq_ids:
-                    skipped_items.append(item)
-                else:
-                    pending_items.append(item)
-
-            if skipped_items:
-                print(f"  Skipping {len(skipped_items)} already refined sequences")
-                print(f"  Processing {len(pending_items)} remaining sequences")
-            else:
-                print(f"  Processing all {len(pending_items)} sequences")
-
-            print(f"  Using {threads} threads for parallel processing...")
-
-            # Load already refined sequences
-            refined_records = []
-            if os.path.exists(refined_file):
-                try:
-                    refined_records = list(SeqIO.parse(refined_file, "fasta"))
-                    print(f"  Loaded {len(refined_records)} previously refined sequences")
-                except:
-                    refined_records = []
-
-            # Prepare arguments for parallel processing
-            # Pass genome_seq_names to avoid each worker scanning the genome
-            refine_args = [
-                (item, extended_alignments_by_query, genome_file, genome_seq_names)
-                for item in pending_items
-            ]
-
-            # Parallel processing with progress tracking and incremental saving
-            completed = 0
-            total = len(refine_args)
-
-            if total > 0:
-                with ProcessPoolExecutor(max_workers=threads) as executor:
-                    futures = {executor.submit(refine_single_boundary, arg): i
-                              for i, arg in enumerate(refine_args)}
-
-                    # Open files for incremental writing
-                    with open(refined_file, 'a') as refined_fa, \
-                         open(progress_file, 'a') as progress_f:
-
-                        for future in as_completed(futures):
-                            try:
-                                refined_record = future.result()
-
-                                # Immediately save to file (incremental)
-                                SeqIO.write([refined_record], refined_fa, "fasta")
-                                refined_fa.flush()  # Force write to disk
-
-                                # Record progress
-                                progress_f.write(f"{refined_record.id}\n")
-                                progress_f.flush()  # Force write to disk
-
-                                refined_records.append(refined_record)
-                                completed += 1
-
-                                # Progress report every 100 sequences
-                                if completed % 100 == 0 or completed == total:
-                                    total_done = len(completed_seq_ids) + completed
-                                    total_all = len(extended_records_with_coords)
-                                    print(f"    Progress: {completed}/{total} (total: {total_done}/{total_all}, {total_done*100//total_all}%)")
-
-                            except Exception as e:
-                                idx = futures[future]
-                                seq_id = refine_args[idx][0]['record'].id
-                                print(f"    Error refining {seq_id}: {e}")
-
-                                # Keep original sequence on error
-                                original_record = refine_args[idx][0]['record']
-
-                                # Save error case too
-                                SeqIO.write([original_record], refined_fa, "fasta")
-                                refined_fa.flush()
-
-                                progress_f.write(f"{original_record.id}\n")
-                                progress_f.flush()
-
-                                refined_records.append(original_record)
-                                completed += 1
-
-                print(f"  ✓ Completed refining {completed} new sequences")
-            else:
-                print(f"  ✓ All sequences already refined, skipping")
-
-        print(f"  Refined {len(refined_records)} sequences")
-
-        SeqIO.write(refined_records, refined_file, "fasta")
-        open(ckpt_refine, 'w').close()
-        print(f"  Refined {len(refined_records)} sequences")
-    else:
-        print("[4/5] Skipping (checkpoint exists)")
-        refined_records = list(SeqIO.parse(refined_file, "fasta"))
-
-    # Step 5: Detect chimeras
-    if not os.path.exists(ckpt_chimera):
-        print("[5/5] Detecting chimeras...")
-        temp_refined = os.path.join(output_dir, "refined_temp.fa")
-        SeqIO.write(refined_records, temp_refined, "fasta")
-
-        detector = LTRChimeraDetector(
-            chimera_threshold=0.3,
-            min_segment_length=500,
-            orientation_aware=True
-        )
-        chimera_result = detector.detect_chimeras(temp_refined, {})
-        split_records = chimera_result['split_records']
-
-        SeqIO.write(split_records, chimera_file, "fasta")
-        open(ckpt_chimera, 'w').close()
-        print(f"  Detected {chimera_result['num_chimeras']} chimeras, {len(split_records)} sequences after split")
-    else:
-        print("[5/5] Skipping (checkpoint exists)")
-        split_records = list(SeqIO.parse(chimera_file, "fasta"))
-
-    # Step 6: Quality control with dual filtering strategy
-    if not os.path.exists(ckpt_final):
-        print("[6/6] Quality control with dual filtering strategy...")
-        validator = LTRQualityValidator()
-        high_quality_records = []
-        quality_pass_count = 0
-        copy_pass_count = 0
-        both_pass_count = 0
-
-        for seq_record in split_records:
-            quality = validator.comprehensive_quality_validation(str(seq_record.seq))
-
-            # Extract copy number from description
-            # Format: "Cluster_X with Y members" or similar
-            copy_number = 0
-            desc = seq_record.description
-            if "members" in desc:
-                try:
-                    # Extract number before "members"
-                    parts = desc.split()
-                    for i, part in enumerate(parts):
-                        if part == "members" and i > 0:
-                            copy_number = int(parts[i-1])
-                            break
-                except (ValueError, IndexError):
-                    copy_number = 0
-
-            # Dual filtering strategy:
-            # 1. Keep sequences that meet quality requirements
-            quality_pass = quality['valid'] and quality['score'] >= 60
-            # 2. Keep sequences with copy number >= 5
-            copy_pass = copy_number >= 5
-
-            if quality_pass or copy_pass:
-                high_quality_records.append(seq_record)
-                if quality_pass and copy_pass:
-                    both_pass_count += 1
-                elif quality_pass:
-                    quality_pass_count += 1
-                else:
-                    copy_pass_count += 1
-
-        SeqIO.write(high_quality_records, ckpt_final, "fasta")
-        print(f"  Filtering results:")
-        print(f"    - Quality pass only: {quality_pass_count}")
-        print(f"    - Copy number pass only (>=5): {copy_pass_count}")
-        print(f"    - Both pass: {both_pass_count}")
-        print(f"    - Total retained: {len(high_quality_records)} sequences")
-    else:
-        print("[6/6] Using existing final consensus")
-
-    return ckpt_final
-
-
-def convert_rtr_to_bed(rtr_files, bed_file):
-    """Convert .rtr files to BED format for efficient sequence extraction"""
-    with open(bed_file, 'w') as bed_out:
-        for rtr_file in rtr_files:
-            with open(rtr_file, 'r') as f:
-                reader = csv.DictReader(f, delimiter='\t')
-                for row in reader:
-                    try:
-                        chrom = row.get('chrom') or row.get('Chr') or row.get('seqid')
-                        left_start = int(row.get('LeftStart', 0))
-                        left_end = int(row.get('LeftEnd', 0))
-                        right_start = int(row.get('RightStart', 0))
-                        right_end = int(row.get('RightEnd', 0))
-                        ltr_id = row.get('ID', f"{chrom}_{left_start}_{right_end}")
-
-                        if left_start and left_end:
-                            bed_out.write(f"{chrom}\t{left_start}\t{left_end}\t{ltr_id}_L\t.\t+\n")
-                        if right_start and right_end:
-                            bed_out.write(f"{chrom}\t{right_start}\t{right_end}\t{ltr_id}_R\t.\t+\n")
-                    except (ValueError, KeyError):
-                        continue
-
-def extract_sequences_with_bedtools(genome_file, bed_file, output_fasta):
-    """Extract sequences using bedtools getfasta"""
-    cmd = ["bedtools", "getfasta", "-fi", genome_file, "-bed", bed_file, "-fo", output_fasta, "-name"]
-    try:
-        subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
-        return True
-    except subprocess.CalledProcessError:
-        return False
-
-def extract_sequences_with_seqkit(genome_file, bed_file, output_fasta):
-    """Extract sequences using seqkit subseq (alternative to bedtools)"""
-    cmd = ["seqkit", "subseq", "--bed", bed_file, genome_file, "-o", output_fasta]
-    try:
-        subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
-        return True
-    except subprocess.CalledProcessError:
-        return False
-
 
 def main():
-    parser = argparse.ArgumentParser(description="Enhanced LTR detection with genome size-based processing")
+    parser = argparse.ArgumentParser(
+        description="LTR detection with genome size-based processing")
     parser.add_argument("fasta_file", help="Input genome FASTA file")
     parser.add_argument("threads", type=int, help="Number of threads")
     parser.add_argument("output_dir", help="Output directory")
-    
+
     args = parser.parse_args()
-    
+
     fasta_file = os.path.abspath(args.fasta_file)
     threads = args.threads
     output_dir = os.path.abspath(args.output_dir)
-    
-    # Validate inputs
+
     if not os.path.exists(fasta_file):
         print(f"Error: Genome file {fasta_file} not found")
         sys.exit(1)
-    
+
+    if threads < 1:
+        print(f"Error: threads must be >= 1 (got {threads})")
+        sys.exit(1)
+
+    cpu_count = mp.cpu_count()
+    if threads > cpu_count:
+        print(f"Warning: threads ({threads}) exceeds CPU count ({cpu_count})")
+
     os.makedirs(output_dir, exist_ok=True)
     os.chdir(output_dir)
 
@@ -1075,25 +207,19 @@ def main():
     # Check if look4ltrs checkpoint exists
     if os.path.exists(l4s_checkpoint):
         print("Found l4s.ok checkpoint, skipping Look4LTRs execution")
-        result_dirs = []
-        # Check for part_* or sample_* subdirectories
-        for item in os.listdir(look4ltrs_dir):
-            item_path = os.path.join(look4ltrs_dir, item)
-            if os.path.isdir(item_path) and (item.startswith('part_') or item.startswith('sample_')):
-                result_dirs.append(item_path)
-        # If no subdirectories, use look4ltrs_dir itself
-        if not result_dirs:
-            result_dirs = [look4ltrs_dir]
         has_checkpoint = True
     else:
         print("No l4s.ok checkpoint found, running Look4LTRs")
         has_checkpoint = False
 
-        # Get genome size
+        # Clean Look4LTRs directory to avoid conflicts with stale output
+        if os.path.exists(look4ltrs_dir):
+            shutil.rmtree(look4ltrs_dir)
+            os.makedirs(look4ltrs_dir)
+
         genome_size_gb = get_file_size_gb(fasta_file)
         print(f"Genome size: {genome_size_gb:.2f} GB")
 
-        # Determine processing strategy based on genome size
         temp_dir = os.path.join(output_dir, "temp_parts")
         os.makedirs(temp_dir, exist_ok=True)
 
@@ -1104,74 +230,17 @@ def main():
         elif genome_size_gb <= 10:
             print("Splitting genome into 2 parts")
             part_files = split_genome_evenly(fasta_file, 2, temp_dir)
-            num_parts = len(part_files)
-            print(f"Actually generated {num_parts} parts")
-
-            result_dirs = []
-            threads_per_part = max(1, threads // num_parts)
-            with ProcessPoolExecutor(max_workers=num_parts) as executor:
-                futures = {}
-                for i, part_file in enumerate(part_files):
-                    part_output_dir = os.path.join(look4ltrs_dir, f"part_{i+1}")
-                    future = executor.submit(run_look4ltrs_single, part_file, threads_per_part, part_output_dir)
-                    futures[future] = part_output_dir
-
-                for future in as_completed(futures):
-                    result_dir = futures[future]
-                    try:
-                        result = future.result()
-                        if result:
-                            result_dirs.append(result)
-                    except Exception as e:
-                        print(f"Error processing part: {e}")
+            result_dirs = _run_parts_parallel(part_files, threads, look4ltrs_dir)
 
         elif genome_size_gb <= 15:
             print("Splitting genome into 3 parts")
             part_files = split_genome_evenly(fasta_file, 3, temp_dir)
-            num_parts = len(part_files)
-            print(f"Actually generated {num_parts} parts")
-
-            result_dirs = []
-            threads_per_part = max(1, threads // num_parts)
-            with ProcessPoolExecutor(max_workers=num_parts) as executor:
-                futures = {}
-                for i, part_file in enumerate(part_files):
-                    part_output_dir = os.path.join(look4ltrs_dir, f"part_{i+1}")
-                    future = executor.submit(run_look4ltrs_single, part_file, threads_per_part, part_output_dir)
-                    futures[future] = part_output_dir
-
-                for future in as_completed(futures):
-                    result_dir = futures[future]
-                    try:
-                        result = future.result()
-                        if result:
-                            result_dirs.append(result)
-                    except Exception as e:
-                        print(f"Error processing part: {e}")
+            result_dirs = _run_parts_parallel(part_files, threads, look4ltrs_dir)
 
         elif genome_size_gb <= 20:
             print("Splitting genome into 4 parts")
             part_files = split_genome_evenly(fasta_file, 4, temp_dir)
-            num_parts = len(part_files)
-            print(f"Actually generated {num_parts} parts")
-
-            result_dirs = []
-            threads_per_part = max(1, threads // num_parts)
-            with ProcessPoolExecutor(max_workers=num_parts) as executor:
-                futures = {}
-                for i, part_file in enumerate(part_files):
-                    part_output_dir = os.path.join(look4ltrs_dir, f"part_{i+1}")
-                    future = executor.submit(run_look4ltrs_single, part_file, threads_per_part, part_output_dir)
-                    futures[future] = part_output_dir
-
-                for future in as_completed(futures):
-                    result_dir = futures[future]
-                    try:
-                        result = future.result()
-                        if result:
-                            result_dirs.append(result)
-                    except Exception as e:
-                        print(f"Error processing part: {e}")
+            result_dirs = _run_parts_parallel(part_files, threads, look4ltrs_dir)
 
         else:
             print("Sampling 4 chunks of ~5GB each")
@@ -1185,11 +254,12 @@ def main():
                 futures = {}
                 for i, chunk_file in enumerate(chunk_files):
                     chunk_output_dir = os.path.join(look4ltrs_dir, f"sample_{i+1}")
-                    future = executor.submit(run_look4ltrs_single, chunk_file, threads_per_chunk, chunk_output_dir)
+                    future = executor.submit(
+                        run_look4ltrs_single, chunk_file,
+                        threads_per_chunk, chunk_output_dir)
                     futures[future] = chunk_output_dir
 
                 for future in as_completed(futures):
-                    result_dir = futures[future]
                     try:
                         result = future.result()
                         if result:
@@ -1197,11 +267,11 @@ def main():
                     except Exception as e:
                         print(f"Error processing sample: {e}")
 
-        # Clean up temp_dir after Look4LTRs completes
+        # Clean up temp_dir
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
-    # Only filter and check result_dirs if we ran Look4LTRs
+    # Validate results
     if not has_checkpoint:
         result_dirs = [d for d in result_dirs if d is not None]
 
@@ -1211,7 +281,7 @@ def main():
 
         print(f"Successfully completed {len(result_dirs)} Look4LTRs runs\n")
 
-        # Create l4s.ok checkpoint after successful Look4LTRs execution
+        # Create l4s.ok checkpoint
         with open(l4s_checkpoint, 'w') as f:
             f.write(f"Look4LTRs completed successfully\n")
             f.write(f"Result directories: {len(result_dirs)}\n")
@@ -1219,34 +289,36 @@ def main():
                 f.write(f"  - {d}\n")
         print(f"Created checkpoint: {l4s_checkpoint}")
 
-    try:
-        final_consensus = build_ltr_library_with_modules(
-            rtr_dirs=result_dirs,
-            genome_file=fasta_file,
-            threads=threads,
-            output_dir=look4ltrs_dir
-        )
-    except Exception as e:
-        print(f"Error in LTR library building: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-
-    if not os.path.exists(final_consensus):
-        print(f"Error: Final consensus file not found: {final_consensus}")
-        sys.exit(1)
-
-    try:
-        result = subprocess.run(
-            ["grep", "-c", "^>", final_consensus],
-            capture_output=True, text=True
-        )
-        final_count = int(result.stdout.strip())
-        print(f"\nLTR library complete: {final_count} sequences -> {final_consensus}")
-    except:
-        pass
-
+    # Consensus library building is handled by Pan_TE via build_ltr_library.py
     print("LTR detection completed successfully")
+
+
+def _run_parts_parallel(part_files, threads, look4ltrs_dir):
+    """Run Look4LTRs on multiple genome parts in parallel."""
+    num_parts = len(part_files)
+    print(f"Actually generated {num_parts} parts")
+
+    result_dirs = []
+    threads_per_part = max(1, threads // num_parts)
+    with ProcessPoolExecutor(max_workers=num_parts) as executor:
+        futures = {}
+        for i, part_file in enumerate(part_files):
+            part_output_dir = os.path.join(look4ltrs_dir, f"part_{i+1}")
+            future = executor.submit(
+                run_look4ltrs_single, part_file,
+                threads_per_part, part_output_dir)
+            futures[future] = part_output_dir
+
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result:
+                    result_dirs.append(result)
+            except Exception as e:
+                print(f"Error processing part: {e}")
+
+    return result_dirs
+
 
 if __name__ == "__main__":
     main()

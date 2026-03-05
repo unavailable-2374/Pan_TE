@@ -7,6 +7,7 @@ use lib "$Bin/../lib";
 use File::Path qw(make_path);
 use Cwd qw(getcwd abs_path);
 use Time::HiRes qw(time);
+use Parallel::ForkManager;
 
 # Import modular components
 use RECON::Config;
@@ -47,9 +48,6 @@ sub main {
     
     # Check required tools
     check_required_tools();
-    
-    # Create working directory structure
-    setup_working_directory($config);
     
     log_step_end("PIPELINE INITIALIZATION", 1, "Ready to start RECON processing");
     
@@ -102,54 +100,151 @@ sub main {
 
 sub run_single_track_pipeline {
     my ($config) = @_;
-    
-    log_step_start("SINGLE TRACK MODE", "Small genome - masked track processing");
-    
-    log_message("INFO", "Genome mode", "Single-track (small genome with masked track processing)");
+
+    log_step_start("SINGLE TRACK MODE", "Small genome - in-situ masked track");
+
+    log_message("INFO", "Genome mode", "Single-track (pre-mask with mdl-repeat + masked track)");
     log_message("INFO", "Input file", "genome=$config->{genome_file}");
-    
-    # Use masked track processing for small genomes to get high-quality consensus
-    # This extracts unmasked regions and uses gi|N naming format
-    my $success = run_masked_track_independent(
-        $config->{genome_file},
-        getcwd(),
-        $config->{threads},
-        $config->{cpu_threads},
-        $config->{genome_size}
-    );
-    
-    log_step_end("SINGLE TRACK MODE", $success, 
-                 $success ? "Single track (masked track) completed" : "Single track (masked track) failed");
-    
+
+    # Step 1: Find mdl-repeat/RepeatScout consensus for pre-masking
+    my $rs_consensus = find_repeatscout_consensus(getcwd());
+
+    # Step 2: Soft-mask genome with mdl-repeat consensus (with checkpoint)
+    my $softmasked_output = "genome_softmasked.fa";
+    my $masked_genome = $config->{genome_file};  # default: use input as-is
+
+    if (-f "premask.ok" && -s $softmasked_output) {
+        log_message("INFO", "Pre-masking already completed", "checkpoint found: premask.ok");
+        $masked_genome = abs_path($softmasked_output);
+    } elsif ($rs_consensus && -s $rs_consensus) {
+        log_message("INFO", "Soft-masking genome with mdl-repeat consensus",
+                    "library=$rs_consensus, mode=soft (-xsmall)");
+        my $temp_input = "genome_premasked.fa";
+        run_cmd("cp $config->{genome_file} $temp_input");
+        my $mask_ok = run_repeatmasker($temp_input, $rs_consensus, $softmasked_output,
+                                        int($config->{threads} / 2) || 1, 1);  # soft_mask=1
+        if ($mask_ok && -s $softmasked_output) {
+            $masked_genome = abs_path($softmasked_output);
+
+            open(my $fh, '>', "premask.ok") or die "Cannot create premask checkpoint: $!\n";
+            print $fh "Pre-masking completed at " . localtime() . "\n";
+            print $fh "Consensus: $rs_consensus\n";
+            print $fh "Output: $softmasked_output\n";
+            print $fh "Size: " . (-s $softmasked_output) . " bytes\n";
+            close $fh;
+
+            log_message("INFO", "Soft-masking completed",
+                        "output=$softmasked_output, size=" . format_size(-s $softmasked_output));
+        } else {
+            log_message("WARN", "Soft-masking failed, using original genome");
+            $masked_genome = $config->{genome_file};
+        }
+    } else {
+        log_message("INFO", "No mdl-repeat consensus found, using original genome");
+    }
+
+    # Step 3: Run masked track (extract unmasked → self-align → RECON → consensus)
+    # masking_type='soft': extraction detects by case, preserves lowercase for rmblastn
+    make_path("masked_track");
+
+    my $success = 0;
+    eval {
+        $success = run_masked_track_independent(
+            $masked_genome,
+            "masked_track",
+            $config->{threads},
+            $config->{cpu_threads},
+            $config->{genome_size},
+            $config->{original_genome_file},
+            'soft'  # soft masking mode
+        );
+    };
+
+    if ($@) {
+        log_message("ERROR", "Masked track failed", "error=$@");
+        $success = 0;
+    }
+
+    # Copy results to top-level consensi.fa for combine step
+    if ($success && -f "masked_track/consensi.fa" && -s "masked_track/consensi.fa") {
+        run_cmd("cp masked_track/consensi.fa consensi.fa");
+        my $count = `grep -c '^>' consensi.fa 2>/dev/null || echo 0`;
+        chomp $count;
+        log_message("INFO", "Copied masked track results",
+                    "sequences=$count, output=consensi.fa");
+    } elsif ($success) {
+        # Masked track returned success but no consensi (no repeats found)
+        open(my $fh, '>', 'consensi.fa'); close($fh);
+        log_message("WARN", "Masked track completed but no consensus sequences generated");
+    } else {
+        open(my $fh, '>', 'consensi.fa'); close($fh);
+        log_message("WARN", "Masked track failed, no consensus sequences");
+    }
+
+    log_step_end("SINGLE TRACK MODE", $success,
+                 $success ? "Single track (in-situ masked) completed" : "Single track (in-situ masked) failed");
+
     return $success;
 }
 
 sub run_dual_track_pipeline {
     my ($config) = @_;
-    
-    log_step_start("DUAL TRACK MODE", "Large genome - independent dual-track processing");
-    
-    log_message("INFO", "Genome mode", "Dual-track (large genome)");
-    log_message("INFO", "Input files", 
+
+    log_step_start("DUAL TRACK MODE", "Large genome - parallel dual-track processing");
+
+    log_message("INFO", "Genome mode", "Dual-track (large genome, parallel execution)");
+    log_message("INFO", "Input files",
                 "masked_genome=$config->{genome_file}, original=$config->{genome_file}");
-    
+
     if (@{$config->{bed_files}}) {
-        log_message("INFO", "BED exclusion files", 
-                    scalar(@{$config->{bed_files}}) . " files: " . 
+        log_message("INFO", "BED exclusion files",
+                    scalar(@{$config->{bed_files}}) . " files: " .
                     join(", ", @{$config->{bed_files}}));
     }
-    
-    # Track 1: Masked genome processing
-    my $masked_success = run_track_1($config);
-    
-    # Track 2: Sampling with progressive masking
-    my $sampling_success = run_track_2($config);
-    
+
+    # Create directories before forking
+    make_path("masked_track");
+    make_path("sampling_track");
+
+    my $pm = Parallel::ForkManager->new(2);
+    my %track_success;
+
+    $pm->run_on_finish(sub {
+        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_ref) = @_;
+        $track_success{$ident} = (defined $data_ref) ? $$data_ref : 0;
+    });
+
+    for my $track_name ("track1", "track2") {
+        $pm->start($track_name) and next;
+
+        # Child: halve threads for parallel execution
+        my $child_config = { %$config };
+        $child_config->{threads} = int($config->{threads} / 2) || 1;
+        $child_config->{cpu_threads} = int($config->{cpu_threads} / 2) || 1;
+
+        my $success = 0;
+        eval {
+            if ($track_name eq "track1") {
+                $success = run_track_1($child_config);
+            } else {
+                $success = run_track_2($child_config);
+            }
+        };
+        if ($@) {
+            log_message("ERROR", "$track_name failed in child process", "error=$@");
+        }
+        $pm->finish(0, \$success);
+    }
+
+    $pm->wait_all_children;
+
+    my $masked_success = $track_success{track1} || 0;
+    my $sampling_success = $track_success{track2} || 0;
     my $overall_success = $masked_success || $sampling_success;
-    
+
     my $status_msg = "";
     if ($masked_success && $sampling_success) {
-        $status_msg = "Both tracks completed successfully";
+        $status_msg = "Both tracks completed successfully (parallel)";
     } elsif ($masked_success) {
         $status_msg = "Masked track completed, sampling track failed";
     } elsif ($sampling_success) {
@@ -157,9 +252,9 @@ sub run_dual_track_pipeline {
     } else {
         $status_msg = "Both tracks failed";
     }
-    
+
     log_step_end("DUAL TRACK MODE", $overall_success, $status_msg);
-    
+
     return $overall_success;
 }
 
@@ -177,10 +272,11 @@ sub run_track_1 {
             "masked_track",
             $config->{threads},
             $config->{cpu_threads},
-            $config->{genome_size}
+            $config->{genome_size},
+            $config->{original_genome_file}
         );
     };
-    
+
     if ($@) {
         log_message("ERROR", "Masked track failed", "error=$@");
         $success = 0;
@@ -233,7 +329,8 @@ sub run_track_2 {
             "sampling_track",
             $config->{threads},
             $config->{cpu_threads},
-            $config->{original_genome_size} || $config->{genome_size}
+            $config->{original_genome_size} || $config->{genome_size},
+            $config->{original_genome_file}
         );
         $success = 1;
     };
@@ -276,22 +373,15 @@ sub generate_final_report {
 
 sub generate_single_track_report {
     my ($config) = @_;
-    
-    log_message("INFO", "Pipeline mode", "Single-track (small genome with masked track processing)");
-    
+
+    log_message("INFO", "Pipeline mode", "Single-track (in-situ masked track)");
+
     if (-s "consensi.fa") {
         my $count = `grep -c '^>' consensi.fa`;
         chomp $count;
         my $size = -s "consensi.fa";
         log_message("INFO", "Final results", "sequences=$count, file_size=${size} bytes");
-        print "Generated $count consensus sequences (using masked track processing)\n";
-        
-        # Report unmasked region extraction statistics if available
-        if (-f "unmasked_extraction.ok") {
-            my $extraction_info = `tail -2 unmasked_extraction.ok | head -1`;
-            chomp $extraction_info;
-            log_message("INFO", "Unmasked region extraction", $extraction_info);
-        }
+        print "Generated $count consensus sequences (using in-situ masked track)\n";
     } else {
         log_message("WARN", "No consensus sequences generated", "consensi.fa missing or empty");
         print "Warning: No consensus sequences generated\n";
@@ -365,8 +455,8 @@ sub create_completion_marker {
     # Create completion marker
     open(my $fh_ok, '>', "RECON.ok") or die "Cannot create RECON.ok: $!\n";
     print $fh_ok "Completed at " . localtime() . "\n";
-    my $mode_description = $config->{processing_mode} eq 'single_track' ? 
-                          "single_track (using masked track processing)" : 
+    my $mode_description = $config->{processing_mode} eq 'single_track' ?
+                          "single_track (in-situ masked track)" :
                           $config->{processing_mode};
     print $fh_ok "Processing mode: $mode_description\n";
     print $fh_ok "Genome class: $config->{genome_class}\n";
@@ -375,13 +465,6 @@ sub create_completion_marker {
     
     log_message("INFO", "Pipeline completion marker created", "file=RECON.ok");
     log_step_end("PIPELINE SUMMARY", 1, "Advanced RECON pipeline finished successfully");
-}
-
-sub setup_working_directory {
-    my ($config) = @_;
-    
-    # Ensure we have a clean working environment
-    # (Optional: could add cleanup logic here)
 }
 
 sub check_pipeline_completion {

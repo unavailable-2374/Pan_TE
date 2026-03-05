@@ -33,21 +33,25 @@ class LTRBoundaryRefiner:
     - Motif-based validation
     """
 
-    def __init__(self, min_ltr_len=100, max_ltr_len=1500,
-                 min_ltr_similarity=0.70, temp_dir=None, logger=None):
+    def __init__(self, min_ltr_len=100, max_ltr_len=5000,
+                 min_ltr_similarity=0.70, tsd_min=3, tsd_max=6, temp_dir=None, logger=None):
         """
         Initialize the boundary refiner.
 
         Args:
             min_ltr_len: Minimum LTR length (default: 100bp)
-            max_ltr_len: Maximum LTR length (default: 1500bp)
+            max_ltr_len: Maximum LTR length (default: 5000bp)
             min_ltr_similarity: Minimum LTR similarity (default: 0.70)
+            tsd_min: Minimum TSD length (default: 3)
+            tsd_max: Maximum TSD length (default: 6)
             temp_dir: Temporary directory for alignment files
             logger: Logger instance
         """
         self.min_ltr_len = min_ltr_len
         self.max_ltr_len = max_ltr_len
         self.min_ltr_similarity = min_ltr_similarity
+        self.tsd_min = tsd_min
+        self.tsd_max = tsd_max
         self.temp_dir = temp_dir if temp_dir else tempfile.gettempdir()
 
         # Setup logger
@@ -611,27 +615,102 @@ class LTRBoundaryRefiner:
 
     def _search_motifs_around_boundaries(self, seq_record, boundaries):
         """
-        Search for terminal motifs around detected boundaries.
+        Search for terminal motifs AND Target Site Duplications (TSDs) around boundaries.
 
         Strategy:
-        - Search ±20bp around each boundary
-        - Adjust boundary if strong motif found
+        1. Search for TSDs (4-6bp direct repeats flanking the element).
+           This is the "Gold Standard" for LTR boundaries.
+        2. If TSD found, snap boundaries to TSD.
+        3. If no TSD, fallback to Motif search (TG..CA).
 
         Args:
             seq_record: SeqRecord object
             boundaries: Current boundary information
 
         Returns:
-            Updated boundaries with motif information
+            Updated boundaries with motif/TSD information
         """
         seq_str = str(seq_record.seq).upper()
         seq_len = len(seq_str)
         start = boundaries['start']
         end = boundaries['end']
+        
+        # --- Strategy 1: TSD Detection (The Gold Standard) ---
+        # Look for 4-6bp identical sequences flanking the current boundaries
+        # Search window: ±20bp around current start/end
+        
+        tsd_found = False
+        best_tsd_score = 0
+        best_tsd_coords = None
+        
+        # Define search windows
+        # Expanded window size to catch boundaries that are further off
+        window_size = 50
+        start_window_min = max(0, start - window_size)
+        start_window_max = min(seq_len, start + window_size)
+        
+        end_window_min = max(0, end - window_size)
+        end_window_max = min(seq_len, end + window_size)
+        
+        # Extract regions to search for TSDs
+        # We look for: Sequence[i : i+k] == Sequence[j : j+k]
+        # where i is near start, j is near end
+        
+        # Optimization: Only check k=4,5,6
+        for k in [4, 5, 6]:
+            # Get candidate TSDs from the start region
+            # We assume the TSD is *immediately* before the LTR start
+            # So we iterate possible "real" starts
+            for s_pos in range(start_window_min, start_window_max - k):
+                candidate_tsd = seq_str[s_pos : s_pos + k]
+                
+                # Check if this TSD exists near the end region
+                # The TSD should be *immediately* after the LTR end
+                # So we look for it in the end window
+                e_pos = seq_str.find(candidate_tsd, end_window_min, end_window_max)
+                
+                if e_pos != -1:
+                    # Found a match!
+                    # Calculate "LTR length" implied by this TSD
+                    # LTR would be from s_pos + k to e_pos
+                    implied_len = e_pos - (s_pos + k)
+                    
+                    if self.min_ltr_len <= implied_len <= self.max_ltr_len:
+                        # Validate with Motifs inside the TSDs
+                        # LTR starts at s_pos + k, ends at e_pos
+                        ltr_seq = seq_str[s_pos + k : e_pos]
+                        
+                        has_5_motif = any(ltr_seq.startswith(m) for m in self.ltr5_motifs)
+                        has_3_motif = any(ltr_seq.endswith(m) for m in self.ltr3_motifs)
+                        
+                        score = k * 10
+                        if has_5_motif: score += 5
+                        if has_3_motif: score += 5
+                        
+                        # Prefer TSDs closer to original boundaries
+                        dist_penalty = abs(s_pos + k - start) + abs(e_pos - end)
+                        score -= dist_penalty * 0.5
+                        
+                        if score > best_tsd_score:
+                            best_tsd_score = score
+                            best_tsd_coords = (s_pos + k, e_pos, candidate_tsd)
+                            tsd_found = True
 
+        if tsd_found:
+            new_start, new_end, tsd_seq = best_tsd_coords
+            boundaries['start'] = new_start
+            boundaries['end'] = new_end
+            boundaries['tsd'] = tsd_seq
+            boundaries['method'] = 'TSD_refined'
+            self.logger.debug(f"TSD found: {tsd_seq} at {new_start}-{new_end}")
+            return boundaries
+
+        # --- Strategy 2: Motif Search (Fallback) ---
         # Search for 5' motifs near start
-        search_start = max(0, start - 20)
-        search_end = min(seq_len, start + 20)
+        # Reverted search window to 20bp to avoid snapping to random noise
+        search_window = 20
+        search_start = max(0, start - search_window)
+        search_end = min(seq_len, start + search_window)
         search_region_5 = seq_str[search_start:search_end]
 
         best_5_motif = None
@@ -646,8 +725,8 @@ class LTRBoundaryRefiner:
                     best_5_pos = actual_pos
 
         # Search for 3' motifs near end
-        search_start = max(0, end - 20)
-        search_end = min(seq_len, end + 20)
+        search_start = max(0, end - search_window)
+        search_end = min(seq_len, end + search_window)
         search_region_3 = seq_str[search_start:search_end]
 
         best_3_motif = None
@@ -662,12 +741,13 @@ class LTRBoundaryRefiner:
                     best_3_pos = actual_pos
 
         # Update boundaries if motifs found close to original
-        if best_5_motif and abs(best_5_pos - start) <= 10:
+        # Relaxed proximity check
+        if best_5_motif and abs(best_5_pos - start) <= search_window:
             boundaries['start'] = best_5_pos
             boundaries['start_motif'] = best_5_motif
             self.logger.debug(f"Adjusted start boundary to motif {best_5_motif} at {best_5_pos}")
 
-        if best_3_motif and abs(best_3_pos - end) <= 10:
+        if best_3_motif and abs(best_3_pos - end) <= search_window:
             boundaries['end'] = best_3_pos
             boundaries['end_motif'] = best_3_motif
             self.logger.debug(f"Adjusted end boundary to motif {best_3_motif} at {best_3_pos}")

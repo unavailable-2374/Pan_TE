@@ -83,7 +83,7 @@ def create_blast_db_mapping(genome_file: str) -> Dict[str, str]:
             
             # 创建BLAST数据库
             cmd = ["makeblastdb", "-in", genome_file, "-dbtype", "nucl", "-out", db_path, "-parse_seqids"]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             
             if result.returncode != 0:
                 logger.error(f"makeblastdb failed: {result.stderr}")
@@ -91,7 +91,7 @@ def create_blast_db_mapping(genome_file: str) -> Dict[str, str]:
             
             # 使用blastdbcmd获取序列列表和映射
             cmd = ["blastdbcmd", "-db", db_path, "-entry", "all", "-outfmt", "%a %t"]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             
             if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):

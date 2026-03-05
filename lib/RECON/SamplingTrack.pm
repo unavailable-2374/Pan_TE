@@ -11,25 +11,34 @@ use RECON::Core;
 use RECON::MaskedTrack;
 
 our @EXPORT = qw(
-    run_sampling_track_independent run_sampling_track_progressive run_sampling_track
+    run_sampling_track_independent
     analyze_round_metrics evaluate_stopping_criteria update_accumulated_mask
-    cleanup_failed_round log_debugging_info extract_unmasked_regions_with_gi_format
+    log_debugging_info extract_unmasked_regions_with_gi_format
+    find_repeatscout_consensus
 );
 
 sub run_sampling_track_independent {
-    my ($genome_file, $bed_files_ref, $masked_consensi, $output_dir, 
-        $threads, $cpu_threads, $genome_size) = @_;
-    
-    my @bed_files = @$bed_files_ref;
+    my @args = @_;
     my $current_dir = getcwd();
+    eval { _run_sampling_track_impl(@args); };
+    my $err = $@;
+    chdir $current_dir;  # ALWAYS restore working directory
+    die $err if $err;
+    return 1;
+}
+
+sub _run_sampling_track_impl {
+    my ($genome_file, $bed_files_ref, $masked_consensi, $output_dir,
+        $threads, $cpu_threads, $genome_size, $original_genome) = @_;
+
+    my @bed_files = @$bed_files_ref;
     chdir $output_dir or die "Cannot change to $output_dir: $!\n";
-    
+
     log_message("INFO", "Starting independent sampling track", "progressive_masking=enabled");
-    
+
     # Check if sampling track is already completed
     if (-f "sampling_track_completed.ok") {
         log_message("INFO", "Sampling track already completed", "checkpoint found: sampling_track_completed.ok");
-        chdir $current_dir;
         return 1;
     }
     
@@ -38,7 +47,7 @@ sub run_sampling_track_independent {
     
     # Initialize cumulative consensi list for progressive masking
     my @cumulative_consensi;
-    push @cumulative_consensi, $masked_consensi if -s $masked_consensi;
+    push @cumulative_consensi, $masked_consensi if defined $masked_consensi && -s $masked_consensi;
     
     # Also include RepeatScout high-quality consensus if available
     my $repeatscout_consensus = find_repeatscout_consensus($output_dir);
@@ -49,8 +58,6 @@ sub run_sampling_track_independent {
     my @sample_sizes = (90, 270, 540, 1200);  # MB - progressive scaling
     my $accumulated_mask;
     my %previous_metrics;
-    my %cumulative_families;  # Track families across rounds
-    
     for my $sample_size_mb (@sample_sizes) {
         last if $round > 4;  # Max 4 rounds
         
@@ -70,7 +77,7 @@ sub run_sampling_track_independent {
             
             # Update accumulated mask if sampled regions exist
             if (-s "$round_dir/sampled_regions.bed") {
-                update_accumulated_mask(\$accumulated_mask, "$round_dir/sampled_regions.bed");
+                update_accumulated_mask(\$accumulated_mask, abs_path("$round_dir/sampled_regions.bed"));
             }
             
             $round++;
@@ -83,26 +90,21 @@ sub run_sampling_track_independent {
         # Change to round directory for all work
         chdir $round_dir or die "Cannot change to $round_dir: $!\n";
         
-        # Create initial exclusion mask from BED files (in round directory)
+        # Create exclusion mask (use absolute paths to avoid chdir issues)
+        $exclusion_mask = abs_path("exclusion.bed");
         if ($round == 1) {
-            $exclusion_mask = "initial_exclusion.bed";
             if (@bed_files) {
                 my $bed_list = join(" ", @bed_files);
                 run_cmd("cat $bed_list | bedtools sort | bedtools merge > $exclusion_mask");
             } else {
-                open(my $fh, '>', $exclusion_mask);
-                close($fh);
+                open(my $fh, '>', $exclusion_mask); close($fh);
             }
             $accumulated_mask = $exclusion_mask;
         } else {
-            # For subsequent rounds, copy accumulated mask to this round
-            $exclusion_mask = "accumulated_mask.bed";
-            if (defined $accumulated_mask && -f "../$accumulated_mask") {
-                run_cmd("cp ../$accumulated_mask $exclusion_mask");
+            if (defined $accumulated_mask && -f $accumulated_mask) {
+                run_cmd("cp $accumulated_mask $exclusion_mask");
             } else {
-                # Fallback to empty mask
-                open(my $fh, '>', $exclusion_mask);
-                close($fh);
+                open(my $fh, '>', $exclusion_mask); close($fh);
             }
         }
         
@@ -121,7 +123,8 @@ sub run_sampling_track_independent {
                 ".",  # Current round directory
                 $threads,
                 $cpu_threads,
-                calculate_genome_size($genome_file)
+                (-s $genome_file),
+                $original_genome
             );
             
             if ($success) {
@@ -148,8 +151,9 @@ sub run_sampling_track_independent {
         my $sample_file = "sample.fa";
         if (!-f "sampling.ok") {
             log_message("INFO", "Starting genome sampling", "target_size=${sample_size_mb}MB");
-            perform_adaptive_sampling($genome_file, $exclusion_mask, $accumulated_mask, 
-                                     $sample_file, $sample_size_mb, RECON::Utils::FRAGMENT_SIZE);
+            perform_adaptive_sampling($genome_file, $exclusion_mask, $accumulated_mask,
+                                     $sample_file, $sample_size_mb, RECON::Utils::FRAGMENT_SIZE,
+                                     "sampled_regions.bed");
             
             # Create sampling checkpoint
             open(my $fh, '>', "sampling.ok") or die "Cannot create sampling checkpoint: $!\n";
@@ -330,11 +334,11 @@ sub run_sampling_track_independent {
         # Step 2.5: Extract unmasked regions and filter short fragments (with checkpoint)
         my $unmasked_sample = "sample_unmasked_filtered.fa";
         if (!-f "unmasked_extract.ok") {
-            log_message("INFO", "Starting unmasked region extraction and filtering", 
+            log_message("INFO", "Starting unmasked region extraction and filtering",
                        "min_length=50bp, input=$masked_sample");
-            
+
             my ($extracted_count, $filtered_count) = extract_unmasked_regions_with_gi_format(
-                $masked_sample, $unmasked_sample
+                $masked_sample, $unmasked_sample, $original_genome
             );
             
             # Create unmasked extraction checkpoint
@@ -513,15 +517,8 @@ sub run_sampling_track_independent {
             log_message("INFO", "No families found, skipping consensus building", "summary_missing=true");
         }
         
-        # Generate sampled regions BED file for this round (in round directory)
-        # This will be used to update the accumulated mask for next round
+        # sampled_regions.bed is now populated by perform_adaptive_sampling above
         my $sampled_regions_file = "sampled_regions.bed";
-        # TODO: This should extract sampled regions from the sampling step
-        # For now, create empty file as placeholder
-        unless (-f $sampled_regions_file) {
-            open(my $fh, '>', $sampled_regions_file);
-            close($fh);
-        }
         
         # Return to sampling_track directory
         chdir "..";
@@ -547,7 +544,7 @@ sub run_sampling_track_independent {
             last;
         }
         if (-s "$round_dir/$sampled_regions_file") {
-            update_accumulated_mask(\$accumulated_mask, "$round_dir/$sampled_regions_file");
+            update_accumulated_mask(\$accumulated_mask, abs_path("$round_dir/$sampled_regions_file"));
         }
         $round++;
     }
@@ -557,20 +554,8 @@ sub run_sampling_track_independent {
     print $fh "Completed at " . localtime() . "\n";
     print $fh "Rounds completed: " . ($round - 1) . "\n";
     close $fh;
-    
-    chdir $current_dir;
-    
+
     log_message("INFO", "Sampling track completed", "rounds=" . ($round - 1));
-}
-
-sub run_sampling_track_progressive {
-    # Legacy compatibility - redirect to independent track
-    return run_sampling_track_independent(@_);
-}
-
-sub run_sampling_track {
-    # Legacy compatibility - redirect to independent track
-    return run_sampling_track_independent(@_);
 }
 
 sub analyze_round_metrics {
@@ -816,55 +801,6 @@ sub update_accumulated_mask {
     unlink($temp_file);
 }
 
-sub cleanup_failed_round {
-    my ($round_dir) = @_;
-    
-    # Remove all checkpoint files for fresh restart
-    my @checkpoint_files = qw(
-        sampling.ok pre-mask.ok renaming.ok rmblastn.ok 
-        recon_prep.ok recon.ok consensus.ok 
-        round_completed.ok
-    );
-    
-    for my $checkpoint (@checkpoint_files) {
-        if (-f $checkpoint) {
-            unlink($checkpoint);
-            log_message("DEBUG", "Removed checkpoint", "file=$checkpoint");
-        }
-    }
-    
-    # Remove potentially corrupted output files but keep logs for debugging
-    my @cleanup_files = qw(
-        consensi.fa msp.out msp.out.backup
-        sample_renamed.fa sample_masked.fa sample.fa
-        seq.names
-        summary/families summary/eles
-    );
-    
-    for my $file (@cleanup_files) {
-        if (-f $file) {
-            unlink($file);
-            log_message("DEBUG", "Removed output file", "file=$file");
-        }
-    }
-    
-    # Remove database files
-    for my $db_file (glob("sample_db*")) {
-        unlink($db_file);
-    }
-    
-    # Remove summary directory if it exists and is empty/corrupted
-    if (-d "summary") {
-        # Remove all files in summary directory
-        for my $summary_file (glob("summary/*")) {
-            unlink($summary_file);
-        }
-        rmdir("summary");
-    }
-    
-    log_message("INFO", "Cleaned up failed round", "round_dir=$round_dir, checkpoints_removed=" . scalar(@checkpoint_files));
-}
-
 sub log_debugging_info {
     my ($round, $round_dir) = @_;
     
@@ -980,15 +916,16 @@ sub find_repeatscout_consensus {
 }
 
 sub extract_unmasked_regions_with_gi_format {
-    my ($input_file, $output_file) = @_;
-    
-    log_message("INFO", "Extracting unmasked regions with gi|N formatting", 
+    my ($input_file, $output_file, $original_genome) = @_;
+
+    log_message("INFO", "Extracting unmasked regions with gi|N formatting",
                "input=$input_file, output=$output_file, min_length=50bp");
-    
+
     # Create temporary file for MaskedTrack extraction
     my $temp_file = "${output_file}.tmp";
-    
-    # Use MaskedTrack's extract_unmasked_regions function (now 50bp minimum, N-only splitting)
+
+    # Sampling track fragments are random genome samples - no flanking extension needed
+    # (extended extraction is for masked track where boundaries mark TE edges)
     my $extracted_regions = extract_unmasked_regions($input_file, $temp_file);
     
     # Reformat the output to use simple gi|N format

@@ -31,6 +31,16 @@ if [ ! -d "$CLASSIFYTE_DIR" ]; then
     error "ClassifyTE directory not found: $CLASSIFYTE_DIR"
 fi
 
+# Auto-detect correct ClassifyTE root directory
+# If user passed a subdirectory (e.g., .../ClassifyTE/models), walk up to find root
+if [ ! -d "$CLASSIFYTE_DIR/features" ] || [ ! -d "$CLASSIFYTE_DIR/models" ]; then
+    PARENT_DIR="$(dirname "$CLASSIFYTE_DIR")"
+    if [ -d "$PARENT_DIR/features" ] && [ -d "$PARENT_DIR/models" ] && [ -d "$PARENT_DIR/nodes" ]; then
+        log "Auto-corrected ClassifyTE path: $CLASSIFYTE_DIR -> $PARENT_DIR"
+        CLASSIFYTE_DIR="$PARENT_DIR"
+    fi
+fi
+
 log "Starting TE classification process"
 log "ClassifyTE directory: $CLASSIFYTE_DIR"
 log "Using $THREADS threads for classification"

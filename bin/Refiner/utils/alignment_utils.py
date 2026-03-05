@@ -49,12 +49,16 @@ def run_repeatmasker_batch_detailed(sequences: List[Dict], genome_file: str,
         ])
         
         # 运行RepeatMasker
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)
+        except subprocess.TimeoutExpired:
+            logger.error("RepeatMasker batch detailed timed out after 6 hours")
+            return results
+
         if result.returncode != 0:
             logger.error(f"RepeatMasker failed: {result.stderr}")
             return results
-        
+
         # 解析输出文件获取详细hits
         out_file = os.path.join(temp_dir, os.path.basename(genome_file) + '.out')
         if os.path.exists(out_file):
@@ -157,13 +161,15 @@ def run_repeatmasker_batch(sequences: List[Dict], genome_file: str,
         ])
         
         # 运行RepeatMasker
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)
+
         # 解析输出文件
         out_file = os.path.join(temp_dir, os.path.basename(genome_file) + '.out')
         if os.path.exists(out_file):
             results = parse_repeatmasker_output(out_file, sequences)
-        
+
+    except subprocess.TimeoutExpired:
+        logger.error("RepeatMasker batch timed out after 6 hours")
     except Exception as e:
         logger.error(f"RepeatMasker batch run failed: {e}")
     finally:
@@ -215,13 +221,15 @@ def run_repeatmasker_single(sequence: Dict, genome_file: str,
         ])
         
         # 运行RepeatMasker
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)
+
         # 解析输出文件
         out_file = os.path.join(temp_dir, os.path.basename(genome_file) + '.out')
         if os.path.exists(out_file):
             hits = parse_repeatmasker_hits(out_file)
-        
+
+    except subprocess.TimeoutExpired:
+        logger.error("RepeatMasker single run timed out after 6 hours")
     except Exception as e:
         logger.error(f"RepeatMasker single run failed: {e}")
     finally:
@@ -265,12 +273,26 @@ def parse_repeatmasker_output(out_file: str, sequences: List[Dict]) -> Dict[str,
                         if seq_data['id'] == repeat_name:
                             identity = 100 - float(fields[1])  # 转换为相似度
                             length = int(fields[6]) - int(fields[5]) + 1
-                            
+
                             # 处理染色体名称中可能包含的坐标信息
                             chrom = fields[4]
                             if ':' in chrom:
                                 chrom = chrom.split(':')[0]
-                            
+
+                            # Extract query coordinates (matching repeat begin/end)
+                            # RM .out fields[11] = repeat begin, fields[12] = repeat end
+                            query_start = 0
+                            query_end = 0
+                            try:
+                                # fields[11] is "repeat begin" (query start in consensus)
+                                # fields[12] is "repeat end" (query end in consensus)
+                                qs = fields[11].strip('()')
+                                qe = fields[12].strip('()')
+                                query_start = int(qs) if qs.isdigit() else 0
+                                query_end = int(qe) if qe.isdigit() else 0
+                            except (IndexError, ValueError):
+                                pass
+
                             results[repeat_name]['copy_number'] += 1
                             results[repeat_name]['total_length'] += length
                             results[repeat_name]['hits'].append({
@@ -278,7 +300,9 @@ def parse_repeatmasker_output(out_file: str, sequences: List[Dict]) -> Dict[str,
                                 'start': int(fields[5]),
                                 'end': int(fields[6]),
                                 'identity': identity,
-                                'length': length
+                                'length': length,
+                                'query_start': query_start,
+                                'query_end': query_end
                             })
                             break
         
@@ -402,9 +426,13 @@ def run_mafft(sequences: List[Dict], algorithm: str = 'localpair',
         cmd.extend([input_file_path])
         
         # 运行MAFFT
-        with open(output_file_path, 'w') as out_file:
-            result = subprocess.run(cmd, stdout=out_file, stderr=subprocess.PIPE, text=True)
-        
+        try:
+            with open(output_file_path, 'w') as out_file:
+                result = subprocess.run(cmd, stdout=out_file, stderr=subprocess.PIPE, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            logger.error(f"MAFFT timed out after 10 minutes for {len(sequences)} sequences")
+            return None
+
         if result.returncode != 0:
             logger.error(f"MAFFT failed: {result.stderr}")
             return None

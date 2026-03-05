@@ -48,10 +48,10 @@ class ConsensusBuilder:
             available_memory_gb = mem.available / (1024**3)
             total_memory_gb = mem.total / (1024**3)
             logger.info(f"System memory: {available_memory_gb:.1f}GB available / {total_memory_gb:.1f}GB total")
-        except:
+        except Exception as e:
             available_memory_gb = 16  # 默认假设16GB可用
             total_memory_gb = 32
-            logger.warning("Could not detect system memory, assuming 16GB available")
+            logger.warning(f"Could not detect system memory ({e}), assuming 16GB available")
         
         # 设置并行处理workers - 基于内存和CPU数量
         cpu_count = mp.cpu_count()
@@ -186,6 +186,25 @@ class ConsensusBuilder:
         if sorted_candidates:
             all_consensus = self._build_consensus_parallel(sorted_candidates, stats)
         
+        # Log stratified processing path distribution
+        if all_consensus:
+            path_counts = {'fast_path_boundary_only': 0, 'minimal_path': 0, 'standard': 0, 'other': 0}
+            for c in all_consensus:
+                method = c.get('consensus_method', c.get('note', ''))
+                if 'fast_path' in str(method):
+                    path_counts['fast_path_boundary_only'] += 1
+                elif 'minimal_path' in str(method):
+                    path_counts['minimal_path'] += 1
+                elif method in ('', 'no_copies_found', 'original_improved'):
+                    path_counts['other'] += 1
+                else:
+                    path_counts['standard'] += 1
+            total_paths = sum(path_counts.values())
+            logger.info(f"Stratified processing path distribution ({total_paths} total):")
+            for path_name, count in path_counts.items():
+                pct = (count / total_paths * 100) if total_paths > 0 else 0
+                logger.info(f"  - {path_name}: {count} ({pct:.1f}%)")
+
         # 质量过滤、分级和去重
         filtered_consensus = self._filter_and_grade_consensus(all_consensus, stats)
         deduplicated_consensus = self._deduplicate_consensus_sequences(filtered_consensus, stats)
@@ -254,9 +273,9 @@ class ConsensusBuilder:
                     try:
                         mem = psutil.virtual_memory()
                         logger.info(f"  Memory usage: {mem.percent:.1f}% ({mem.used/(1024**3):.1f}GB / {mem.total/(1024**3):.1f}GB)")
-                    except:
+                    except Exception:
                         pass
-                    
+
                     last_report_time = current_time
         
         # 记录开始时间
@@ -274,7 +293,7 @@ class ConsensusBuilder:
             if mem.available < 4 * (1024**3):  # 少于4GB可用内存
                 logger.warning(f"Low memory detected ({mem.available/(1024**3):.1f}GB), using sequential processing")
                 use_multiprocessing = False
-        except:
+        except Exception:
             pass
         
         if not use_multiprocessing:
@@ -321,14 +340,7 @@ class ConsensusBuilder:
                 logger.info(f"Using ProcessPoolExecutor with {self.max_workers} workers (CPU-bound optimization)")
                 executor_class = ProcessPoolExecutor
                 
-                # 对于ProcessPoolExecutor，尝试使用spawn方法
-                try:
-                    original_method = mp.get_start_method()
-                    if original_method != 'spawn':
-                        logger.info(f"Switching multiprocessing from '{original_method}' to 'spawn' method")
-                        mp.set_start_method('spawn', force=True)
-                except (RuntimeError, ValueError) as e:
-                    logger.debug(f"Could not set spawn method: {e}")
+                # mp.set_start_method('spawn') is called once at pipeline startup in main.py
             
             # 使用选定的执行器进行并行处理
             with executor_class(max_workers=self.max_workers) as executor:
@@ -384,7 +396,7 @@ class ConsensusBuilder:
                                 logger.warning(f"High memory usage ({mem.percent:.1f}%), triggering aggressive GC")
                                 gc.collect(2)  # Full collection
                                 time.sleep(1)  # Brief pause to allow memory reclamation
-                        except:
+                        except Exception:
                             pass
         
         # 最终统计
@@ -440,56 +452,734 @@ class ConsensusBuilder:
                 sequences.append(seq)
         
         logger.info(f"Extracted {len(sequences)} sequences from Phase 2 output")
-        
+
         return sequences
+
+    def _categorize_input_sequences(self, sequences: List[Dict]) -> Dict[str, List[Dict]]:
+        """Categorize input sequences by source type."""
+        categories = {
+            'non_chimeric': [],
+            'chimera_segments': [],
+            'unsplit_chimeras': [],
+            'failed_sequences': []
+        }
+
+        for seq in sequences:
+            source = seq.get('source', 'unknown')
+            if source == 'non_chimeric':
+                categories['non_chimeric'].append(seq)
+            elif source == 'chimera_split':
+                if seq.get('split_from'):
+                    categories['chimera_segments'].append(seq)
+                else:
+                    categories['unsplit_chimeras'].append(seq)
+            elif source == 'unsplit_chimera':
+                categories['unsplit_chimeras'].append(seq)
+            elif source == 'processing_failed':
+                categories['failed_sequences'].append(seq)
+            else:
+                categories['non_chimeric'].append(seq)
+
+        return categories
+
+    def _build_consensus_parallel(self, sequences: List[Dict], stats: Dict) -> List[Dict]:
+        """Build consensus sequences in parallel or sequentially."""
+        if self.max_workers <= 1 or len(sequences) <= 1:
+            logger.info("Using sequential consensus building")
+            return self._build_consensus_sequential(sequences, stats)
+        else:
+            logger.info(f"Using parallel consensus building with {self.max_workers} workers")
+            return self._process_sequences_dynamic(sequences, stats)
+
+    def _build_consensus_sequential(self, sequences: List[Dict], stats: Dict) -> List[Dict]:
+        """Build consensus sequences sequentially."""
+        all_consensus = []
+        for i, seq in enumerate(sequences, 1):
+            logger.debug(f"Processing sequence {i}/{len(sequences)}: {seq['id']}")
+            consensus_result = self._process_single_sequence_for_consensus(seq)
+            if consensus_result:
+                all_consensus.extend(consensus_result['consensus_sequences'])
+                stats['processed_sequences'] += 1
+                stats['single_consensus'] += len([c for c in consensus_result['consensus_sequences']
+                                                  if c.get('subfamily_count', 1) == 1])
+                stats['multiple_consensus'] += len([c for c in consensus_result['consensus_sequences']
+                                                    if c.get('subfamily_count', 1) > 1])
+            else:
+                stats['failed_sequences'] += 1
+            if i % 50 == 0 or i == len(sequences):
+                logger.info(f"Progress: {i}/{len(sequences)} sequences processed, "
+                           f"{len(all_consensus)} consensus generated")
+        stats['total_consensus'] = len(all_consensus)
+        return all_consensus
+
+    def _process_single_sequence_for_consensus(self, sequence: Dict) -> Optional[Dict]:
+        """Process single sequence for consensus building."""
+        try:
+            seq_id = sequence.get('id', 'unknown')
+            seq_data = sequence.get('sequence', '')
+            if not seq_data:
+                logger.warning(f"Empty sequence for {seq_id}")
+                return None
+            result = expand_and_improve_sequence(sequence, self.config, self.mafft_threads)
+            if result and result['consensus_count'] > 0:
+                return {
+                    'consensus_sequences': result['consensus_list'],
+                    'method': f"expanded_{result['consensus_count']}_consensus"
+                }
+            else:
+                logger.debug(f"Expansion failed for {seq_id}, using original sequence")
+                consensus = self._create_single_consensus(sequence)
+                return {
+                    'consensus_sequences': [consensus],
+                    'method': 'fallback_single'
+                }
+        except Exception as e:
+            logger.error(f"Error processing sequence {sequence.get('id', 'unknown')} for consensus: {e}")
+            return None
+
+    def _create_single_consensus(self, sequence: Dict) -> Dict:
+        """Create single consensus sequence."""
+        return {
+            'id': f"{sequence['id']}_consensus",
+            'sequence': sequence['sequence'],
+            'subfamily_id': 1,
+            'subfamily_count': 1,
+            'avg_identity': 100.0,
+            'avg_length': len(sequence['sequence']),
+            'source_sequence': sequence['id'],
+            'consensus_method': 'single_sequence',
+            'quality_score': self._calculate_consensus_quality_score(100.0, 1)
+        }
+
+    def _calculate_consensus_quality_score(self, avg_identity: float, copy_count: int) -> float:
+        """Calculate consensus quality score."""
+        identity_score = avg_identity / 100.0
+        copy_score = min(1.0, np.log1p(copy_count) / np.log1p(10))
+        return identity_score * 0.7 + copy_score * 0.3
+
+    def _filter_and_grade_consensus(self, consensus_list: List[Dict], stats: Dict) -> List[Dict]:
+        """Filter and grade consensus sequences - distribution-aware version.
+
+        Uses percentile-based dynamic trust levels instead of fixed thresholds.
+        """
+        if not consensus_list:
+            return []
+
+        copy_numbers = [c.get('copy_number', 0) for c in consensus_list]
+        if copy_numbers:
+            p25 = np.percentile(copy_numbers, 25)
+            p50 = np.percentile(copy_numbers, 50)
+            p75 = np.percentile(copy_numbers, 75)
+            copy_mean = np.mean(copy_numbers)
+            copy_max = max(copy_numbers)
+        else:
+            p25, p50, p75 = 2, 5, 15
+            copy_mean, copy_max = 5, 20
+
+        logger.info(f"Copy number distribution: P25={p25:.1f}, P50={p50:.1f}, P75={p75:.1f}, "
+                   f"mean={copy_mean:.1f}, max={copy_max}")
+
+        high_trust_threshold = max(p75, 3)
+        medium_high_threshold = max(p50, 2)
+        medium_threshold = max(p25, 1)
+
+        logger.info(f"Dynamic trust thresholds: High>={high_trust_threshold:.1f}, "
+                   f"MedHigh>={medium_high_threshold:.1f}, Med>={medium_threshold:.1f}")
+
+        validated_consensus = []
+        trust_stats = {'high': 0, 'medium_high': 0, 'medium': 0, 'low': 0}
+
+        for consensus in consensus_list:
+            seq_length = len(consensus.get('sequence', ''))
+            if seq_length < self.config.min_length:
+                continue
+            copy_number = consensus.get('copy_number', 0)
+            base_quality = consensus.get('quality_score', 0)
+            quality_class = consensus.get('quality_class', 'B')
+            sequence = consensus.get('sequence', '')
+
+            if copy_number >= high_trust_threshold:
+                trust_level = 'high'
+            elif copy_number >= medium_high_threshold:
+                trust_level = 'medium_high'
+            elif copy_number >= medium_threshold:
+                trust_level = 'medium'
+            else:
+                trust_level = 'low'
+            trust_stats[trust_level] += 1
+            consensus['trust_level'] = trust_level
+
+            skip_validation = False
+            validation_strictness = 'standard'
+
+            if trust_level in ['high', 'medium_high']:
+                skip_validation = True
+            elif trust_level == 'medium':
+                if quality_class in ['A', 'C_rescued'] or _has_te_structural_features_standalone(sequence):
+                    skip_validation = True
+                else:
+                    validation_strictness = 'light'
+            else:
+                if quality_class == 'A' or _has_te_structural_features_standalone(sequence):
+                    skip_validation = True
+                elif seq_length >= 1500:
+                    validation_strictness = 'light'
+
+            if skip_validation:
+                consensus['validations'] = {}
+                consensus['validation_score'] = 1.0
+                final_score = base_quality
+            else:
+                validations = _validate_consensus_quality(consensus)
+                consensus['validations'] = validations
+                raw_validation_score = sum(validations.values()) / len(validations) if validations else 0
+                if validation_strictness == 'light':
+                    final_score = base_quality * 0.8 + raw_validation_score * 0.2
+                else:
+                    final_score = base_quality * 0.7 + raw_validation_score * 0.3
+                consensus['validation_score'] = raw_validation_score
+
+            consensus['final_quality_score'] = final_score
+            validated_consensus.append(consensus)
+
+        logger.info(f"Trust level distribution: {trust_stats}")
+
+        if not validated_consensus:
+            return []
+
+        quality_scores = [c.get('final_quality_score', 0) for c in validated_consensus]
+        thresholds = _calculate_adaptive_thresholds(quality_scores)
+        logger.info(f"Quality thresholds: High={thresholds['high']:.3f}, "
+                   f"Medium={thresholds['medium']:.3f}, Low={thresholds['low']:.3f}")
+
+        filtered_consensus = []
+        rejected_count = 0
+
+        for consensus in validated_consensus:
+            final_score = consensus.get('final_quality_score', 0)
+            validation_score = consensus.get('validation_score', 0)
+            quality_class = consensus.get('quality_class', 'B')
+            trust_level = consensus.get('trust_level', 'low')
+            seq_length = len(consensus.get('sequence', ''))
+            should_reject = False
+
+            if trust_level in ['high', 'medium_high']:
+                if final_score < 0.1:
+                    should_reject = True
+            elif trust_level == 'medium':
+                if validation_score < 0.2 and final_score < thresholds['low'] * 0.7:
+                    if seq_length < 1000 and quality_class not in ['A', 'C_rescued']:
+                        should_reject = True
+            else:
+                if validation_score < 0.15 and final_score < thresholds['low'] * 0.8:
+                    if seq_length < 1000 and quality_class not in ['A', 'C_rescued']:
+                        should_reject = True
+
+            if should_reject:
+                rejected_count += 1
+                continue
+
+            if final_score >= thresholds['high']:
+                consensus['quality_grade'] = 'high'
+                stats['high_quality_consensus'] += 1
+            elif final_score >= thresholds['medium']:
+                consensus['quality_grade'] = 'medium'
+                stats['medium_quality_consensus'] += 1
+            else:
+                consensus['quality_grade'] = 'low'
+                stats['low_quality_consensus'] += 1
+            filtered_consensus.append(consensus)
+
+        stats['rejected_consensus'] = rejected_count
+        filtered_consensus.sort(key=lambda x: x.get('final_quality_score', 0), reverse=True)
+        logger.info(f"Filtering complete: {len(filtered_consensus)} passed, {rejected_count} rejected")
+        return filtered_consensus
+
+    def _deduplicate_consensus_sequences(self, consensus_sequences: List[Dict], stats: Dict) -> List[Dict]:
+        """Deduplicate consensus sequences."""
+        if len(consensus_sequences) <= 1:
+            return consensus_sequences
+
+        logger.info(f"Deduplicating {len(consensus_sequences)} consensus sequences")
+        sorted_consensus = sorted(consensus_sequences,
+                                  key=lambda x: x.get('quality_score', 0),
+                                  reverse=True)
+        deduplicated = []
+        for consensus in sorted_consensus:
+            is_duplicate = False
+            for existing in deduplicated:
+                similarity = self._calculate_sequence_similarity(
+                    consensus['sequence'], existing['sequence'])
+                if similarity > 0.95:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                deduplicated.append(consensus)
+
+        removed_count = len(consensus_sequences) - len(deduplicated)
+        stats['deduplicated_sequences'] = removed_count
+        logger.info(f"Deduplication: removed {removed_count}, kept {len(deduplicated)}")
+        return deduplicated
+
+    def _calculate_sequence_similarity(self, seq1: str, seq2: str) -> float:
+        """Calculate sequence similarity."""
+        if not seq1 or not seq2:
+            return 0.0
+        min_len = min(len(seq1), len(seq2))
+        max_len = max(len(seq1), len(seq2))
+        if max_len / min_len > 1.2:
+            return 0.0
+        matches = sum(1 for i in range(min_len) if seq1[i] == seq2[i])
+        length_penalty = min_len / max_len
+        return (matches / min_len) * length_penalty
+
+    def _generate_phase4_compatible_output(self, consensus_sequences: List[Dict],
+                                           stats: Dict, sequence_categories: Dict) -> Dict[str, Any]:
+        """Generate Phase 4 compatible output."""
+        high_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'high']
+        medium_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'medium']
+        low_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'low']
+
+        logger.info(f"Quality distribution: High={len(high_quality)}, "
+                   f"Medium={len(medium_quality)}, Low={len(low_quality)}")
+
+        masking_library = high_quality.copy()
+        selected_medium = medium_quality
+        if medium_quality:
+            masking_library.extend(selected_medium)
+
+        analysis_library = high_quality + medium_quality
+        self._save_enhanced_analysis_library_fasta(analysis_library, stats)
+
+        result = {
+            'masking_library': masking_library,
+            'analysis_library': analysis_library,
+            'statistics': stats,
+            'phase3_complete': True,
+            'sequence_categories': sequence_categories,
+            'quality_distribution': {
+                'high': len(high_quality),
+                'medium': len(medium_quality),
+                'low': len(low_quality),
+                'masking_selected': {
+                    'high': len(high_quality),
+                    'medium': len(selected_medium),
+                    'low': 0
+                }
+            },
+            'enhancement_metrics': {
+                'adaptive_thresholds_used': True,
+                'biological_validation': True,
+                'quality_components_tracked': True
+            }
+        }
+
+        logger.info(f"Phase 4 output: Masking={len(masking_library)}, Analysis={len(analysis_library)}")
+        return result
+
+    def _save_enhanced_analysis_library_fasta(self, analysis_library: List[Dict], stats: Dict):
+        """Save analysis library as FASTA file."""
+        output_dir = Path(self.config.output_dir)
+        analysis_file = output_dir / "phase3_analysis_library.fa"
+        stats_file = output_dir / "phase3_quality_statistics.txt"
+
+        try:
+            with open(analysis_file, 'w') as f:
+                for seq in analysis_library:
+                    seq_id = seq.get('id', 'unknown')
+                    sequence = seq.get('sequence', '')
+                    header_parts = [
+                        f">{seq_id}",
+                        f"grade={seq.get('quality_grade', 'unknown')}",
+                        f"final_score={seq.get('final_quality_score', 0):.3f}",
+                        f"base_score={seq.get('quality_score', 0):.3f}",
+                        f"validation={seq.get('validation_score', 0):.3f}",
+                        f"copies={seq.get('copy_number', 0)}",
+                        f"length={len(sequence)}"
+                    ]
+                    if seq.get('tsd'):
+                        header_parts.append(f"tsd={seq['tsd']}")
+                    f.write(" ".join(header_parts) + "\n" + sequence + "\n")
+            logger.info(f"Saved analysis library to: {analysis_file}")
+
+            with open(stats_file, 'w') as f:
+                f.write("Phase 3 Quality Statistics\n" + "=" * 50 + "\n\n")
+                f.write("Overall Statistics:\n")
+                for key, value in stats.items():
+                    f.write(f"  {key}: {value}\n")
+                f.write("\nQuality Component Analysis:\n")
+                if analysis_library:
+                    component_stats = defaultdict(list)
+                    for seq in analysis_library:
+                        for comp_name, comp_value in seq.get('quality_components', {}).items():
+                            component_stats[comp_name].append(comp_value)
+                    for comp_name, values in component_stats.items():
+                        if values:
+                            f.write(f"  {comp_name}: mean={np.mean(values):.3f}, "
+                                    f"std={np.std(values):.3f}, "
+                                    f"min={np.min(values):.3f}, max={np.max(values):.3f}\n")
+            logger.info(f"Saved quality statistics to: {stats_file}")
+        except Exception as e:
+            logger.error(f"Failed to save analysis files: {e}")
+
+    def _save_analysis_library_fasta(self, analysis_library: List[Dict]):
+        """Backward-compatible wrapper for _save_enhanced_analysis_library_fasta."""
+        self._save_enhanced_analysis_library_fasta(analysis_library, {})
+
+
+def determine_processing_path(seed_seq: Dict, rm_hits: list, config: PipelineConfig) -> str:
+    """
+    Determine stratified processing path based on sequence confidence.
+
+    Returns:
+        'fast'     - High-copy, high-identity: skip MAFFT, boundary-extend only
+        'minimal'  - Very low copy: use original sequence as-is
+        'standard' - Everything else: full MAFFT rebuild
+    """
+    if not getattr(config, 'enable_stratified_processing', True):
+        return 'standard'
+
+    copy_number = len(rm_hits) if rm_hits else 0
+    quality_class = seed_seq.get('quality_class', 'B')
+
+    # Minimal path: 0-1 copies
+    max_copies_minimal = getattr(config, 'minimal_path_max_copies', 1)
+    if copy_number <= max_copies_minimal:
+        return 'minimal'
+
+    # Fast path: high copy + high identity
+    min_copies_fast = getattr(config, 'fast_path_min_copies', 10)
+    min_identity_fast = getattr(config, 'fast_path_min_identity', 75.0)
+
+    if copy_number >= min_copies_fast:
+        # Calculate average identity from rm_hits
+        identities = [h.get('identity', 0) for h in rm_hits if 'identity' in h]
+        avg_identity = sum(identities) / len(identities) if identities else 0
+
+        if avg_identity >= min_identity_fast:
+            # Additional check: structural features or quality class A
+            sequence = seed_seq.get('sequence', '')
+            if quality_class == 'A' or _has_te_structural_features_standalone(sequence):
+                return 'fast'
+
+    return 'standard'
+
+
+def fast_path_consensus(seed_seq: Dict, copies: list, config: PipelineConfig) -> Dict:
+    """
+    Fast path: keep RepeatScout's original consensus, only extend boundaries.
+    Skips expensive MAFFT MSA entirely.
+
+    For high-copy, high-identity sequences where RepeatScout's consensus
+    is already reliable.
+    """
+    from utils.sequence_utils import extend_consensus_boundaries
+
+    sequence = seed_seq['sequence']
+    original_length = len(sequence)
+
+    # Extend boundaries using the longest genomic copy
+    if copies:
+        longest_copy = max(copies, key=lambda x: x.get('length', 0))
+        reference_seq = longest_copy.get('extended_sequence', longest_copy.get('sequence', ''))
+        if reference_seq and len(reference_seq) > len(sequence):
+            extended = extend_consensus_boundaries(sequence, reference_seq)
+            if len(extended) > len(sequence):
+                logger.debug(f"{seed_seq['id']}: Fast path extended {len(sequence)}bp -> {len(extended)}bp")
+                sequence = extended
+
+    # Calculate quality score from copy statistics (no MAFFT needed)
+    identities = [c.get('identity', 0) for c in copies]
+    avg_identity = sum(identities) / len(identities) if identities else 0
+    copy_number = len(copies)
+
+    # Quality scoring for fast path
+    identity_score = avg_identity / 100.0
+    copy_score = min(1.0, np.log1p(copy_number) / np.log1p(50))
+    quality_score = identity_score * 0.5 + copy_score * 0.3 + 0.2  # Base bonus for qualifying
+
+    if len(sequence) < 50:
+        return None
+
+    return {
+        'id': f"{seed_seq['id']}_sf0",
+        'sequence': sequence,
+        'source_id': seed_seq['id'],
+        'quality_class': seed_seq.get('quality_class', 'A'),
+        'subfamily_id': 0,
+        'copy_number': copy_number,
+        'avg_identity': avg_identity,
+        'length': len(sequence),
+        'original_length': original_length,
+        'improvement_ratio': len(sequence) / original_length if original_length > 0 else 1.0,
+        'quality_score': quality_score,
+        'consensus_method': 'fast_path_boundary_only',
+        'characteristics': {
+            'copy_number': copy_number,
+            'avg_identity': avg_identity
+        },
+        'note': f'fast_path:copies={copy_number},identity={avg_identity:.1f}'
+    }
+
+
+def _select_rmblast_matrix(config: PipelineConfig, divergence: int = 20, gc_pct: int = 41) -> str:
+    """Select the best RepeatMasker scoring matrix for rmblastn.
+
+    Args:
+        config: Pipeline config with rmblast_matrix_dir
+        divergence: Expected divergence level (14, 18, 20, 25)
+        gc_pct: Genome GC percentage (35, 37, 39, 41, 43, 45, 47, 49, 51, 53)
+
+    Returns:
+        Matrix name (e.g. '20p41g.matrix') or empty string if not available.
+    """
+    import os
+    matrix_dir = getattr(config, 'rmblast_matrix_dir', '')
+    if not matrix_dir:
+        return ""
+
+    # Try exact match first
+    matrix_name = f"{divergence}p{gc_pct}g.matrix"
+    if os.path.isfile(os.path.join(matrix_dir, matrix_name)):
+        return matrix_name
+
+    # Try nearest GC content
+    for gc in [41, 43, 39, 45, 37, 47, 35, 49, 51, 53]:
+        matrix_name = f"{divergence}p{gc}g.matrix"
+        if os.path.isfile(os.path.join(matrix_dir, matrix_name)):
+            return matrix_name
+
+    return ""
+
+
+def get_genome_copies_blastn(seed_seq: Dict, config: PipelineConfig) -> list:
+    """
+    RMBlast-based copy recruitment with RepeatMasker-level sensitivity.
+
+    Uses rmblastn (if available) with RepeatMasker's scoring matrices and
+    gap parameters, matching the 'general_search_parameters' recipe:
+      - matrix: 20p##g.matrix (divergence-optimized)
+      - word_size: 9 (sensitive seed matching)
+      - gapopen: 24, gapextend: 6 (conservative for TE detection)
+      - complexity_adjust: on (Shannon entropy weighting)
+      - min_raw_gapped_score: 225 (RepeatMasker minimum)
+
+    Falls back to standard blastn with best-effort parameters if rmblastn
+    or matrices are not available.
+
+    Returns list of hit dicts compatible with rm_hits format.
+    """
+    import subprocess
+    import tempfile
+    import os
+
+    db_path = getattr(config, 'genome_blast_db', '')
+    if not db_path:
+        return []
+
+    # Determine whether to use rmblastn or standard blastn
+    rmblastn_exe = getattr(config, 'rmblastn_exe', 'rmblastn')
+    matrix_dir = getattr(config, 'rmblast_matrix_dir', '')
+    use_rmblast = bool(matrix_dir) and os.path.isfile(rmblastn_exe if os.path.sep in rmblastn_exe
+                                                       else (subprocess.run(['which', rmblastn_exe],
+                                                             capture_output=True, text=True).stdout.strip() or '/nonexistent'))
+
+    query_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as qf:
+            qf.write(f">{seed_seq['id']}\n{seed_seq['sequence']}\n")
+            query_path = qf.name
+
+        if use_rmblast:
+            # --- RMBlast path: RepeatMasker-level sensitivity ---
+            matrix_name = _select_rmblast_matrix(config)
+            if not matrix_name:
+                matrix_name = "20p41g.matrix"  # default
+
+            # RepeatMasker general_search recipe translation:
+            # gap_initValue=-30, ins_gap_extValue=-6
+            # rmblastn gapopen = abs(gap_init - ins_gap_ext) = abs(-30-(-6)) = 24
+            # rmblastn gapextend = abs(ins_gap_ext) = 6
+            # minscore=225, bandwidth=14
+            # xdrop_ungap = minscore*2 = 450
+            # xdrop_gap_final = minscore = 225
+            # xdrop_gap = minscore/2 = 112
+            cmd = [
+                rmblastn_exe,
+                "-query", query_path,
+                "-db", db_path,
+                "-outfmt", "6 sseqid sstart send pident length score qstart qend",
+                "-matrix", matrix_name,
+                "-complexity_adjust",
+                "-gapopen", "24",
+                "-gapextend", "6",
+                "-word_size", "9",
+                "-min_raw_gapped_score", "225",
+                "-xdrop_ungap", "450",
+                "-xdrop_gap_final", "225",
+                "-xdrop_gap", "112",
+                "-dust", "no",
+                "-mask_level", "90",
+                "-num_threads", "1",
+                "-num_alignments", "9999999",
+            ]
+
+            # Set BLASTMAT environment so rmblastn can find matrix files
+            env = os.environ.copy()
+            env['BLASTMAT'] = matrix_dir
+
+            logger.debug(f"{seed_seq['id']}: Using rmblastn with {matrix_name}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+        else:
+            # --- Standard blastn fallback: best-effort parameters ---
+            # Cannot match RM sensitivity without scoring matrices, but use
+            # smaller word size and lower evalue for better sensitivity
+            cmd = [
+                config.blastn_exe,
+                "-query", query_path,
+                "-db", db_path,
+                "-outfmt", "6 sseqid sstart send pident length score qstart qend",
+                "-evalue", "1e-5",
+                "-word_size", "9",
+                "-gapopen", "2",
+                "-gapextend", "1",
+                "-reward", "1",
+                "-penalty", "-1",
+                "-perc_identity", "55",
+                "-max_target_seqs", "500",
+                "-num_threads", "1",
+                "-dust", "yes"
+            ]
+            logger.debug(f"{seed_seq['id']}: Using standard blastn (lower sensitivity)")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if result.returncode != 0:
+            stderr_snippet = result.stderr[:300] if result.stderr else ""
+            logger.debug(f"Search failed for {seed_seq['id']} (rc={result.returncode}): {stderr_snippet}")
+            return []
+
+        hits = []
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            fields = line.split('\t')
+            if len(fields) >= 8:
+                chrom = fields[0]
+                start = int(fields[1])
+                end = int(fields[2])
+                identity = float(fields[3])
+                length = int(fields[4])
+
+                # Ensure start < end
+                if start > end:
+                    start, end = end, start
+
+                hits.append({
+                    'chrom': chrom,
+                    'start': start,
+                    'end': end,
+                    'identity': identity,
+                    'length': length,
+                    'score': int(float(fields[5])),
+                    'source': 'rmblastn' if use_rmblast else 'blastn'
+                })
+
+        if hits:
+            logger.debug(f"{seed_seq['id']}: Found {len(hits)} copies via {'rmblastn' if use_rmblast else 'blastn'}")
+
+        return hits
+
+    except subprocess.TimeoutExpired:
+        logger.debug(f"Search timeout for {seed_seq['id']}")
+        return []
+    except Exception as e:
+        logger.debug(f"Search error for {seed_seq['id']}: {e}")
+        return []
+    finally:
+        if query_path and os.path.exists(query_path):
+            os.unlink(query_path)
 
 
 def expand_and_improve_sequence(seed_seq: Dict, config: PipelineConfig, mafft_threads: int = 1) -> Dict:
     """
     扩展和改进单个候选序列
     目标：提高序列质量和代表性，不是减少数量
-    
+
+    Enhanced with stratified processing paths:
+    - 'fast': High-copy sequences skip MAFFT, only extend boundaries
+    - 'minimal': Very low-copy sequences use original as default consensus
+    - 'standard': Full MAFFT rebuild (existing behavior)
+
     Args:
         seed_seq: 种子序列
         config: 配置对象
         mafft_threads: MAFFT使用的线程数（避免线程爆炸）
     """
-    
+
     result = {
         'source_id': seed_seq['id'],
         'consensus_count': 0,
         'consensus_list': []
     }
-    
+
     try:
         # 1. 获取基因组拷贝（优先使用Phase 1的结果）
         copies = get_genome_copies(seed_seq, config)
-        
+
+        # Get rm_hits for stratification decision
+        rm_hits = seed_seq.get('rm_hits', [])
+
+        # 2. Determine processing path (stratified optimization)
+        processing_path = determine_processing_path(seed_seq, rm_hits, config)
+
+        if processing_path == 'minimal':
+            # Minimal path: very low copy, use default consensus
+            improved = create_default_consensus(seed_seq)
+            if improved:
+                improved['consensus_method'] = 'minimal_path'
+                improved['note'] = 'minimal_path:low_copy'
+                result['consensus_list'].append(improved)
+                result['consensus_count'] = 1
+            return result
+
         if not copies or len(copies) < 2:
             # 拷贝太少，直接使用原始序列
-            if len(copies) == 1:
-                # 只有一个拷贝，使用该拷贝改进原始序列
+            if copies and len(copies) == 1:
                 improved = improve_with_single_copy(seed_seq, copies[0])
             else:
-                # 没有拷贝，使用原始序列
                 improved = create_default_consensus(seed_seq)
-            
+
             if improved:
                 result['consensus_list'].append(improved)
                 result['consensus_count'] = 1
             return result
-        
-        logger.debug(f"{seed_seq['id']}: Found {len(copies)} copies")
-        
+
+        logger.debug(f"{seed_seq['id']}: Found {len(copies)} copies, path={processing_path}")
+
+        if processing_path == 'fast':
+            # Fast path: skip MAFFT, boundary extension only
+            consensus = fast_path_consensus(seed_seq, copies, config)
+            if consensus:
+                result['consensus_list'].append(consensus)
+                result['consensus_count'] = 1
+            else:
+                # Fallback to standard if fast path fails
+                improved = improve_original_sequence(seed_seq, copies)
+                if improved:
+                    result['consensus_list'].append(improved)
+                    result['consensus_count'] = 1
+            return result
+
+        # Standard path: full MAFFT rebuild (existing behavior)
         # 2. 分析拷贝特征
         characteristics = analyze_copy_characteristics(copies)
-        
+
         # 3. 根据特征决定是否需要分亚家族
         if should_split_subfamilies(characteristics, len(copies)):
             # 识别亚家族并分别构建共识
             subfamilies = identify_subfamilies_for_expansion(copies, characteristics)
             logger.debug(f"{seed_seq['id']}: Split into {len(subfamilies)} subfamilies")
-            
+
             for sf_idx, subfamily in enumerate(subfamilies):
                 if len(subfamily) >= 2:  # 至少2个拷贝才构建共识
                     consensus = build_expanded_consensus(
@@ -514,16 +1204,16 @@ def expand_and_improve_sequence(seed_seq: Dict, config: PipelineConfig, mafft_th
             )
             if consensus:
                 result['consensus_list'].append(consensus)
-        
+
         result['consensus_count'] = len(result['consensus_list'])
-        
+
         # 如果没有生成任何共识，至少保留改进的原始序列
         if result['consensus_count'] == 0:
             improved = improve_original_sequence(seed_seq, copies)
             if improved:
                 result['consensus_list'].append(improved)
                 result['consensus_count'] = 1
-        
+
     except Exception as e:
         logger.error(f"Error processing {seed_seq['id']}: {e}")
         # 出错时至少保留原始序列
@@ -531,52 +1221,56 @@ def expand_and_improve_sequence(seed_seq: Dict, config: PipelineConfig, mafft_th
         if fallback:
             result['consensus_list'].append(fallback)
             result['consensus_count'] = 1
-    
+
     return result
 
 
 def get_genome_copies(seed_seq: Dict, config: PipelineConfig) -> List[Dict]:
     """
     获取基因组拷贝，优先使用Phase 1的结果
+
+    Priority: Phase 1 rm_hits > BLASTN > RepeatMasker fallback
     """
     from utils.sequence_utils import extract_sequence_from_genome, detect_tsd
-    
+
     # 优先使用Phase 1提供的RepeatMasker结果
     if 'rm_hits' in seed_seq and seed_seq['rm_hits']:
         rm_hits = seed_seq['rm_hits']
         logger.debug(f"{seed_seq['id']}: Using {len(rm_hits)} hits from Phase 1")
     else:
-        # Phase 1没有结果，需要重新运行RepeatMasker
-        logger.debug(f"{seed_seq['id']}: Running RepeatMasker (no Phase 1 results)")
-        from utils.alignment_utils import run_repeatmasker_single
-        
-        rm_params = {
-            's': True,  # 敏感模式
-            'no_is': True,
-            'nolow': True,
-            'div': 25,  # 允许25%的分化
-            'cutoff': 200,
-            'pa': 1
-        }
-        rm_hits = run_repeatmasker_single(seed_seq, config.genome_file, params=rm_params, config=config)
-    
+        # Try BLASTN first (faster than RepeatMasker)
+        rm_hits = []
+        blast_db = getattr(config, 'genome_blast_db', '')
+        if blast_db:
+            logger.debug(f"{seed_seq['id']}: Trying BLASTN copy recruitment")
+            rm_hits = get_genome_copies_blastn(seed_seq, config)
+
+        if not rm_hits:
+            # Fall back to RepeatMasker
+            logger.debug(f"{seed_seq['id']}: Running RepeatMasker (no Phase 1 or BLASTN results)")
+            from utils.alignment_utils import run_repeatmasker_single
+
+            rm_params = {
+                's': True,  # 敏感模式
+                'no_is': True,
+                'nolow': True,
+                'div': 25,  # 允许25%的分化
+                'cutoff': 200,
+                'pa': 1
+            }
+            rm_hits = run_repeatmasker_single(seed_seq, config.genome_file, params=rm_params, config=config)
+
     if not rm_hits:
         return []
-    
-    # 应用优化的二轮采样策略：使用外部工具批量提取
-    # 这样避免了提取所有45,081个序列的巨大开销，并且大幅提升提取速度
-    try:
-        from two_stage_sampling_optimized import apply_optimized_two_stage_sampling
-        logger.info(f"Using optimized batch extraction for {len(rm_hits)} RM hits of {seed_seq['id']}")
-        copies = apply_optimized_two_stage_sampling(rm_hits, seed_seq, config)
-    except ImportError:
-        # 降级到原始版本
-        from two_stage_sampling import apply_two_stage_sampling
-        logger.info(f"Falling back to standard extraction for {len(rm_hits)} RM hits of {seed_seq['id']}")
-        copies = apply_two_stage_sampling(rm_hits, seed_seq, config)
-    
+
+    # Two-stage sampling: RM-based coarse sampling + sequence-based fine sampling
+    # extract_sequence_from_genome now uses indexed access (pysam/samtools) for O(1) per call
+    from two_stage_sampling import apply_two_stage_sampling
+    logger.info(f"Applying two-stage sampling for {len(rm_hits)} RM hits of {seed_seq['id']}")
+    copies = apply_two_stage_sampling(rm_hits, seed_seq, config)
+
     logger.info(f"Selected {len(copies)} representative copies after two-stage sampling")
-    
+
     return copies
 
 
@@ -629,76 +1323,145 @@ def should_split_subfamilies(characteristics: Dict, copy_number: int) -> bool:
     return False
 
 
+def _compute_pairwise_identity(seq_a: str, seq_b: str) -> float:
+    """Compute pairwise sequence identity between two sequences.
+
+    Uses a fast k-mer Jaccard estimate for speed.  For short sequences
+    (<200bp) falls back to direct character comparison after simple
+    alignment anchoring.
+
+    Returns identity as fraction 0-1.
+    """
+    if not seq_a or not seq_b:
+        return 0.0
+
+    a = seq_a.upper()
+    b = seq_b.upper()
+
+    # For very short sequences, use direct comparison
+    min_len = min(len(a), len(b))
+    max_len = max(len(a), len(b))
+
+    if min_len < 200:
+        # Align shorter to longer using sliding window, pick best match
+        if len(a) > len(b):
+            a, b = b, a  # a is shorter
+        best_matches = 0
+        scan_range = len(b) - len(a) + 1
+        step = max(1, scan_range // 100)
+        for offset in range(0, scan_range, step):
+            matches = sum(1 for i in range(len(a)) if a[i] == b[offset + i])
+            if matches > best_matches:
+                best_matches = matches
+        return best_matches / len(a) if len(a) > 0 else 0.0
+
+    # K-mer Jaccard for longer sequences (k=8)
+    k = 8
+    kmers_a = set()
+    kmers_b = set()
+    for i in range(len(a) - k + 1):
+        kmer = a[i:i + k]
+        if 'N' not in kmer:
+            kmers_a.add(kmer)
+    for i in range(len(b) - k + 1):
+        kmer = b[i:i + k]
+        if 'N' not in kmer:
+            kmers_b.add(kmer)
+
+    if not kmers_a or not kmers_b:
+        return 0.0
+
+    intersection = len(kmers_a & kmers_b)
+    union = len(kmers_a | kmers_b)
+    jaccard = intersection / union if union > 0 else 0.0
+
+    # Convert Jaccard similarity to approximate sequence identity
+    # Using Mash-like formula: identity ≈ 1 + (1/k) * ln(2*J / (1+J))
+    import math
+    if jaccard > 0:
+        identity = 1.0 + (1.0 / k) * math.log(2.0 * jaccard / (1.0 + jaccard))
+        identity = max(0.0, min(1.0, identity))
+    else:
+        identity = 0.0
+
+    return identity
+
+
 def identify_subfamilies_for_expansion(copies: List[Dict], characteristics: Dict) -> List[List[Dict]]:
     """
-    识别亚家族，目的是发现不同的TE变体
+    Identify subfamilies using actual pairwise sequence identity.
+
+    Previous version used RM-identity-to-seed as a proxy, which
+    conflates distinct subfamilies with similar divergence from the
+    seed. Now computes real pairwise distances between copies.
     """
-    from utils.sequence_utils import calculate_sequence_identity
-    
     if len(copies) < 5:
         return [copies]
-    
-    # 构建简化的距离矩阵（主要基于identity和长度）
+
     n = len(copies)
+
+    # Build pairwise distance matrix using actual sequence identity
     distance_matrix = np.zeros((n, n))
-    
+
     for i in range(n):
-        for j in range(i+1, n):
-            # 序列相似度距离
-            identity = copies[i].get('identity', 100) / 100.0
-            identity_j = copies[j].get('identity', 100) / 100.0
-            avg_identity = (identity + identity_j) / 2
-            seq_distance = 1 - avg_identity
-            
-            # 长度差异距离
+        seq_i = copies[i].get('sequence', '')
+        for j in range(i + 1, n):
+            seq_j = copies[j].get('sequence', '')
+
+            # Compute actual pairwise identity
+            pairwise_id = _compute_pairwise_identity(seq_i, seq_j)
+            seq_distance = 1.0 - pairwise_id
+
+            # Length difference as secondary signal (weight 20%)
             len_i, len_j = copies[i]['length'], copies[j]['length']
             if max(len_i, len_j) > 0:
-                length_ratio = min(len_i, len_j) / max(len_i, len_j)
-                length_distance = 1 - length_ratio
+                length_distance = 1.0 - min(len_i, len_j) / max(len_i, len_j)
             else:
                 length_distance = 1.0
-            
-            # 综合距离（简单加权）
-            total_distance = 0.7 * seq_distance + 0.3 * length_distance
+
+            total_distance = 0.8 * seq_distance + 0.2 * length_distance
             distance_matrix[i, j] = total_distance
             distance_matrix[j, i] = total_distance
-    
-    # 层次聚类
+
+    logger.debug(f"Built pairwise distance matrix for {n} copies "
+                 f"(mean dist={np.mean(distance_matrix[np.triu_indices(n, k=1)]):.3f})")
+
+    # Hierarchical clustering
     from scipy.cluster.hierarchy import linkage, fcluster
     from scipy.spatial.distance import squareform
-    
+
     condensed_distances = squareform(distance_matrix)
     linkage_matrix = linkage(condensed_distances, method='average')
-    
-    # 动态阈值：基于距离分布
+
+    # Dynamic threshold based on distance distribution
     distances = distance_matrix[np.triu_indices_from(distance_matrix, k=1)]
     if len(distances) > 0:
-        # 使用距离的第75百分位作为阈值
         threshold = np.percentile(distances, 75)
-        threshold = max(0.15, min(0.4, threshold))  # 限制在合理范围
+        threshold = max(0.15, min(0.4, threshold))
     else:
         threshold = 0.25
-    
-    # 聚类
+
     clusters = fcluster(linkage_matrix, threshold, criterion='distance')
-    
-    # 组织成亚家族
+
+    # Organize into subfamilies
     subfamilies = defaultdict(list)
     for i, cluster_id in enumerate(clusters):
         subfamilies[cluster_id].append(copies[i])
-    
-    # 过滤太小的亚家族（合并到最近的）
+
+    # Merge small subfamilies (<2 copies) into nearest cluster
     final_subfamilies = []
     for subfamily in subfamilies.values():
         if len(subfamily) >= 2:
             final_subfamilies.append(subfamily)
         else:
-            # 单个拷贝，尝试合并到最近的亚家族
             if final_subfamilies:
                 final_subfamilies[0].extend(subfamily)
             else:
                 final_subfamilies.append(subfamily)
-    
+
+    logger.debug(f"Identified {len(final_subfamilies)} subfamilies "
+                 f"(sizes: {[len(sf) for sf in final_subfamilies]})")
+
     return final_subfamilies
 
 
@@ -1027,6 +1790,90 @@ def calculate_consensus_quality(consensus: Dict, copies: List[Dict]) -> float:
     return final_score
 
 
+def _has_te_structural_features_standalone(sequence: str) -> bool:
+    """
+    Standalone function to check for TE structural features.
+    Used in Phase 3 for quality scoring of single/low-copy sequences.
+
+    Features checked:
+    1. Terminal Inverted Repeats (TIR)
+    2. Long Terminal Repeats (LTR)
+    3. Poly-A tail
+    """
+    if not sequence or len(sequence) < 50:
+        return False
+
+    sequence = sequence.upper()
+    seq_len = len(sequence)
+
+    # 1. Check for TIR (10-40bp, allowing 2 mismatches)
+    for tir_len in range(10, min(41, seq_len // 4)):
+        left_tir = sequence[:tir_len]
+        right_tir = sequence[-tir_len:]
+        complement = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G', 'N': 'N'}
+        right_tir_rc = ''.join(complement.get(b, 'N') for b in reversed(right_tir))
+        mismatches = sum(1 for a, b in zip(left_tir, right_tir_rc) if a != b)
+        if mismatches <= 2:
+            return True
+
+    # 2. Check for LTR (80-500bp, >75% identity)
+    if seq_len >= 260:  # min 80*2 + 100
+        for ltr_len in range(80, min(501, seq_len // 3)):
+            left_ltr = sequence[:ltr_len]
+            right_ltr = sequence[-ltr_len:]
+            matches = sum(1 for a, b in zip(left_ltr, right_ltr) if a == b)
+            if matches / ltr_len >= 0.75:
+                return True
+
+    # 3. Check for poly-A tail
+    tail_region = sequence[-50:] if seq_len >= 50 else sequence
+    if 'AAAAAA' in tail_region:
+        return True
+
+    # 4. Check for TG...CA pattern (LTR signature)
+    if sequence[:2] == 'TG' and sequence[-2:] == 'CA':
+        return True
+
+    return False
+
+
+def _calculate_sequence_complexity_simple(sequence: str) -> float:
+    """
+    Simple sequence complexity calculation using Shannon entropy.
+    Returns value between 0 (simple) and 1 (complex).
+    """
+    if not sequence or len(sequence) < 10:
+        return 0.0
+
+    sequence = sequence.upper()
+
+    # Calculate Shannon entropy
+    from collections import Counter
+    import math
+
+    base_counts = Counter(sequence)
+    total = sum(base_counts.values())
+
+    entropy = 0.0
+    for count in base_counts.values():
+        if count > 0:
+            freq = count / total
+            entropy -= freq * math.log2(freq)
+
+    # Normalize to 0-1 (max entropy for 4 bases is 2.0)
+    normalized_entropy = entropy / 2.0
+
+    # Also check for simple repeats
+    simple_repeat_ratio = 0.0
+    for pattern in ['AAAA', 'TTTT', 'GGGG', 'CCCC', 'ATAT', 'TATA', 'GCGC', 'CGCG']:
+        simple_repeat_ratio += sequence.count(pattern) * len(pattern) / len(sequence)
+
+    # Combine entropy and simple repeat penalty
+    complexity = normalized_entropy * (1.0 - min(simple_repeat_ratio, 0.5))
+
+    return min(1.0, max(0.0, complexity))
+
+
 def _calculate_sequence_complexity_score(sequence: str) -> float:
     """计算序列复杂度分数"""
     if not sequence or len(sequence) < 10:
@@ -1185,41 +2032,50 @@ def _evaluate_boundary_quality(sequence: str) -> float:
 
 
 def _validate_consensus_quality(consensus: Dict) -> Dict[str, bool]:
-    """多层次的质量验证"""
+    """Multi-level quality validation - relaxed for better sensitivity
+
+    Key changes:
+    1. Relaxed entropy threshold (1.0 -> 0.8)
+    2. Relaxed GC content range (0.15-0.85 -> 0.10-0.90)
+    3. Relaxed N content threshold (0.1 -> 0.15)
+    4. Relaxed ambiguity threshold (0.15 -> 0.20)
+    """
     validations = {}
     sequence = consensus.get('sequence', '')
-    
+
     if not sequence:
         return {'sequence_exists': False}
-    
-    # 1. 长度验证
+
     seq_len = len(sequence)
+
+    # 1. Length validation (unchanged)
     validations['length_valid'] = 50 <= seq_len <= 20000
-    
-    # 2. 复杂度验证
+
+    # 2. Complexity validation - relaxed tandem ratio threshold
     tandem_ratio = _calculate_tandem_repeat_ratio(sequence)
-    validations['complexity_valid'] = tandem_ratio < 0.5
-    
-    # 3. GC含量验证
+    validations['complexity_valid'] = tandem_ratio < 0.6  # was 0.5
+
+    # 3. GC content validation - relaxed range
     gc_content = _calculate_gc_content(sequence)
-    validations['gc_valid'] = 0.15 < gc_content < 0.85
-    
-    # 4. N含量验证
+    validations['gc_valid'] = 0.10 < gc_content < 0.90  # was 0.15-0.85
+
+    # 4. N content validation - relaxed threshold
     n_ratio = sequence.upper().count('N') / len(sequence)
-    validations['n_content_valid'] = n_ratio < 0.1
-    
-    # 5. TSD验证（如果声称有TSD）
+    validations['n_content_valid'] = n_ratio < 0.15  # was 0.1
+
+    # 5. TSD validation (if claimed) - unchanged
     if consensus.get('tsd'):
         validations['tsd_valid'] = _verify_tsd_pattern(consensus['tsd'])
-    
-    # 6. 模糊碱基验证
+
+    # 6. Ambiguous base validation - relaxed threshold
     ambiguous_ratio = _calculate_ambiguous_base_ratio(sequence)
-    validations['ambiguity_valid'] = ambiguous_ratio < 0.15
-    
-    # 7. 最小信息熵验证
+    validations['ambiguity_valid'] = ambiguous_ratio < 0.20  # was 0.15
+
+    # 7. Minimum entropy validation - relaxed threshold
+    # Note: DNA entropy max is ~2.0, threshold 0.8 allows more diversity
     entropy = _calculate_sequence_entropy(sequence.upper())
-    validations['entropy_valid'] = entropy > 1.0  # 最小熵阈值
-    
+    validations['entropy_valid'] = entropy > 0.8  # was 1.0
+
     return validations
 
 
@@ -1466,33 +2322,82 @@ def _select_valuable_low_sequences(low_sequences: List[Dict]) -> List[Dict]:
 
 
 def improve_with_single_copy(seed_seq: Dict, copy: Dict) -> Dict:
-    """使用单个拷贝改进原始序列"""
-    # 优化：优先选择更长的序列
+    """
+    Improve original sequence using single copy.
+
+    Key change: Single-copy sequences are no longer penalized with fixed low score.
+    Rationale: RepeatScout already filtered for copy number (≥10 k-mer occurrences).
+    A single RepeatMasker hit may indicate:
+    - Ancient TE with divergent copies not detected by RM
+    - Young TE just starting to amplify
+    - TE with structural features that validate it
+    """
+    # Select best sequence based on length and quality
     if copy['length'] > len(seed_seq['sequence']):
-        # 拷贝更长，使用拷贝
         sequence = copy['sequence']
         logger.debug(f"Using longer copy: {copy['length']}bp vs original {len(seed_seq['sequence'])}bp")
     elif copy.get('identity', 0) > 80:
-        # 拷贝质量更高
         sequence = copy['sequence']
     else:
-        # 保留原始序列
         sequence = seed_seq['sequence']
-    
-    # 检查序列长度阈值
+
+    # Check minimum length threshold
     if len(sequence) < 50:
         logger.debug(f"Filtered out single-copy improved sequence for {seed_seq['id']}: too short ({len(sequence)}bp < 50bp)")
         return None
-    
+
+    # Dynamic quality scoring for single-copy sequences
+    # Base score starts at 0.35 (not 0.3 death sentence)
+    base_score = 0.35
+    score_reasons = []
+
+    seq_length = len(sequence)
+
+    # Bonus for length - longer sequences more likely to be real TEs
+    if seq_length >= 2000:
+        base_score += 0.2
+        score_reasons.append("very_long")
+    elif seq_length >= 1000:
+        base_score += 0.15
+        score_reasons.append("long")
+    elif seq_length >= 500:
+        base_score += 0.1
+        score_reasons.append("medium_length")
+
+    # Bonus for structural features
+    if _has_te_structural_features_standalone(sequence):
+        base_score += 0.15
+        score_reasons.append("structural_features")
+
+    # Bonus for sequence complexity (non-simple repeat)
+    complexity = _calculate_sequence_complexity_simple(sequence)
+    if complexity >= 0.7:
+        base_score += 0.1
+        score_reasons.append("high_complexity")
+    elif complexity >= 0.5:
+        base_score += 0.05
+        score_reasons.append("medium_complexity")
+
+    # Bonus if quality class is good
+    quality_class = seed_seq.get('quality_class', 'B')
+    if quality_class == 'A':
+        base_score += 0.1
+        score_reasons.append("A_class")
+    elif quality_class == 'C_rescued':
+        base_score += 0.05
+        score_reasons.append("rescued")
+
+    final_score = min(0.75, base_score)  # Cap at 0.75 for single copy
+
     return {
         'id': f"{seed_seq['id']}_improved",
         'sequence': sequence,
         'source_id': seed_seq['id'],
-        'quality_class': seed_seq.get('quality_class', 'A'),
+        'quality_class': quality_class,
         'copy_number': 1,
         'avg_identity': copy.get('identity', 0),
-        'quality_score': 0.3,  # 低质量分数因为只有一个拷贝
-        'note': 'single_copy_improvement'
+        'quality_score': final_score,
+        'note': f'single_copy_improvement:{",".join(score_reasons)}'
     }
 
 
@@ -1545,507 +2450,26 @@ def create_default_consensus(seed_seq: Dict) -> Dict:
     }
 
 
-# Phase 3 特有方法 - 添加在文件末尾
-
-def _categorize_input_sequences(self, sequences: List[Dict]) -> Dict[str, List[Dict]]:
-    """对输入序列进行分类"""
-    categories = {
-        'non_chimeric': [],
-        'chimera_segments': [],
-        'unsplit_chimeras': [],
-        'failed_sequences': []
-    }
-    
-    for seq in sequences:
-        source = seq.get('source', 'unknown')
-        
-        if source == 'non_chimeric':
-            categories['non_chimeric'].append(seq)
-        elif source == 'chimera_split':
-            if seq.get('split_from'):
-                # 这是一个拆分片段
-                categories['chimera_segments'].append(seq)
-            else:
-                # 这是一个未拆分的嵌合体
-                categories['unsplit_chimeras'].append(seq)
-        elif source == 'unsplit_chimera':
-            categories['unsplit_chimeras'].append(seq)
-        elif source == 'processing_failed':
-            categories['failed_sequences'].append(seq)
-        else:
-            # 其他来源，默认作为普通序列处理
-            categories['non_chimeric'].append(seq)
-    
-    return categories
-
-
-def _build_consensus_parallel(self, sequences: List[Dict], stats: Dict) -> List[Dict]:
-    """并行构建共识序列"""
-    all_consensus = []
-    
-    if self.max_workers <= 1 or len(sequences) <= 1:
-        logger.info("Using sequential consensus building")
-        all_consensus = self._build_consensus_sequential(sequences, stats)
-    else:
-        logger.info(f"Using parallel consensus building with {self.max_workers} workers")
-        # 复用原有的并行处理逻辑
-        all_consensus = self._process_sequences_dynamic(sequences, stats)
-    
-    return all_consensus
-
-
-def _build_consensus_sequential(self, sequences: List[Dict], stats: Dict) -> List[Dict]:
-    """串行构建共识序列"""
-    all_consensus = []
-    
-    for i, seq in enumerate(sequences, 1):
-        logger.debug(f"Processing sequence {i}/{len(sequences)}: {seq['id']}")
-        
-        consensus_result = self._process_single_sequence_for_consensus(seq)
-        
-        if consensus_result:
-            all_consensus.extend(consensus_result['consensus_sequences'])
-            stats['processed_sequences'] += 1
-            stats['single_consensus'] += len([c for c in consensus_result['consensus_sequences'] 
-                                            if c.get('subfamily_count', 1) == 1])
-            stats['multiple_consensus'] += len([c for c in consensus_result['consensus_sequences'] 
-                                              if c.get('subfamily_count', 1) > 1])
-        else:
-            stats['failed_sequences'] += 1
-        
-        # 定期报告进度
-        if i % 50 == 0 or i == len(sequences):
-            logger.info(f"Progress: {i}/{len(sequences)} sequences processed, "
-                       f"{len(all_consensus)} consensus generated")
-    
-    stats['total_consensus'] = len(all_consensus)
-    return all_consensus
-
-
-def _process_single_sequence_for_consensus(self, sequence: Dict) -> Optional[Dict]:
-    """处理单个序列进行共识构建"""
-    try:
-        seq_id = sequence.get('id', 'unknown')
-        seq_data = sequence.get('sequence', '')
-        
-        if not seq_data:
-            logger.warning(f"Empty sequence for {seq_id}")
-            return None
-        
-        # 使用扩展和改进方法（复用现有实现）
-        result = expand_and_improve_sequence(sequence, self.config, self.mafft_threads)
-        
-        if result and result['consensus_count'] > 0:
-            return {
-                'consensus_sequences': result['consensus_list'],
-                'method': f"expanded_{result['consensus_count']}_consensus"
-            }
-        else:
-            # 回退到原序列
-            logger.debug(f"Expansion failed for {seq_id}, using original sequence")
-            consensus = self._create_single_consensus(sequence)
-            return {
-                'consensus_sequences': [consensus],
-                'method': 'fallback_single'
-            }
-        
-    except Exception as e:
-        logger.error(f"Error processing sequence {sequence.get('id', 'unknown')} for consensus: {e}")
-        return None
-
-
-def _create_single_consensus(self, sequence: Dict) -> Dict:
-    """创建单一共识序列"""
-    consensus = {
-        'id': f"{sequence['id']}_consensus",
-        'sequence': sequence['sequence'],
-        'subfamily_id': 1,
-        'subfamily_count': 1,
-        'avg_identity': 100.0,
-        'avg_length': len(sequence['sequence']),
-        'source_sequence': sequence['id'],
-        'consensus_method': 'single_sequence',
-        'quality_score': self._calculate_consensus_quality_score(100.0, 1)
-    }
-    
-    return consensus
-
-
-def _calculate_consensus_quality_score(self, avg_identity: float, copy_count: int) -> float:
-    """计算共识序列质量分数"""
-    # 基于平均相似性和拷贝数的综合评分
-    identity_score = avg_identity / 100.0
-    copy_score = min(1.0, np.log1p(copy_count) / np.log1p(10))  # 10个拷贝为满分
-    
-    # 加权平均
-    quality_score = identity_score * 0.7 + copy_score * 0.3
-    
-    return quality_score
-
-
-def _filter_and_grade_consensus(self, consensus_list: List[Dict], stats: Dict) -> List[Dict]:
-    """过滤和分级共识序列 - 增强版本
-    
-    改进：
-    1. 增加质量验证层
-    2. 实现动态阈值系统
-    3. 严格的拒绝标准
-    """
-    if not consensus_list:
-        return []
-    
-    # 首先应用质量验证
-    validated_consensus = []
-    for consensus in consensus_list:
-        # 基本长度过滤
-        seq_length = len(consensus.get('sequence', ''))
-        if seq_length < self.config.min_length:
-            continue
-        
-        # 应用生物学验证
-        validations = _validate_consensus_quality(consensus)
-        consensus['validations'] = validations
-        consensus['validation_score'] = sum(validations.values()) / len(validations) if validations else 0
-        
-        # 计算综合质量分数（基础质量 + 验证分数）
-        base_quality = consensus.get('quality_score', 0)
-        validation_score = consensus['validation_score']
-        
-        # 综合评分：基础质量60% + 验证分数40%
-        final_score = base_quality * 0.6 + validation_score * 0.4
-        consensus['final_quality_score'] = final_score
-        
-        validated_consensus.append(consensus)
-    
-    if not validated_consensus:
-        return []
-    
-    # 计算动态阈值
-    quality_scores = [c.get('final_quality_score', 0) for c in validated_consensus]
-    thresholds = _calculate_adaptive_thresholds(quality_scores)
-    
-    logger.info(f"Dynamic quality thresholds: High={thresholds['high']:.3f}, "
-               f"Medium={thresholds['medium']:.3f}, Low={thresholds['low']:.3f}")
-    
-    # 应用动态分级和过滤
-    filtered_consensus = []
-    rejected_count = 0
-    
-    for consensus in validated_consensus:
-        final_score = consensus.get('final_quality_score', 0)
-        validation_score = consensus.get('validation_score', 0)
-        
-        # 严格的拒绝标准
-        if validation_score < 0.3 or final_score < thresholds['low']:
-            rejected_count += 1
-            logger.debug(f"Rejected {consensus['id']}: final_score={final_score:.3f}, "
-                        f"validation={validation_score:.3f}")
-            continue
-        
-        # 动态质量分级
-        if final_score >= thresholds['high']:
-            consensus['quality_grade'] = 'high'
-            stats['high_quality_consensus'] += 1
-        elif final_score >= thresholds['medium']:
-            consensus['quality_grade'] = 'medium'
-            stats['medium_quality_consensus'] += 1
-        else:
-            consensus['quality_grade'] = 'low'
-            stats['low_quality_consensus'] += 1
-        
-        filtered_consensus.append(consensus)
-    
-    # 记录拒绝统计
-    stats['rejected_consensus'] = rejected_count
-    
-    # 按最终质量分数排序
-    filtered_consensus.sort(key=lambda x: x.get('final_quality_score', 0), reverse=True)
-    
-    logger.info(f"Enhanced filtering and grading complete:")
-    logger.info(f"  - Validated: {len(validated_consensus)} sequences")
-    logger.info(f"  - Passed: {len(filtered_consensus)} sequences")
-    logger.info(f"  - Rejected: {rejected_count} sequences")
-    logger.info(f"  - Quality distribution: High={stats.get('high_quality_consensus', 0)}, "
-               f"Medium={stats.get('medium_quality_consensus', 0)}, "
-               f"Low={stats.get('low_quality_consensus', 0)}")
-    
-    return filtered_consensus
-
-
-def _deduplicate_consensus_sequences(self, consensus_sequences: List[Dict], stats: Dict) -> List[Dict]:
-    """去除重复的共识序列"""
-    if len(consensus_sequences) <= 1:
-        return consensus_sequences
-    
-    logger.info(f"Deduplicating {len(consensus_sequences)} consensus sequences")
-    
-    # 按质量分数排序（高到低）
-    sorted_consensus = sorted(consensus_sequences, 
-                            key=lambda x: x.get('quality_score', 0), 
-                            reverse=True)
-    
-    deduplicated = []
-    processed_sequences = set()
-    
-    for consensus in sorted_consensus:
-        seq_id = consensus['id']
-        sequence = consensus['sequence']
-        
-        # 检查是否与已有序列重复
-        is_duplicate = False
-        
-        for existing in deduplicated:
-            similarity = self._calculate_sequence_similarity(
-                sequence, existing['sequence']
-            )
-            
-            # 如果相似度过高，认为是重复
-            if similarity > 0.95:  # 95%相似度阈值
-                is_duplicate = True
-                logger.debug(f"Removing duplicate: {seq_id} (similarity {similarity:.3f} with {existing['id']})")
-                break
-        
-        if not is_duplicate:
-            deduplicated.append(consensus)
-            processed_sequences.add(seq_id)
-    
-    removed_count = len(consensus_sequences) - len(deduplicated)
-    stats['deduplicated_sequences'] = removed_count
-    
-    logger.info(f"Deduplication complete: removed {removed_count} duplicate sequences, "
-               f"kept {len(deduplicated)} unique sequences")
-    
-    return deduplicated
-
-
-def _calculate_sequence_similarity(self, seq1: str, seq2: str) -> float:
-    """计算序列相似度"""
-    if not seq1 or not seq2:
-        return 0.0
-    
-    # 使用较短序列的长度
-    min_len = min(len(seq1), len(seq2))
-    max_len = max(len(seq1), len(seq2))
-    
-    # 长度差异太大，不认为是重复
-    if max_len / min_len > 1.2:
-        return 0.0
-    
-    # 计算对齐的相似度
-    matches = sum(1 for i in range(min_len) if seq1[i] == seq2[i])
-    
-    # 考虑长度差异的惩罚
-    length_penalty = min_len / max_len
-    
-    return (matches / min_len) * length_penalty
-
-
-def _generate_phase4_compatible_output(self, consensus_sequences: List[Dict], 
-                                      stats: Dict, sequence_categories: Dict) -> Dict[str, Any]:
-    """生成Phase 4兼容输出格式（修改版）
-    
-    修改策略：
-    1. 保留所有高质量序列
-    2. 保留所有中等质量序列（不再使用智能选择）
-    3. 丢弃所有低质量序列（不再选择有价值序列）
-    4. Analysis library只包含高质量和中等质量序列
-    """
-    
-    # 按质量分级分离序列
-    high_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'high']
-    medium_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'medium']
-    low_quality = [seq for seq in consensus_sequences if seq.get('quality_grade') == 'low']
-    
-    logger.info(f"Quality distribution for modified selection strategy:")
-    logger.info(f"  High: {len(high_quality)}, Medium: {len(medium_quality)}, Low: {len(low_quality)}")
-    
-    # 修改：全部保留高质量和中等质量序列，丢弃低质量序列
-    masking_library = high_quality.copy()  # 包含所有高质量序列
-    
-    # 全部保留medium序列（不再使用智能选择）
-    if medium_quality:
-        selected_medium = medium_quality  # 直接使用所有中等质量序列
-        masking_library.extend(selected_medium)
-        logger.info(f"Keeping all {len(selected_medium)} medium quality sequences")
-    else:
-        selected_medium = []
-    
-    # 丢弃所有低质量序列（不再选择有价值的低质量序列）
-    valuable_low = []
-    if low_quality:
-        logger.info(f"Discarding {len(low_quality)} low quality sequences")
-    
-    # Analysis library只包含高质量和中等质量序列
-    analysis_library = high_quality + medium_quality
-    
-    # 保存增强的输出文件
-    self._save_enhanced_analysis_library_fasta(analysis_library, stats)
-    
-    result = {
-        'masking_library': masking_library,
-        'analysis_library': analysis_library,
-        'statistics': stats,
-        'phase3_complete': True,
-        'sequence_categories': sequence_categories,
-        'quality_distribution': {
-            'high': len(high_quality),
-            'medium': len(medium_quality),
-            'low': len(low_quality),
-            'masking_selected': {
-                'high': len(high_quality),
-                'medium': len(selected_medium),
-                'low': len(valuable_low)
-            }
-        },
-        'enhancement_metrics': {
-            'adaptive_thresholds_used': True,
-            'intelligent_medium_selection': False,  # 不再使用智能选择
-            'all_medium_retained': len(selected_medium) > 0,  # 全部保留中等质量序列
-            'valuable_low_selection': False,  # 不再选择低质量序列
-            'low_quality_discarded': len(low_quality) > 0,  # 丢弃低质量序列
-            'biological_validation': True,
-            'quality_components_tracked': True
-        }
-    }
-    
-    logger.info(f"Generated Phase 4 output (modified strategy):")
-    logger.info(f"  - Masking library: {len(masking_library)} sequences")
-    logger.info(f"    (High: {len(high_quality)}, Medium: {len(selected_medium)} [ALL RETAINED], Low: {len(valuable_low)} [NONE])")
-    logger.info(f"  - Analysis library: {len(analysis_library)} sequences (High + Medium only)")
-    logger.info(f"  - Discarded: {len(low_quality)} low quality sequences")
-    logger.info(f"  - Strategy: Keep all high+medium quality, discard all low quality")
-    
-    return result
-
-
-def _save_enhanced_analysis_library_fasta(self, analysis_library: List[Dict], stats: Dict):
-    """保存Analysis library为FASTA文件（修改版：仅包含高质量和中等质量序列）"""
-    from pathlib import Path
-    
-    output_dir = Path(self.config.output_dir)
-    
-    # 保存analysis library
-    analysis_file = output_dir / "phase3_analysis_library.fa"
-    stats_file = output_dir / "phase3_quality_statistics.txt"
-    
-    try:
-        with open(analysis_file, 'w') as f:
-            for seq in analysis_library:
-                seq_id = seq.get('id', 'unknown')
-                sequence = seq.get('sequence', '')
-                
-                # 构建详细的header信息
-                header_parts = [
-                    f">{seq_id}",
-                    f"grade={seq.get('quality_grade', 'unknown')}",
-                    f"final_score={seq.get('final_quality_score', 0):.3f}",
-                    f"base_score={seq.get('quality_score', 0):.3f}",
-                    f"validation={seq.get('validation_score', 0):.3f}",
-                    f"copies={seq.get('copy_number', 0)}",
-                    f"length={len(sequence)}"
-                ]
-                
-                if seq.get('tsd'):
-                    header_parts.append(f"tsd={seq['tsd']}")
-                
-                header = " ".join(header_parts)
-                f.write(f"{header}\n{sequence}\n")
-        
-        logger.info(f"Saved analysis library (high+medium quality) to: {analysis_file}")
-        
-        # 保存详细统计信息
-        with open(stats_file, 'w') as f:
-            f.write("Phase 3 Quality Statistics (Modified Strategy)\n")
-            f.write("=" * 50 + "\n\n")
-            
-            f.write("Overall Statistics:\n")
-            for key, value in stats.items():
-                f.write(f"  {key}: {value}\n")
-            
-            f.write("\nQuality Component Analysis:\n")
-            # 统计各质量组件的分布
-            if analysis_library:
-                component_stats = defaultdict(list)
-                for seq in analysis_library:
-                    components = seq.get('quality_components', {})
-                    for comp_name, comp_value in components.items():
-                        component_stats[comp_name].append(comp_value)
-                
-                for comp_name, values in component_stats.items():
-                    if values:
-                        f.write(f"  {comp_name}:\n")
-                        f.write(f"    Mean: {np.mean(values):.3f}\n")
-                        f.write(f"    Std: {np.std(values):.3f}\n")
-                        f.write(f"    Min: {np.min(values):.3f}\n")
-                        f.write(f"    Max: {np.max(values):.3f}\n")
-            
-            f.write("\nValidation Results Summary:\n")
-            validation_counts = defaultdict(int)
-            for seq in analysis_library:
-                validations = seq.get('validations', {})
-                for val_name, val_result in validations.items():
-                    if val_result:
-                        validation_counts[val_name] += 1
-            
-            total_seqs = len(analysis_library)
-            for val_name, count in validation_counts.items():
-                percentage = (count / total_seqs * 100) if total_seqs > 0 else 0
-                f.write(f"  {val_name}: {count}/{total_seqs} ({percentage:.1f}%)\n")
-        
-        logger.info(f"Saved enhanced quality statistics to: {stats_file}")
-        logger.info(f"  - Total sequences: {len(analysis_library)}")
-        
-        # 按质量分级统计
-        quality_counts = {}
-        for seq in analysis_library:
-            grade = seq.get('quality_grade', 'unknown')
-            quality_counts[grade] = quality_counts.get(grade, 0) + 1
-        
-        logger.info(f"  - Quality distribution: {quality_counts}")
-        
-    except Exception as e:
-        logger.error(f"Failed to save enhanced analysis files: {e}")
-
-
-def _save_analysis_library_fasta(self, analysis_library: List[Dict]):
-    """保存 Analysis library 为 FASTA 文件 - 保持向后兼容"""
-    # 调用增强版本
-    self._save_enhanced_analysis_library_fasta(analysis_library, {})
-
-
-# 为ConsensusBuilder类添加这些方法 - 在类定义后绑定
-# _extract_sequences_from_phase2 already defined inside the class
-ConsensusBuilder._categorize_input_sequences = _categorize_input_sequences
-ConsensusBuilder._build_consensus_parallel = _build_consensus_parallel
-ConsensusBuilder._build_consensus_sequential = _build_consensus_sequential
-ConsensusBuilder._process_single_sequence_for_consensus = _process_single_sequence_for_consensus
-ConsensusBuilder._create_single_consensus = _create_single_consensus
-ConsensusBuilder._calculate_consensus_quality_score = _calculate_consensus_quality_score
-ConsensusBuilder._deduplicate_consensus_sequences = _deduplicate_consensus_sequences
-ConsensusBuilder._calculate_sequence_similarity = _calculate_sequence_similarity
-ConsensusBuilder._generate_phase4_compatible_output = _generate_phase4_compatible_output
-ConsensusBuilder._save_analysis_library_fasta = _save_analysis_library_fasta
-
 # STRATIFIED BIOLOGICAL FILTERING INTEGRATION
-# Replace default filtering with stratified biological filtering
+# Override the default _filter_and_grade_consensus and _save_enhanced_analysis_library_fasta
+# with stratified versions if available.  The methods are now defined inside the class body
+# (no more monkey-patching via setattr).
 try:
     from .phase3_stratified_integration import (
         _filter_and_grade_consensus_stratified,
         _save_enhanced_analysis_library_fasta_stratified
     )
+except ImportError:
+    try:
+        from phase3_stratified_integration import (
+            _filter_and_grade_consensus_stratified,
+            _save_enhanced_analysis_library_fasta_stratified
+        )
+    except ImportError:
+        _filter_and_grade_consensus_stratified = None
+        _save_enhanced_analysis_library_fasta_stratified = None
 
-    # Replace with stratified versions
+if _filter_and_grade_consensus_stratified is not None:
     ConsensusBuilder._filter_and_grade_consensus = _filter_and_grade_consensus_stratified
     ConsensusBuilder._save_enhanced_analysis_library_fasta = _save_enhanced_analysis_library_fasta_stratified
-
-    logger.info("✓ Stratified biological filtering ENABLED")
-    logger.info("  - Using evidence-based tiered filtering")
-    logger.info("  - Output: high_quality_consensus.fasta (phase4)")
-    logger.info("  - Output: phase3_analysis_library.fa (Combine)")
-
-except ImportError as e:
-    # Fallback to default filtering if stratified module not available
-    logger.warning(f"Stratified filtering module not available: {e}")
-    logger.warning("Using default filtering method")
-    ConsensusBuilder._filter_and_grade_consensus = _filter_and_grade_consensus
-    ConsensusBuilder._save_enhanced_analysis_library_fasta = _save_enhanced_analysis_library_fasta
+    logger.info("Stratified biological filtering enabled")

@@ -85,51 +85,171 @@ def _save_stratified_output_files(self, analysis_library: List[Dict], stats: Dic
     medium_quality = [seq for seq in analysis_library if seq.get('quality_grade') == 'medium']
     low_quality = [seq for seq in analysis_library if seq.get('quality_grade') == 'low']
 
+    # Get sequences that passed basic filtering (from stats)
+    passed_basic = stats.get('stratified_filtering_stats', {}).get('passed_basic_filtering_sequences', [])
+
     # File 1: High quality only (for phase4)
+    # If no high quality sequences, use medium quality as fallback
     high_quality_file = output_dir / "high_quality_consensus.fasta"
+
+    # Select sequences for phase4 masking
+    masking_sequences = high_quality if high_quality else medium_quality
+
+    if not masking_sequences:
+        logger.warning("⚠ No high or medium quality sequences available for phase4 masking!")
+        logger.warning("  Using low quality sequences as last resort")
+        masking_sequences = low_quality
 
     try:
         with open(high_quality_file, 'w') as f:
-            for seq in high_quality:
-                seq_id = seq.get('id', 'unknown')
-                sequence = seq.get('sequence', '')
+            if not masking_sequences:
+                # Create empty file with comment if no sequences at all
+                f.write("# No sequences passed quality filtering\n")
+                logger.error("✗ NO sequences passed filtering! Creating empty placeholder file.")
+            else:
+                for seq in masking_sequences:
+                    seq_id = seq.get('id', 'unknown')
+                    sequence = seq.get('sequence', '')
 
-                # Build header with metadata
-                header_parts = [
-                    f">{seq_id}",
-                    f"grade={seq.get('quality_grade', 'unknown')}",
-                    f"final_score={seq.get('final_quality_score', 0):.3f}",
-                    f"base_score={seq.get('quality_score', 0):.3f}",
-                    f"validation={seq.get('validation_score', 0):.3f}",
-                    f"copies={seq.get('copy_number', 0)}",
-                    f"length={len(sequence)}"
-                ]
+                    # Build header with metadata
+                    header_parts = [
+                        f">{seq_id}",
+                        f"grade={seq.get('quality_grade', 'unknown')}",
+                        f"final_score={seq.get('final_quality_score', 0):.3f}",
+                        f"base_score={seq.get('quality_score', 0):.3f}",
+                        f"validation={seq.get('validation_score', 0):.3f}",
+                        f"copies={seq.get('copy_number', 0)}",
+                        f"length={len(sequence)}"
+                    ]
 
-                if seq.get('tsd'):
-                    header_parts.append(f"tsd={seq['tsd']}")
+                    if seq.get('tsd'):
+                        header_parts.append(f"tsd={seq['tsd']}")
 
-                header = " ".join(header_parts)
-                f.write(f"{header}\n{sequence}\n")
+                    header = " ".join(header_parts)
+                    f.write(f"{header}\n{sequence}\n")
 
-        logger.info(f"✓ Saved HIGH quality consensus (phase4) to: {high_quality_file}")
-        logger.info(f"    {len(high_quality)} sequences")
+        if masking_sequences:
+            if masking_sequences == high_quality:
+                logger.info(f"✓ Saved HIGH quality consensus (phase4) to: {high_quality_file}")
+                logger.info(f"    {len(high_quality)} sequences")
+            elif masking_sequences == medium_quality:
+                logger.warning(f"⚠ No HIGH quality sequences, using MEDIUM quality for phase4")
+                logger.info(f"✓ Saved MEDIUM quality consensus (phase4) to: {high_quality_file}")
+                logger.info(f"    {len(medium_quality)} sequences")
+            else:
+                logger.warning(f"⚠ No HIGH/MEDIUM quality sequences, using LOW quality for phase4")
+                logger.info(f"✓ Saved LOW quality consensus (phase4) to: {high_quality_file}")
+                logger.info(f"    {len(low_quality)} sequences")
 
     except Exception as e:
         logger.error(f"Failed to save high quality file: {e}")
 
     # File 2: High + Medium quality (for Combine)
+    # If no high+medium, include low quality as fallback
     combined_file = output_dir / "phase3_analysis_library.fa"
     combined_sequences = high_quality + medium_quality
 
+    if not combined_sequences:
+        logger.warning("⚠ No high+medium quality sequences, including LOW quality in analysis library")
+        combined_sequences = low_quality
+
     try:
         with open(combined_file, 'w') as f:
-            for seq in combined_sequences:
+            if not combined_sequences:
+                # Create empty file with comment if no sequences at all
+                f.write("# No sequences passed quality filtering\n")
+                logger.error("✗ NO sequences passed filtering! Analysis library is empty.")
+            else:
+                for seq in combined_sequences:
+                    seq_id = seq.get('id', 'unknown')
+                    sequence = seq.get('sequence', '')
+
+                    # Build header with metadata
+                    header_parts = [
+                        f">{seq_id}",
+                        f"grade={seq.get('quality_grade', 'unknown')}",
+                        f"final_score={seq.get('final_quality_score', 0):.3f}",
+                        f"base_score={seq.get('quality_score', 0):.3f}",
+                        f"validation={seq.get('validation_score', 0):.3f}",
+                        f"copies={seq.get('copy_number', 0)}",
+                        f"length={len(sequence)}"
+                    ]
+
+                    if seq.get('tsd'):
+                        header_parts.append(f"tsd={seq['tsd']}")
+
+                    header = " ".join(header_parts)
+                    f.write(f"{header}\n{sequence}\n")
+
+        if combined_sequences:
+            if high_quality or medium_quality:
+                logger.info(f"✓ Saved HIGH+MEDIUM quality analysis library (Combine) to: {combined_file}")
+                logger.info(f"    {len(combined_sequences)} sequences (High: {len(high_quality)}, Medium: {len(medium_quality)})")
+            else:
+                logger.warning(f"✓ Saved LOW quality analysis library (Combine) to: {combined_file}")
+                logger.info(f"    {len(combined_sequences)} sequences (all LOW quality)")
+
+    except Exception as e:
+        logger.error(f"Failed to save combined file: {e}")
+
+    # File 3: All sequences that passed basic quality checks (NEW)
+    basic_filtered_file = output_dir / "phase3_post_basic_filtering.fa"
+
+    try:
+        if passed_basic:
+            with open(basic_filtered_file, 'w') as f:
+                for seq in passed_basic:
+                    seq_id = seq.get('id', 'unknown')
+                    sequence = seq.get('sequence', '')
+
+                    # Build header with metadata
+                    header_parts = [
+                        f">{seq_id}",
+                        f"grade={seq.get('quality_grade', 'rejected')}",
+                        f"final_score={seq.get('final_quality_score', 0):.3f}",
+                        f"base_score={seq.get('quality_score', 0):.3f}",
+                        f"validation={seq.get('validation_score', 0):.3f}",
+                        f"copies={seq.get('copy_number', 0)}",
+                        f"length={len(sequence)}"
+                    ]
+
+                    if seq.get('tsd'):
+                        header_parts.append(f"tsd={seq['tsd']}")
+
+                    header = " ".join(header_parts)
+                    f.write(f"{header}\n{sequence}\n")
+
+            logger.info(f"✓ Saved post-basic-filtering sequences to: {basic_filtered_file}")
+            logger.info(f"    {len(passed_basic)} sequences (passed length/N-content/complexity checks)")
+
+            # Count how many were accepted vs rejected after validation
+            accepted_count = len(high_quality) + len(medium_quality) + len(low_quality)
+            rejected_after_basic = len(passed_basic) - accepted_count
+            logger.info(f"    → {accepted_count} accepted by stratified filtering")
+            logger.info(f"    → {rejected_after_basic} rejected by validation/copy-number filtering")
+        else:
+            logger.warning(f"⚠ No sequences passed basic filtering!")
+
+    except Exception as e:
+        logger.error(f"Failed to save basic filtered file: {e}")
+
+    # File 4: ALL sequences (including rejected) - for analysis
+    all_sequences_file = output_dir / "phase3_all_sequences_with_grades.fa"
+
+    try:
+        with open(all_sequences_file, 'w') as f:
+            # Write all sequences from analysis_library (these have grades assigned)
+            all_seqs_written = set()
+
+            for seq in analysis_library:
                 seq_id = seq.get('id', 'unknown')
                 sequence = seq.get('sequence', '')
+                all_seqs_written.add(seq_id)
 
                 # Build header with metadata
                 header_parts = [
                     f">{seq_id}",
+                    f"status=ACCEPTED",
                     f"grade={seq.get('quality_grade', 'unknown')}",
                     f"final_score={seq.get('final_quality_score', 0):.3f}",
                     f"base_score={seq.get('quality_score', 0):.3f}",
@@ -144,11 +264,41 @@ def _save_stratified_output_files(self, analysis_library: List[Dict], stats: Dic
                 header = " ".join(header_parts)
                 f.write(f"{header}\n{sequence}\n")
 
-        logger.info(f"✓ Saved HIGH+MEDIUM quality analysis library (Combine) to: {combined_file}")
-        logger.info(f"    {len(combined_sequences)} sequences (High: {len(high_quality)}, Medium: {len(medium_quality)})")
+            # Write rejected sequences from passed_basic (these passed basic but failed tier filtering)
+            if passed_basic:
+                for seq in passed_basic:
+                    seq_id = seq.get('id', 'unknown')
+                    if seq_id in all_seqs_written:
+                        continue  # Already written as accepted
+
+                    sequence = seq.get('sequence', '')
+                    all_seqs_written.add(seq_id)
+
+                    # This sequence was rejected by tier filtering
+                    header_parts = [
+                        f">{seq_id}",
+                        f"status=REJECTED_BY_TIER_FILTERING",
+                        f"grade=rejected",
+                        f"final_score={seq.get('final_quality_score', 0):.3f}",
+                        f"base_score={seq.get('quality_score', 0):.3f}",
+                        f"validation={seq.get('validation_score', 0):.3f}",
+                        f"copies={seq.get('copy_number', 0)}",
+                        f"length={len(sequence)}"
+                    ]
+
+                    if seq.get('tsd'):
+                        header_parts.append(f"tsd={seq['tsd']}")
+
+                    header = " ".join(header_parts)
+                    f.write(f"{header}\n{sequence}\n")
+
+        total_written = len(all_seqs_written)
+        logger.info(f"✓ Saved ALL sequences (accepted + rejected) to: {all_sequences_file}")
+        logger.info(f"    {total_written} total sequences")
+        logger.info(f"    {len(analysis_library)} accepted, {total_written - len(analysis_library)} rejected")
 
     except Exception as e:
-        logger.error(f"Failed to save combined file: {e}")
+        logger.error(f"Failed to save all sequences file: {e}")
 
     # Also save detailed statistics
     stats_file = output_dir / "phase3_stratified_statistics.txt"
@@ -159,21 +309,50 @@ def _save_stratified_output_files(self, analysis_library: List[Dict], stats: Dic
             f.write("Phase 3 Stratified Biological Filtering Statistics\n")
             f.write("=" * 80 + "\n\n")
 
+            filter_stats = stats.get('stratified_filtering_stats', {})
+            total_input = filter_stats.get('total_input', len(analysis_library))
+            passed_basic_count = filter_stats.get('passed_basic_filtering', 0)
+            rejected_by_validation = filter_stats.get('rejected_by_validation', 0)
+            rejected_by_basic = filter_stats.get('rejected', 0)
+
             f.write("Overall Results:\n")
-            f.write(f"  Total input sequences: {stats.get('total_input', len(analysis_library))}\n")
-            f.write(f"  High quality: {len(high_quality)} ({len(high_quality)/len(analysis_library)*100:.1f}%)\n")
-            f.write(f"  Medium quality: {len(medium_quality)} ({len(medium_quality)/len(analysis_library)*100:.1f}%)\n")
-            f.write(f"  Low quality: {len(low_quality)} ({len(low_quality)/len(analysis_library)*100:.1f}%)\n")
-            f.write(f"  Rejected: {stats.get('rejected_consensus', 0)}\n\n")
+            f.write(f"  Total input sequences: {total_input}\n")
+            f.write(f"  Passed basic quality checks: {passed_basic_count} ({passed_basic_count/total_input*100:.1f}%)\n")
+            f.write(f"    - Length, N-content, complexity checks\n")
+            f.write(f"  Rejected by basic quality: {rejected_by_basic} ({rejected_by_basic/total_input*100:.1f}%)\n\n")
+
+            f.write(f"  Final acceptance (after validation/copy filtering):\n")
+            f.write(f"    High quality: {len(high_quality)} ({len(high_quality)/total_input*100:.1f}%)\n")
+            f.write(f"    Medium quality: {len(medium_quality)} ({len(medium_quality)/total_input*100:.1f}%)\n")
+            f.write(f"    Low quality: {len(low_quality)} ({len(low_quality)/total_input*100:.1f}%)\n")
+            f.write(f"    Total accepted: {len(high_quality)+len(medium_quality)+len(low_quality)} ({(len(high_quality)+len(medium_quality)+len(low_quality))/total_input*100:.1f}%)\n")
+            f.write(f"  Rejected by validation/copies: {rejected_by_validation} ({rejected_by_validation/total_input*100:.1f}%)\n\n")
 
             f.write("Output Files:\n")
             f.write(f"  1. high_quality_consensus.fasta: {len(high_quality)} sequences (for phase4)\n")
-            f.write(f"  2. phase3_analysis_library.fa: {len(combined_sequences)} sequences (for Combine)\n\n")
+            f.write(f"  2. phase3_analysis_library.fa: {len(combined_sequences)} sequences (for Combine)\n")
+            f.write(f"  3. phase3_post_basic_filtering.fa: {passed_basic_count} sequences (all passed basic quality)\n\n")
 
-            f.write("Filtering Strategy:\n")
-            f.write("  Tier 1 (≥5 copies): Standard quality requirements\n")
-            f.write("  Tier 2 (4-5 copies): Requires TSD + quality≥0.75 + validation≥0.70\n")
-            f.write("  Tier 3 (2-3 copies): Requires TSD + quality≥0.80 + validation≥0.80\n\n")
+            f.write("Filtering Strategy (RELAXED THRESHOLDS - Fixed 99.95% rejection issue):\n")
+            f.write("  Standardized abundance: I = (C × (L/L₀)) / G_Gb\n")
+            f.write("  Fixed boundaries in I space: b₁=5, b₂=25\n")
+            f.write("  Adaptive copy thresholds calculated from genome size and family length\n")
+            f.write("  Structure score S: comprehensive stct.md v1.0 scoring with enhanced hybrid mode\n\n")
+            f.write("  UPDATED Thresholds (Previous caused 99.95% rejection):\n")
+            f.write("  Tier A (I≥b₂, high copy):   S ≥ 0.30 (was 0.55)\n")
+            f.write("  Tier B (b₁≤I<b₂, medium):   S ≥ 0.40 (was 0.70)\n")
+            f.write("  Tier C (I<b₁, low copy):    S ≥ 0.50 (was 0.85)\n\n")
+            f.write("  Extreme cases:\n")
+            f.write("    - I ≥ 100: Allow S ≥ 0.25 (was 0.45)\n")
+            f.write("    - I < 1 and S < 0.55: Reject (was 0.90)\n\n")
+            f.write("  Enhancements:\n")
+            f.write("    - Selective HMM: enabled for sequences >1000bp\n")
+            f.write("    - Enhanced hybrid scoring: 60% quality + 40% structure (when structural evidence limited)\n")
+            f.write("    - Relaxed complexity threshold: 0.35 (was 0.40)\n\n")
+            f.write("  Quality grading within tiers:\n")
+            f.write("    - Tier A → HIGH quality\n")
+            f.write("    - Tier B → HIGH/MEDIUM (based on S score)\n")
+            f.write("    - Tier C → MEDIUM/LOW (based on S score)\n\n")
 
             # Rejection reasons if available
             if 'stratified_filtering_stats' in stats:

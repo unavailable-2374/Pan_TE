@@ -51,6 +51,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _cmd_label(cmd: str) -> str:
+    """Extract a short label from a command string for logging."""
+    # Get the first token (binary name), strip path
+    token = cmd.split()[0]
+    return os.path.basename(token)
+
 def detect_compression_format(file_path: str) -> str:
     """
     Detect the compression format of a file.
@@ -106,8 +112,6 @@ def decompress_file(input_file: str, output_file: str = None) -> str:
         temp_fd, output_file = tempfile.mkstemp(suffix='.fa', prefix='pan_te_genome_')
         os.close(temp_fd)
     
-    logger.info(f"Decompressing {compression_format} file: {input_file}")
-    
     try:
         if compression_format == 'gzip':
             with gzip.open(input_file, 'rt') as infile, open(output_file, 'w') as outfile:
@@ -115,15 +119,12 @@ def decompress_file(input_file: str, output_file: str = None) -> str:
         elif compression_format == 'bzip2':
             with bz2.open(input_file, 'rt') as infile, open(output_file, 'w') as outfile:
                 outfile.write(infile.read())
-        
-        logger.info(f"Decompression completed: {output_file}")
         return output_file
-        
+
     except Exception as e:
-        # Clean up temp file on error
         if output_file and os.path.exists(output_file):
             os.remove(output_file)
-        logger.error(f"Failed to decompress {input_file}: {str(e)}")
+        logger.error(f"Decompression failed: {e}")
         raise
 
 class CustomArgumentParser(argparse.ArgumentParser):
@@ -186,9 +187,12 @@ def parse_arguments():
         
     return args
 
+BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 class PanTEPipeline:
     """Implementation of the Pan TE Pipeline with step tracking and checkpoints."""
-    
+
     def __init__(self, genome_file: Optional[str], output_dir: str, threads: int = 4,
                  model_dir: Optional[str] = None, vcf_dir: Optional[str] = None):
         """Initialize the pipeline with configuration parameters."""
@@ -239,30 +243,25 @@ class PanTEPipeline:
         """Handle decompression of genome file if needed."""
         if not self.original_genome_file:
             return
-            
+
         compression_format = detect_compression_format(self.original_genome_file)
-        
+
         if compression_format == 'uncompressed':
             self.genome_file = self.original_genome_file
-            logger.info(f"Using uncompressed genome file: {self.genome_file}")
         else:
-            logger.info(f"Detected {compression_format} compressed genome file: {self.original_genome_file}")
-            # Decompress to a temporary file in the output directory
+            logger.info(f"Decompressing {compression_format} genome...")
             temp_genome = os.path.join(self.output_dir, 'genome', 'decompressed_genome.fa')
             os.makedirs(os.path.dirname(temp_genome), exist_ok=True)
-            
             self.genome_file = decompress_file(self.original_genome_file, temp_genome)
             self.decompressed_genome_file = temp_genome
-            logger.info(f"Decompressed genome file ready: {self.genome_file}")
 
     def cleanup_temp_files(self):
         """Clean up temporary files created during processing."""
         if self.decompressed_genome_file and os.path.exists(self.decompressed_genome_file):
             try:
                 os.remove(self.decompressed_genome_file)
-                logger.info(f"Cleaned up decompressed genome file: {self.decompressed_genome_file}")
-            except Exception as e:
-                logger.warning(f"Failed to clean up decompressed genome file: {e}")
+            except Exception:
+                pass
 
     def calculate_chunk_count(self):
         """Calculate the number of chunks that will be used by build_RS based on genome size."""
@@ -295,38 +294,31 @@ class PanTEPipeline:
 
     def setup_directories(self):
         """Create the necessary directory structure."""
-        directories = [
-            self.output_dir,
-            os.path.join(self.output_dir, 'genome'),
-            os.path.join(self.output_dir, 'RepeatScout'),
-            os.path.join(self.output_dir, 'RECON'),
-            os.path.join(self.output_dir, 'Combine')
-        ]
-        
-        for directory in directories:
-            os.makedirs(directory, exist_ok=True)
-            logger.info(f"Created directory: {directory}")
+        for sub in ['genome', 'RepeatScout', 'RECON', 'Combine']:
+            os.makedirs(os.path.join(self.output_dir, sub), exist_ok=True)
 
     def create_checkpoint(self, step: str):
         """Create a checkpoint file for a completed step."""
-        checkpoint_file = os.path.join(self.output_dir, self.steps[step])
-        Path(checkpoint_file).touch()
-        logger.info(f"Created checkpoint for {step}: {checkpoint_file}")
+        Path(os.path.join(self.output_dir, self.steps[step])).touch()
 
     def check_checkpoint(self, step: str) -> bool:
         """Check if a step's checkpoint exists."""
-        return os.path.exists(os.path.join(self.output_dir, self.steps[step]))
+        exists = os.path.exists(os.path.join(self.output_dir, self.steps[step]))
+        if exists:
+            logger.info(f"{step}: skipped (checkpoint exists)")
+        return exists
 
     def run_cmd(self, cmd: str, workdir: Optional[str] = None) -> subprocess.CompletedProcess:
         """Run shell command with error handling and logging."""
         start_time = time.time()
         current_dir = os.getcwd()
-        
+        label = _cmd_label(cmd)
+
         try:
             if workdir:
                 os.chdir(workdir)
-                
-            logger.info(f"Running command: {cmd}")
+
+            logger.debug(f"Command: {cmd}")
             result = subprocess.run(
                 cmd,
                 shell=True,
@@ -335,17 +327,21 @@ class PanTEPipeline:
                 stderr=subprocess.PIPE,
                 encoding='utf-8'
             )
-            
+
             duration = time.time() - start_time
-            logger.info(f"Command completed in {duration:.2f} seconds")
+            if duration >= 5:
+                logger.info(f"  {label} done ({duration:.0f}s)")
             return result
-            
+
         except subprocess.CalledProcessError as e:
             duration = time.time() - start_time
-            logger.error(f"Command failed after {duration:.2f} seconds")
-            logger.error(f"Error output: {e.stderr}")
+            # Extract last meaningful error lines from stderr
+            err_lines = [l for l in (e.stderr or '').strip().splitlines()
+                         if l.strip() and '[INFO]' not in l]
+            err_tail = '\n'.join(err_lines[-5:]) if err_lines else e.stderr
+            logger.error(f"{label} failed ({duration:.0f}s)\n{err_tail}")
             raise
-            
+
         finally:
             if workdir:
                 os.chdir(current_dir)
@@ -353,8 +349,6 @@ class PanTEPipeline:
     def process_genome(self):
         """Step 1: Process genome and VCF files if provided."""
         if self.check_checkpoint('genome'):
-            logger.info("Genome processing already completed, skipping...")
-            # When genome.ok exists, use the processed genome directly
             self.genome_file = self.processed_genome
             return
 
@@ -362,11 +356,9 @@ class PanTEPipeline:
         processed_genome = os.path.join(genome_dir, 'genome.fa')
         os.makedirs(genome_dir, exist_ok=True)
 
-        # Decompress genome file if needed (only when checkpoint doesn't exist)
         if self.original_genome_file:
             self.prepare_genome_file()
-            
-        # Step 1: Process VCF files if provided
+
         combined_input = None
         if self.vcf_dir:
             logger.info("Processing VCF files...")
@@ -377,308 +369,278 @@ class PanTEPipeline:
             )
             try:
                 vcf_sequences = vcf_processor.process_all_vcfs()
-                logger.info(f"VCF processing completed: {vcf_sequences}")
-                
-                # Step 2: Combine VCF results with input genome
-                logger.info("Combining VCF results with input genome...")
                 combined_input = os.path.join(genome_dir, 'combined_input.fa')
-                # Use cat for faster file concatenation
                 self.run_cmd(f"cat {vcf_sequences} {self.genome_file} > {combined_input}")
-                
-                # Clean up VCF results file (DISABLED - keeping temp files)
-                # os.remove(vcf_sequences)
-                
-                # Update genome file path to combined file for processing
                 self.genome_file = combined_input
-                
             except Exception as e:
-                logger.error(f"VCF processing failed: {str(e)}")
+                logger.error(f"VCF processing failed: {e}")
                 raise
 
-        # Step 3: Process the genome file (either combined or original)
-        logger.info("Processing genome file...")
+        logger.info("Processing genome...")
         self.process_single_genome(processed_genome)
 
-        # Clean up temporary files (DISABLED - keeping temp files)
-        # if combined_input and os.path.exists(combined_input):
-        #     os.remove(combined_input)
-
-        # Update genome file path to processed version
         self.genome_file = processed_genome
         self.create_checkpoint('genome')
-        logger.info("Genome processing completed")
+        logger.info("Genome ready")
 
     def process_single_genome(self, output_file: str):
         """Process a single genome file."""
-        logger.info("Starting single genome processing")
-
-        # Use optimized cleaner that combines uppercase conversion + cleaning
-        # This is 10-50x faster than tr + clean_seq for large genomes
-        self.run_cmd(f"clean_seq_fast {self.genome_file} {output_file}")
-
-        # Index genome
+        self.run_cmd(f"{BIN_DIR}/clean_seq_fast {self.genome_file} {output_file}")
         self.run_cmd(f"samtools faidx {output_file}")
-        self.run_cmd(f"index {output_file}")
-
-        logger.info("Single genome processing completed")
+        self.run_cmd(f"{BIN_DIR}/index {output_file}")
 
     def process_ltr(self):
         """Process LTRs using allocated threads."""
         if self.check_checkpoint('ltr'):
-            logger.info("LTR processing already completed")
             return
-            
-        logger.info(f"Starting LTR processing with {self.ltr_threads} threads")
-        
-        # Use the processed genome file from genome directory
+
+        logger.info(f"LTR detection starting (threads={self.ltr_threads})")
+
         genome_file = os.path.join(self.output_dir, 'genome', 'genome.fa')
         if not os.path.exists(genome_file):
-            raise FileNotFoundError(f"Processed genome file not found: {genome_file}")
-        
-        # First create genome index if it doesn't exist
+            raise FileNotFoundError(f"Processed genome not found: {genome_file}")
+
         if not os.path.exists(f"{genome_file}.fai"):
             self.run_cmd(f"samtools faidx {genome_file}")
-        
-        # Run LTR_detect with the processed genome file
-        cmd = f"LTR_detect {genome_file} {self.ltr_threads} {self.output_dir}"
-        self.run_cmd(cmd)
-        
+
+        self.run_cmd(f"{BIN_DIR}/LTR_detect {genome_file} {self.ltr_threads} {self.output_dir}")
+        self.build_ltr_consensus()
+
         self.create_checkpoint('ltr')
-        logger.info("LTR processing completed")
+        logger.info("LTR detection done")
+
+    def build_ltr_consensus(self):
+        """Build LTR consensus library from Look4LTRs .rtr output."""
+        look4ltrs_dir = os.path.join(self.output_dir, "Look4LTRs")
+        genome_file = os.path.join(self.output_dir, 'genome', 'genome.fa')
+
+        build_script = os.path.join(
+            BIN_DIR, '..', 'submodule', 'Look4LTRs', 'build_ltr_library.py')
+        if not os.path.exists(build_script):
+            raise FileNotFoundError(
+                f"build_ltr_library.py not found: {build_script}")
+
+        rtr_files = []
+        for root, _, files in os.walk(look4ltrs_dir):
+            for fname in files:
+                if fname.endswith('.rtr'):
+                    rtr_files.append(os.path.join(root, fname))
+
+        if not rtr_files:
+            logger.warning("No .rtr files found, skipping LTR consensus")
+            return
+
+        logger.info(f"Building LTR consensus ({len(rtr_files)} .rtr files)")
+
+        lib_dir = os.path.join(look4ltrs_dir, 'consensus_lib')
+        os.makedirs(lib_dir, exist_ok=True)
+
+        if len(rtr_files) == 1:
+            cmd = (f"python3 {build_script} "
+                   f"--rtr {rtr_files[0]} "
+                   f"--genome {genome_file} "
+                   f"--output {lib_dir} "
+                   f"--threads {self.ltr_threads}")
+            self.run_cmd(cmd)
+        else:
+            part_libs = []
+            for i, rtr_file in enumerate(rtr_files):
+                part_dir = os.path.join(lib_dir, f'part_{i}')
+                cmd = (f"python3 {build_script} "
+                       f"--rtr {rtr_file} "
+                       f"--genome {genome_file} "
+                       f"--output {part_dir} "
+                       f"--threads {self.ltr_threads}")
+                try:
+                    self.run_cmd(cmd)
+                    part_lib = os.path.join(part_dir, 'ltr_library.fa')
+                    if (os.path.exists(part_lib)
+                            and os.path.getsize(part_lib) > 0):
+                        part_libs.append(part_lib)
+                except Exception as e:
+                    logger.warning(f"Part {i} consensus failed: {e}")
+
+            if part_libs:
+                combined = os.path.join(lib_dir, 'combined_raw.fa')
+                self.run_cmd(f"cat {' '.join(part_libs)} > {combined}")
+                final = os.path.join(lib_dir, 'ltr_library.fa')
+                self.run_cmd(
+                    f"cd-hit-est -i {combined} -o {final} "
+                    f"-c 0.8 -aS 0.8 -T {self.ltr_threads} -M 0 "
+                    f"> /dev/null 2>&1")
+                logger.info(f"Combined {len(part_libs)} part libraries")
+            else:
+                logger.warning("No part libraries built successfully")
+
+        final_lib = os.path.join(lib_dir, 'ltr_library.fa')
+        if os.path.exists(final_lib):
+            result = subprocess.run(
+                f"grep -c '^>' {final_lib}",
+                shell=True, capture_output=True, text=True)
+            count = (int(result.stdout.strip())
+                     if result.returncode == 0 else 0)
+            logger.info(f"LTR library: {count} families")
 
     def process_repeatscout(self):
-        """Process RepeatScout with allocated threads."""
+        """Process mdl-repeat with allocated threads."""
         if self.check_checkpoint('repeatscout'):
-            logger.info("RepeatScout processing already completed")
             return
-            
-        logger.info(f"Starting RepeatScout with {self.rs_threads} threads")
+
+        logger.info(f"mdl-repeat starting (threads={self.rs_threads})")
         rs_dir = os.path.join(self.output_dir, 'RepeatScout')
         tmp_dir = os.path.join(rs_dir, 'tmp')
         os.makedirs(tmp_dir, exist_ok=True)
         processed_genome = os.path.join(self.output_dir, 'genome', 'genome.fa')
-        cmd = (f"build_RS --genome {processed_genome} --threads {self.rs_threads} "
+        cmd = (f"{BIN_DIR}/build_RS --genome {processed_genome} --threads {self.rs_threads} "
                f"--tmp {tmp_dir} --workdir {rs_dir} ")
-        
+
         if hasattr(self, 'rmblast_dir'):
             cmd += f" --rmblast {self.rmblast_dir}"
-            
+
         self.run_cmd(cmd, rs_dir)
         self.create_checkpoint('repeatscout')
-        logger.info("RepeatScout processing completed")
+        logger.info("mdl-repeat done")
 
     def process_recon(self):
         """Step 4: Process RECON."""
         if self.check_checkpoint('recon'):
-            logger.info("RECON processing already completed")
             return
-            
-        logger.info("Starting RECON processing")
+
+        logger.info("RECON starting")
         recon_dir = os.path.join(self.output_dir, 'RECON')
-        
-        # Always use Refiner-generated masked genome (simplifies workflow)  
-        masked_genome = os.path.join(self.output_dir, 'RepeatScout', 'refiner_output', 'genome_final_masked.fa')
-        
-        if not os.path.exists(masked_genome):
-            raise FileNotFoundError(f"Expected masked genome not found: {masked_genome}")
-            
-        logger.info(f"Using Refiner-generated masked genome: {masked_genome}")
-        
-        # Use original genome size for batch size calculation
-        original_genome_size = os.path.getsize(self.processed_genome)
-        
-        # Use masked genome size as sample size (full masked genome)
-        sample_size = os.path.getsize(masked_genome)
-        logger.info(f"Using full masked genome (size: {sample_size:,} bp) for RECON")
-        
-        cmd = f"run_RECON_advanced {self.threads} {masked_genome} {sample_size}"
+
+        original_genome = self.processed_genome
+        genome_size = os.path.getsize(original_genome)
+        gb_1 = 1024 ** 3
+
+        if genome_size < gb_1:
+            # Small genome: pass original genome, run_RECON_advanced will
+            # pre-mask it with mdl-repeat consensus then run masked track
+            recon_genome = original_genome
+            logger.info(f"Small genome ({genome_size/1e6:.0f}MB) - RECON in-situ masked track on original genome")
+        else:
+            # Large genome: use masked genome for dual-track processing
+            recon_genome = os.path.join(self.output_dir, 'RepeatScout', 'refiner_output', 'genome_final_masked.fa')
+            if not os.path.exists(recon_genome):
+                raise FileNotFoundError(f"Masked genome not found: {recon_genome}")
+            logger.info(f"Large genome ({genome_size/1e9:.1f}GB) - RECON on masked genome")
+
+        sample_size = os.path.getsize(recon_genome)
+        cmd = f"{BIN_DIR}/run_RECON_advanced {self.threads} {recon_genome} {sample_size}"
         self.run_cmd(cmd, recon_dir)
-        
+
         self.create_checkpoint('recon')
+        logger.info("RECON done")
 
     def combine_results(self):
         """Step 5: Combine and classify results."""
         if self.check_checkpoint('combine'):
-            logger.info("Results combination already completed, skipping...")
             return
-            
-        if not self.model_dir:
-            logger.warning("No model directory specified, skipping classification step")
-            # Continue with combination but skip classification
-            
-        logger.info("Starting results combination and classification")
+
+        logger.info("Combining results")
         combine_dir = os.path.join(self.output_dir, 'Combine')
-        
-        # Step 1: Combine raw results from LTR, RepeatScout and RECON
-        # RepeatScout now uses Refiner output with high_quality_consensus.fasta
+
+        # Collect mdl-repeat consensus
         rs_consensus = "../RepeatScout/refiner_output/phase3_analysis_library.fa"
         if not os.path.exists(os.path.join(combine_dir, rs_consensus)):
-            rs_consensus = "../RepeatScout/consensi.fa"  # fallback
-        
-        # Find all RECON consensi files from different tracks and rounds
+            rs_consensus = "../RepeatScout/consensi.fa"
+
+        # Collect all RECON consensi
         recon_dir = os.path.join(self.output_dir, 'RECON')
         recon_consensi = []
-        
-        # Check for direct consensi.fa (single_track mode for small genomes)
+
         direct_consensi = os.path.join(recon_dir, 'consensi.fa')
         if os.path.exists(direct_consensi) and os.path.getsize(direct_consensi) > 0:
             recon_consensi.append("../RECON/consensi.fa")
-            logger.info("Found RECON single_track result: consensi.fa")
-        
-        # Check for masked track consensi (dual_track mode)
+
         masked_track_consensi = os.path.join(recon_dir, 'masked_track', 'consensi.fa')
         if os.path.exists(masked_track_consensi) and os.path.getsize(masked_track_consensi) > 0:
             recon_consensi.append("../RECON/masked_track/consensi.fa")
-            logger.info("Found RECON masked_track result: masked_track/consensi.fa")
-        
-        # Check for sampling track rounds (dual_track mode)
+
         sampling_track_dir = os.path.join(recon_dir, 'sampling_track')
         if os.path.isdir(sampling_track_dir):
-            # Get all round directories and sort them numerically
-            round_dirs = [d for d in os.listdir(sampling_track_dir) if d.startswith('round_')]
-            round_dirs.sort(key=lambda x: int(x.split('_')[1]) if x.split('_')[1].isdigit() else 0)
-            
+            round_dirs = sorted(
+                [d for d in os.listdir(sampling_track_dir) if d.startswith('round_')],
+                key=lambda x: int(x.split('_')[1]) if x.split('_')[1].isdigit() else 0)
             for round_dir in round_dirs:
-                round_consensi = os.path.join(sampling_track_dir, round_dir, 'consensi.fa')
-                if os.path.exists(round_consensi) and os.path.getsize(round_consensi) > 0:
+                rc = os.path.join(sampling_track_dir, round_dir, 'consensi.fa')
+                if os.path.exists(rc) and os.path.getsize(rc) > 0:
                     recon_consensi.append(f"../RECON/sampling_track/{round_dir}/consensi.fa")
-                    logger.info(f"Found RECON sampling_track result: sampling_track/{round_dir}/consensi.fa")
-        
-        # Build the cat command with all available consensi files
-        input_files = ["../Look4LTRs/consensi.fa", rs_consensus] + recon_consensi
-        cat_cmd = f"cat {' '.join(input_files)} > raw_TEs_combined.fa"
-        
-        if len(recon_consensi) == 0:
-            logger.warning("No RECON consensus files found - check if RECON step completed successfully")
-        
-        logger.info(f"Combining consensus libraries from {len(input_files)} sources: LTR, RepeatScout, and {len(recon_consensi)} RECON result(s)")
-        self.run_cmd(cat_cmd, combine_dir)
-        
-        # Step 2: TE-optimized deduplication using CD-HIT-EST
-        logger.info("Removing redundant TEs with TE-optimized parameters...")
-        
-        # CD-HIT parameters optimized for TE characteristics:
-        # -c 0.8: 80% identity - balance between removing redundancy and preserving TE diversity
-        # -aS 0.8: 80% shorter sequence coverage - important for TE fragments and deletions
-        # -aL 0.8: 80% longer sequence coverage - handles partial TEs
-        # -G 0: local alignment - better for TEs with divergent ends/TIRs
-        # -n 8: word size 8 for 80% identity (CD-HIT recommendation)
-        # -r 1: compare both strands - TEs can insert in both orientations
-        # -mask NX: mask low-complexity regions - common in TEs
-        # -M 0: no memory limit
-        # -d 0: full sequence names in output
-        
+
+        # LTR consensus
+        ltr_consensus = "../Look4LTRs/consensus_lib/ltr_library.fa"
+        if not os.path.exists(os.path.join(combine_dir, ltr_consensus)):
+            ltr_consensus = "../Look4LTRs/consensi.fa"
+
+        input_files = [ltr_consensus, rs_consensus] + recon_consensi
+
+        if not recon_consensi:
+            logger.warning("No RECON consensus files found")
+
+        logger.info(f"Merging {len(input_files)} sources (LTR + RS + {len(recon_consensi)} RECON)")
+        self.run_cmd(f"cat {' '.join(input_files)} > raw_TEs_combined.fa", combine_dir)
+
+        # Deduplication
+        logger.info("Deduplicating with cd-hit-est...")
         self.run_cmd(
             f"cd-hit-est "
-            f"-i raw_TEs_combined.fa "
-            f"-o raw_TEs.fa "
-            f"-c 0.8 "           # 80% sequence identity threshold
-            f"-aS 0.8 "          # 80% coverage of shorter sequence
-            f"-aL 0.8 "          # 80% coverage of longer sequence  
-            f"-G 0 "             # local alignment mode
-            f"-n 8 "             # word size for 80% identity
-            f"-r 1 "             # compare both strands
-            f"-mask NX "         # mask low-complexity regions
-            f"-M 0 "             # no memory limit
-            f"-T {self.threads} " # use all available threads
-            f"-d 0",             # keep full sequence names
+            f"-i raw_TEs_combined.fa -o raw_TEs.fa "
+            f"-c 0.8 -aS 0.8 -aL 0.8 -G 0 -n 8 -r 1 "
+            f"-mask NX -M 0 -T {self.threads} -d 0",
             combine_dir
         )
-        
-        # Log deduplication results
-        raw_count = int(subprocess.check_output(f"grep -c '^>' raw_TEs_combined.fa", 
-                                               shell=True, cwd=combine_dir).decode().strip())
-        final_count = int(subprocess.check_output(f"grep -c '^>' raw_TEs.fa", 
-                                                 shell=True, cwd=combine_dir).decode().strip())
-        logger.info(f"Deduplication: {raw_count} -> {final_count} sequences "
-                   f"({raw_count - final_count} duplicates removed)")
-        
-        # Step 3: Run classifier on deduplicated TEs (if model directory available)
+
+        raw_count = int(subprocess.check_output(
+            f"grep -c '^>' raw_TEs_combined.fa",
+            shell=True, cwd=combine_dir).decode().strip())
+        final_count = int(subprocess.check_output(
+            f"grep -c '^>' raw_TEs.fa",
+            shell=True, cwd=combine_dir).decode().strip())
+        logger.info(f"Dedup: {raw_count} -> {final_count} ({raw_count - final_count} removed)")
+
+        # Classification
         if self.model_dir:
-            self.run_cmd(f"run_Classifier {self.model_dir} {self.threads}", combine_dir)
-        else:
-            logger.info("Skipping classification step (no model directory specified)")
-        
+            logger.info("Classifying TEs...")
+            self.run_cmd(f"{BIN_DIR}/run_Classifier {self.model_dir} {self.threads}", combine_dir)
+
         self.create_checkpoint('combine')
-        logger.info("Results combination completed")
-
-    def process_single_genome(self, output_file: str):
-        """Process a single genome file."""
-        logger.info("Starting single genome processing")
-
-        # Use optimized cleaner that combines uppercase conversion + cleaning
-        # This is 10-50x faster than tr + clean_seq for large genomes
-        self.run_cmd(f"clean_seq_fast {self.genome_file} {output_file}")
-
-        # Index genome
-        self.run_cmd(f"samtools faidx {output_file}")
-        self.run_cmd(f"index {output_file}")
-
-        logger.info("Single genome processing completed")
-
-    def combine_genome_results(self, genome_dir: str, input_files: list):
-        """Combine and process all genome sequences into final genome.fa."""
-        logger.info("Combining genome results")
-
-        # Combine all input files using cat for speed
-        combined_fa = os.path.join(genome_dir, 'combined.fa')
-        files_str = ' '.join(input_files)
-        self.run_cmd(f"cat {files_str} > {combined_fa}")
-
-        # Process combined file with optimized cleaner
-        self.run_cmd(f"clean_seq_fast {combined_fa} {os.path.join(genome_dir, 'genome.fa')}")
-        self.run_cmd(f"samtools faidx {os.path.join(genome_dir, 'genome.fa')}")
-        self.run_cmd(f"index {os.path.join(genome_dir, 'genome')}")
-
-        # Cleanup (DISABLED - keeping temp files)
-        # os.remove(combined_fa)
-        # for file in input_files:
-        #     os.remove(file)
-
-        logger.info("Genome results combined successfully")
+        logger.info("Combine done")
 
     def run(self):
         """Run complete pipeline."""
         try:
-            # Process genome first
             if not self.check_checkpoint('genome'):
                 self.process_genome()
-                
-            # Run parallel detection after genome processing
-            logger.info("Starting parallel TE detection")
+
+            logger.info("Parallel detection: LTR + mdl-repeat")
             with ThreadPoolExecutor(max_workers=2) as executor:
                 ltr_future = executor.submit(self.process_ltr)
                 rs_future = executor.submit(self.process_repeatscout)
-                
-                # Wait for both to complete
+
                 for future in [ltr_future, rs_future]:
                     try:
                         future.result()
                     except Exception as e:
-                        logger.error(f"Detection task failed: {str(e)}")
+                        logger.error(f"Detection failed: {e}")
                         raise
-            
-            # Run remaining steps
+
             if not self.check_checkpoint('recon'):
                 self.process_recon()
-                
+
             if not self.check_checkpoint('combine'):
                 self.combine_results()
-                
+
         except Exception as e:
-            logger.error(f"Pipeline failed: {str(e)}")
+            logger.error(f"Pipeline failed: {e}")
             raise
         finally:
-            # Clean up temporary files
             self.cleanup_temp_files()
 
 def main():
     """Main execution function."""
     try:
-        # Parse arguments
         args = parse_arguments()
-        
-        # Create pipeline instance
+
         pipeline = PanTEPipeline(
             genome_file=args.genome,
             output_dir=args.out,
@@ -687,28 +649,21 @@ def main():
             vcf_dir=args.vcf_dir
         )
 
-        # Set memory limit if specified
         if args.M > 0:
             import resource
             resource.setrlimit(resource.RLIMIT_AS, (args.M * 1024 * 1024, -1))
-            logger.info(f"Set memory limit to {args.M} MB")
 
-        # Set fragment size
         if hasattr(pipeline, 'fragment_size'):
             pipeline.fragment_size = args.fragment_size
-            logger.info(f"Set fragment size to {args.fragment_size}")
 
-        # Run pipeline
         pipeline.run()
         logger.info("Pipeline completed successfully")
-        
+
     except KeyboardInterrupt:
-        logger.error("Pipeline interrupted by user")
+        logger.error("Interrupted by user")
         sys.exit(1)
     except Exception as e:
-        logger.error(f"Pipeline failed: {str(e)}")
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logger.exception("Detailed error traceback:")
+        logger.error(f"Pipeline failed: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":

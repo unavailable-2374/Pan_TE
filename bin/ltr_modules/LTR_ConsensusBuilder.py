@@ -28,7 +28,7 @@ class LTRConsensusBuilder:
     - CD-HIT clustering
     """
 
-    def __init__(self, min_frac_major: float = 0.60, threads: int = 1, logger=None):
+    def __init__(self, min_frac_major: float = 0.50, threads: int = 1, logger=None):
         """
         Initialize the consensus builder.
 
@@ -84,11 +84,9 @@ class LTRConsensusBuilder:
         elif method == 'weighted':
             consensus = self.weighted_consensus(sequences, self.min_frac_major)
         elif method == 'msa':
-            # MSA requires temp directory
-            import tempfile
-            with tempfile.TemporaryDirectory() as tmpdir:
-                seq_tuples = [(f"seq_{i}", seq) for i, seq in enumerate(sequences)]
-                consensus, _ = self.msa_consensus(seq_tuples, tmpdir)
+            # MSA no longer requires temp directory for I/O, but we keep the interface clean
+            seq_tuples = [(f"seq_{i}", seq) for i, seq in enumerate(sequences)]
+            consensus, _ = self.msa_consensus(seq_tuples)
         else:
             raise ValueError(f"Unknown consensus method: {method}")
 
@@ -98,7 +96,7 @@ class LTRConsensusBuilder:
 
         return consensus
 
-    def simple_consensus(self, sequences: List[str], min_frac_major: float = 0.60) -> str:
+    def simple_consensus(self, sequences: List[str], min_frac_major: float = 0.50) -> str:
         """
         Build consensus using majority rule.
 
@@ -142,7 +140,7 @@ class LTRConsensusBuilder:
 
         return ''.join(consensus).rstrip('N')
 
-    def weighted_consensus(self, sequences: List[str], min_frac_major: float = 0.60) -> str:
+    def weighted_consensus(self, sequences: List[str], min_frac_major: float = 0.50) -> str:
         """
         Build consensus with sequence quality weighting.
 
@@ -219,44 +217,62 @@ class LTRConsensusBuilder:
 
         return ''.join(consensus).rstrip('N')
 
-    def run_mafft(self, in_fa: str, out_fa: str) -> bool:
+    def run_mafft(self, seq_data: str, n_seqs: int) -> Tuple[bool, str]:
         """
-        Run MAFFT alignment.
-
+        Run MAFFT alignment using stdin/stdout to reduce I/O.
+        
         Args:
-            in_fa: Input FASTA file
-            out_fa: Output aligned FASTA file
-
+            seq_data: Input sequences in FASTA format (string)
+            n_seqs: Number of sequences
+            
         Returns:
-            bool: True if successful
+            tuple: (success, aligned_fasta_string)
         """
         exe = shutil.which('mafft')
         if not exe:
             self.logger.warning("MAFFT not found in PATH")
-            return False
+            return False, ""
 
-        if not os.path.exists(in_fa) or os.path.getsize(in_fa) == 0:
-            return False
+        # Optimize parameters based on input size
+        # --retree 1 --maxiterate 0 is fastest (FFT-NS-1) for small/similar clusters
+        # --auto is robust for larger/divergent clusters
+        
+        if n_seqs < 50:
+            # Very fast for small clusters
+            params = ['--retree', '1', '--maxiterate', '0']
+        else:
+            # Standard for larger clusters
+            params = ['--auto']
 
-        # Use thread parameter for parallel execution
-        cmd = [exe, '--auto', '--quiet', '--thread', str(max(1, self.threads)), in_fa]
+        cmd = [exe] + params + ['--quiet', '--thread', str(max(1, self.threads)), '-']
+        
         try:
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True, check=True)
-            with open(out_fa, 'w') as f:
-                f.write(result.stdout)
-            return True
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"MAFFT failed: {e}")
-            return False
+            process = subprocess.Popen(
+                cmd, 
+                stdin=subprocess.PIPE, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate(input=seq_data)
+            
+            if process.returncode != 0:
+                self.logger.error(f"MAFFT failed: {stderr}")
+                return False, ""
+                
+            return True, stdout
+        except Exception as e:
+            self.logger.error(f"MAFFT execution error: {e}")
+            return False, ""
 
-    def msa_consensus(self, sequences: List[Tuple[str, str]], tempdir: str) -> Tuple[str, int]:
+    def msa_consensus(self, sequences: List[Tuple[str, str]], tempdir: str = None) -> Tuple[str, int]:
         """
         MSA-based consensus with fallback to simple consensus.
+        Optimized to use in-memory processing instead of temp files.
 
         Args:
             sequences: List of (header, sequence) tuples
-            tempdir: Temporary directory for intermediate files
+            tempdir: Deprecated, kept for compatibility
 
         Returns:
             tuple: (consensus_sequence, num_sequences)
@@ -267,31 +283,33 @@ class LTRConsensusBuilder:
         if len(sequences) == 1:
             return (sequences[0][1], 1)
 
-        # Write input file
-        in_fa = os.path.join(tempdir, 'input.fa')
-        with open(in_fa, 'w') as f:
-            for header, seq in sequences:
-                f.write(f'>{header}\n{seq}\n')
+        # Build input string in memory
+        input_parts = []
+        for header, seq in sequences:
+            input_parts.append(f">{header}\n{seq}")
+        input_data = "\n".join(input_parts)
 
-        # Try MAFFT alignment
-        aln_fa = os.path.join(tempdir, 'aligned.fa')
-        success = self.run_mafft(in_fa, aln_fa)
+        # Run MAFFT via pipe
+        success, aligned_data = self.run_mafft(input_data, len(sequences))
 
-        if success and os.path.exists(aln_fa):
-            # Parse aligned sequences
+        if success and aligned_data:
+            # Parse aligned sequences from string
             aligned_seqs = []
-            with open(aln_fa) as f:
-                seq = ''
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('>'):
-                        if seq:
-                            aligned_seqs.append(seq)
-                            seq = ''
-                    else:
-                        seq += line
-                if seq:
-                    aligned_seqs.append(seq)
+            current_seq = []
+            
+            for line in aligned_data.splitlines():
+                line = line.strip()
+                if not line: continue
+                
+                if line.startswith('>'):
+                    if current_seq:
+                        aligned_seqs.append("".join(current_seq))
+                        current_seq = []
+                else:
+                    current_seq.append(line)
+            
+            if current_seq:
+                aligned_seqs.append("".join(current_seq))
 
             if aligned_seqs:
                 # Use weighted consensus for better representativeness
@@ -394,3 +412,57 @@ class LTRConsensusBuilder:
             tuple: (is_valid, reason)
         """
         return validate_sequence(consensus, min_length=10, max_n_content=0.95)
+
+    def refine_consensus_from_recruitment(self, consensus_id: str, original_consensus: str, 
+                                        recruited_seqs: List[str], max_seqs: int = 200) -> str:
+        """
+        Refine consensus using recruited genomic copies (Family Recruitment).
+        
+        Biologically, the initial consensus is built from a few full-length copies found by Look4LTRs.
+        However, the genome contains many more copies (Solo-LTRs, truncated copies).
+        Including these provides a more robust representation of the ancestral sequence.
+
+        Args:
+            consensus_id: ID of the consensus
+            original_consensus: The initial consensus sequence
+            recruited_seqs: List of genomic sequences found by FastGA
+            max_seqs: Max sequences to use for MSA (to prevent memory issues)
+
+        Returns:
+            str: Refined consensus sequence
+        """
+        if not recruited_seqs:
+            return original_consensus
+
+        # 1. Filter and Sample
+        # Remove sequences that are too short compared to original consensus
+        orig_len = len(original_consensus)
+        valid_seqs = [s for s in recruited_seqs if len(s) >= orig_len * 0.5 and len(s) <= orig_len * 1.5]
+        
+        if not valid_seqs:
+            return original_consensus
+
+        # If too many, sample randomly but ensure original is kept (via logic)
+        # Actually, we should prioritize high-diversity copies, but random sampling is robust enough for now
+        import random
+        if len(valid_seqs) > max_seqs:
+            sampled_seqs = random.sample(valid_seqs, max_seqs)
+        else:
+            sampled_seqs = valid_seqs
+
+        # Always include the original consensus as a "guide" or "anchor"
+        # Give it a unique ID so we can track it if needed, but for MSA it's just another seq
+        seq_tuples = [(f"recruited_{i}", seq) for i, seq in enumerate(sampled_seqs)]
+        seq_tuples.insert(0, ("original_consensus", original_consensus))
+
+        # 2. Run MSA (MAFFT)
+        # Optimized: No temp directory needed
+        refined_consensus, _ = self.msa_consensus(seq_tuples)
+
+        # 3. Validation
+        # If refinement failed or produced garbage, revert to original
+        if not refined_consensus or len(refined_consensus) < orig_len * 0.5:
+            self.logger.warning(f"Refinement failed for {consensus_id}, keeping original")
+            return original_consensus
+
+        return refined_consensus

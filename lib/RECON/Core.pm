@@ -4,13 +4,17 @@ use strict;
 use warnings;
 use Exporter 'import';
 use File::Path qw(make_path);
+use FindBin qw($Bin);
 use RECON::Logger;
 use RECON::Utils;
 
+# RepeatModeler2-compatible scoring matrix for rmblastn
+my $MATRIX_DIR = "$Bin/Matrices/ncbi/nt";
+$ENV{BLASTMAT} = $MATRIX_DIR if -d $MATRIX_DIR;
+
 our @EXPORT = qw(
-    determine_k_parameter run_recon_pipeline run_recon_pipeline_with_k
-    run_rmblastn_self_alignment run_single_rmblastn run_parallel_rmblastn_with_msp
-    run_sequential_chunked merge_msp_files
+    determine_k_parameter run_recon_pipeline
+    run_rmblastn_self_alignment merge_msp_files
     check_checkpoint create_checkpoint remove_checkpoint remove_all_checkpoints
     cleanup_intermediate_files
 );
@@ -58,23 +62,25 @@ sub remove_all_checkpoints {
 
 sub cleanup_intermediate_files {
     my ($force) = @_;
-    
+
     # Only cleanup if consensi.fa was successfully generated or force flag is set
     if (!$force && !(-s "consensi.fa")) {
         log_message("INFO", "Skipping cleanup", "consensi.fa not found or empty");
         return 0;
     }
-    
+
     # Check debug flag
     my $debug = $ENV{'RECON_DEBUG'} || 0;
     if ($debug) {
         log_message("INFO", "Skipping cleanup", "RECON_DEBUG=$debug");
         return 0;
     }
-    
+
     my @cleanup_dirs = ("ele_def_res", "ele_redef_res", "edge_redef_res");
     my $cleaned_count = 0;
-    
+    my $cleaned_files = 0;
+
+    # Clean up RECON intermediate directories
     for my $dir (@cleanup_dirs) {
         if (-d $dir) {
             run_cmd("rm -rf $dir");
@@ -82,13 +88,77 @@ sub cleanup_intermediate_files {
             log_message("INFO", "Cleaned up intermediate directory", "dir=$dir");
         }
     }
-    
-    if ($cleaned_count > 0) {
-        log_message("INFO", "Intermediate file cleanup completed", 
-                    "directories_removed=$cleaned_count, consensi_size=" . (-s "consensi.fa" || 0));
+
+    # Clean up RMBlastN chunk files (residual .blast and .msp files)
+    my @rmblast_blast_files = glob("rmblast_chunk_*.blast");
+    my @rmblast_msp_files = glob("rmblast_chunk_*.msp");
+    my @rmblast_chunk_fa_files = glob("rmblast_chunk_*.fa");
+
+    for my $file (@rmblast_blast_files, @rmblast_msp_files, @rmblast_chunk_fa_files) {
+        if (-f $file) {
+            unlink($file);
+            $cleaned_files++;
+        }
     }
-    
-    return $cleaned_count;
+    if (@rmblast_blast_files || @rmblast_msp_files || @rmblast_chunk_fa_files) {
+        log_message("INFO", "Cleaned up RMBlastN chunk files",
+                    "blast=" . scalar(@rmblast_blast_files) .
+                    ", msp=" . scalar(@rmblast_msp_files) .
+                    ", fa=" . scalar(@rmblast_chunk_fa_files));
+    }
+
+    # Clean up BLAST database files
+    my @blast_db_files = glob("sample_db.n*");
+    for my $file (@blast_db_files) {
+        if (-f $file) {
+            unlink($file);
+            $cleaned_files++;
+        }
+    }
+    if (@blast_db_files) {
+        log_message("INFO", "Cleaned up BLAST database files", "count=" . scalar(@blast_db_files));
+    }
+
+    # Clean up RepeatMasker intermediate files
+    my @rm_cat_files = glob("*.cat *.cat.gz");
+    my @rm_tbl_files = glob("*.tbl");
+    my @rm_out_files = glob("sample_masked.fa.out sample.fa.out");
+    my @rm_dirs = glob("RM_*");
+
+    for my $file (@rm_cat_files, @rm_tbl_files, @rm_out_files) {
+        if (-f $file) {
+            unlink($file);
+            $cleaned_files++;
+        }
+    }
+    for my $dir (@rm_dirs) {
+        if (-d $dir) {
+            run_cmd("rm -rf $dir");
+            $cleaned_count++;
+        }
+    }
+    if (@rm_cat_files || @rm_tbl_files || @rm_out_files || @rm_dirs) {
+        log_message("INFO", "Cleaned up RepeatMasker intermediate files",
+                    "cat=" . scalar(@rm_cat_files) .
+                    ", tbl=" . scalar(@rm_tbl_files) .
+                    ", out=" . scalar(@rm_out_files) .
+                    ", dirs=" . scalar(@rm_dirs));
+    }
+
+    # Clean up merged consensus temporary file
+    if (-f "merged_consensus.fa") {
+        unlink("merged_consensus.fa");
+        $cleaned_files++;
+        log_message("INFO", "Cleaned up merged consensus file", "file=merged_consensus.fa");
+    }
+
+    if ($cleaned_count > 0 || $cleaned_files > 0) {
+        log_message("INFO", "Intermediate file cleanup completed",
+                    "directories_removed=$cleaned_count, files_removed=$cleaned_files, " .
+                    "consensi_size=" . (-s "consensi.fa" || 0));
+    }
+
+    return $cleaned_count + $cleaned_files;
 }
 
 sub determine_k_parameter {
@@ -341,11 +411,6 @@ sub process_eledef {
     }
 }
 
-sub run_recon_pipeline_with_k {
-    my ($k_param) = @_;
-    return run_recon_pipeline($k_param);
-}
-
 sub run_rmblastn_self_alignment {
     my ($query_file, $output_file, $threads, $database) = @_;
     $threads ||= 4;
@@ -359,63 +424,77 @@ sub run_rmblastn_self_alignment {
         create_blast_database($query_file, $database);
     }
     
-    # Check query file size to decide on parallel strategy
+    # Check query file size to decide strategy
     my $query_size = -s $query_file;
     my $size_mb = $query_size / (1024 * 1024);
-    
-    if ($size_mb <= 5) {
-        # Small files - use single thread approach
+
+    if ($size_mb <= 20) {
+        # ≤20MB: single process, no chunking needed
         return run_single_rmblastn_process($query_file, $output_file, $threads, $database);
     }
-    
-    # Large files - use parallel approach
+
+    # >20MB: chunk into ≤20MB pieces to control memory
     return run_parallel_rmblastn_chunked($query_file, $output_file, $threads, $database);
 }
 
 sub run_single_rmblastn_process {
     my ($query_file, $output_file, $threads, $database) = @_;
-    
+
     log_message("INFO", "Using single-process RMBlastN", "small_file_optimization");
-    
-    # Run RMBlastN with standard RECON parameters
+
+    # Run RMBlastN with RepeatModeler2-compatible parameters
+    # comparison.matrix + complexity_adjust: proven RM2 scoring scheme
+    # word_size 9: balances sensitivity vs memory for genome-scale self-alignment
+    # lcase_masking: honor lowercase soft masking in query (skip seeding, allow extension)
+    my $blast_tmp = "${output_file}.blast_tmp";
     my $cmd = "rmblastn -query $query_file -db $database " .
-              "-out $output_file " .
+              "-out $blast_tmp " .
               "-num_threads $threads " .
-              "-word_size 11 -gapopen 5 -gapextend 2 " .
-              "-penalty -3 -reward 1 -evalue 1e-5 " .
-              "-max_target_seqs 1000000";
-    
+              "-word_size 9 -matrix comparison.matrix " .
+              "-gapopen 20 -gapextend 5 " .
+              "-complexity_adjust -lcase_masking -evalue 1e-5 " .
+              "-max_target_seqs 50000";
+
     run_cmd($cmd);
-    
+
+    # Convert BLAST output to MSP format (consistent with parallel/sequential paths)
+    if (-s $blast_tmp) {
+        run_cmd("MSPCollect.pl $blast_tmp > $output_file");
+        unlink($blast_tmp);
+    } else {
+        # No hits: create empty output
+        open(my $fh, '>', $output_file);
+        close($fh);
+        unlink($blast_tmp);
+    }
+
     my $hit_count = `wc -l < $output_file`;
     chomp $hit_count;
-    log_message("INFO", "Single RMBlastN completed", "hits=$hit_count, output=$output_file");
-    
+    log_message("INFO", "Single RMBlastN completed", "msp_lines=$hit_count, output=$output_file");
+
     return $hit_count;
 }
 
 sub run_parallel_rmblastn_chunked {
     my ($query_file, $output_file, $threads, $database) = @_;
-    
-    # Calculate parallel strategy: threads/2 processes, 2 threads each
-    my $num_processes = int($threads / 2);
-    $num_processes = 1 if $num_processes < 1;
-    $num_processes = 40 if $num_processes > 40;  # Cap at 40 processes
-    my $threads_per_process = 2;
-    
-    log_message("INFO", "Using parallel RMBlastN strategy", 
-                "processes=$num_processes, threads_per_process=$threads_per_process");
-    
-    # Split query file into 1MB chunks
-    my @chunk_files = split_fasta_by_size($query_file, "rmblast_chunk", 1);
+
+    # Split query into ≤20MB chunks to cap per-process memory
+    my @chunk_files = split_fasta_by_size($query_file, "rmblast_chunk", 20);
     my $actual_chunks = @chunk_files;
-    
+
     if ($actual_chunks <= 1) {
-        # If only one chunk, fall back to single process
         return run_single_rmblastn_process($query_file, $output_file, $threads, $database);
     }
-    
-    log_message("INFO", "Query split into chunks", "chunks=$actual_chunks, target_processes=$num_processes");
+
+    # Process-level parallelism: 1 thread per process, maximize concurrency
+    # rmblastn internal threading (-num_threads) is unreliable,
+    # process-level parallelism via ForkManager is more effective
+    my $num_processes = $threads;
+    $num_processes = $actual_chunks if $num_processes > $actual_chunks;
+    my $threads_per_process = 1;
+
+    log_message("INFO", "Using parallel RMBlastN strategy",
+                "total_threads=$threads, processes=$num_processes, threads_per_process=$threads_per_process, chunks=$actual_chunks");
     
     # Use Parallel::ForkManager for parallel processing
     eval { require Parallel::ForkManager; };
@@ -439,16 +518,17 @@ sub run_parallel_rmblastn_chunked {
         
         # Child process
         eval {
-            # Run rmblastn with standard RECON parameters
+            # Run rmblastn with RepeatModeler2-compatible parameters
             my $cmd = "rmblastn -query $chunk_file -db $database " .
                      "-out $chunk_blast " .
                      "-num_threads $threads_per_process " .
-                     "-word_size 11 -gapopen 5 -gapextend 2 " .
-                     "-penalty -3 -reward 1 -evalue 1e-5 " .
-                     "-max_target_seqs 1000000";
-            
+                     "-word_size 9 -matrix comparison.matrix " .
+                     "-gapopen 20 -gapextend 5 " .
+                     "-complexity_adjust -lcase_masking -evalue 1e-5 " .
+                     "-max_target_seqs 50000";
+
             run_cmd($cmd);
-            
+
             # Convert to MSP immediately and cleanup
             if (-s $chunk_blast) {
                 run_cmd("MSPCollect.pl $chunk_blast > $chunk_msp");
@@ -496,80 +576,6 @@ sub run_parallel_rmblastn_chunked {
     return $hit_count;
 }
 
-sub run_single_rmblastn {
-    my ($query_file, $subject_file, $output_file, $threads) = @_;
-    $threads ||= 4;
-    
-    # Create database for subject
-    my $db_name = "${subject_file}_db";
-    create_blast_database($subject_file, $db_name);
-    
-    # Run blast with TE-optimized parameters for divergent sequence detection
-    my $cmd = "rmblastn -query $query_file -db $db_name " .
-              "-out $output_file " .
-              "-num_threads $threads -task rmblastn " .
-              "-word_size 11 -gapopen 5 -gapextend 2 " .
-              "-penalty -1 -reward 1 -evalue 1e-3 " .
-              "-dust no -soft_masking false " .
-              "-max_target_seqs 10000";
-    
-    run_cmd($cmd);
-    
-    log_message("INFO", "Single RMBlastN completed", "output=$output_file");
-}
-
-sub run_parallel_rmblastn_with_msp {
-    my ($fasta_file, $output_file, $threads, $chunk_size_mb) = @_;
-    $threads ||= 8;
-    $chunk_size_mb ||= 100;
-    
-    log_message("INFO", "Starting parallel RMBlastN with MSP collection", 
-                "threads=$threads, chunk_size=${chunk_size_mb}MB");
-    
-    # Split large FASTA files for parallel processing
-    my @chunk_files = split_fasta_by_size($fasta_file, "chunk", $chunk_size_mb);
-    my $num_chunks = @chunk_files;
-    
-    if ($num_chunks <= 1) {
-        # Single file processing
-        return run_rmblastn_self_alignment($fasta_file, $output_file, $threads);
-    }
-    
-    # Parallel processing
-    my @blast_files;
-    for my $i (0..$#chunk_files) {
-        my $chunk_file = $chunk_files[$i];
-        my $blast_out = "blast_part${i}.out";
-        
-        push @blast_files, $blast_out;
-        
-        # Run blast for this chunk
-        run_rmblastn_self_alignment($chunk_file, $blast_out, 
-                                   int($threads / $num_chunks) + 1);
-    }
-    
-    # Merge results
-    my $blast_list = join(" ", @blast_files);
-    run_cmd("cat $blast_list > $output_file");
-    
-    # Run MSP collection
-    my $msp_file = $output_file;
-    $msp_file =~ s/\.blast$//;
-    $msp_file .= ".msp";
-    
-    run_cmd("MSPCollect.pl $output_file > $msp_file");
-    
-    # Cleanup chunks
-    for my $i (0..$#chunk_files) {
-        unlink($chunk_files[$i], "blast_part${i}.out");
-    }
-    
-    log_message("INFO", "Parallel RMBlastN completed", 
-                "chunks=$num_chunks, output=$output_file, msp=$msp_file");
-    
-    return $msp_file;
-}
-
 sub run_sequential_chunked {
     my ($query_file, $output_file, $threads, $database, $chunk_files_ref) = @_;
     
@@ -588,16 +594,17 @@ sub run_sequential_chunked {
         log_message("INFO", "Processing chunk $i", "file=$chunk_file");
         
         eval {
-            # Run rmblastn on this chunk with standard RECON parameters
+            # Run rmblastn with RepeatModeler2-compatible parameters
             my $cmd = "rmblastn -query $chunk_file -db $database " .
                      "-out $chunk_blast " .
                      "-num_threads $threads " .
-                     "-word_size 11 -gapopen 5 -gapextend 2 " .
-                     "-penalty -3 -reward 1 -evalue 1e-5 " .
-                     "-max_target_seqs 1000000";
-            
+                     "-word_size 9 -matrix comparison.matrix " .
+                     "-gapopen 20 -gapextend 5 " .
+                     "-complexity_adjust -lcase_masking -evalue 1e-5 " .
+                     "-max_target_seqs 50000";
+
             run_cmd($cmd);
-            
+
             # Convert to MSP and cleanup
             if (-s $chunk_blast) {
                 run_cmd("MSPCollect.pl $chunk_blast > $chunk_msp");
@@ -615,11 +622,9 @@ sub run_sequential_chunked {
         }
     }
     
-    # Merge results
-    my $final_msp = "${output_file}.msp";
-    merge_msp_files(\@msp_files, $final_msp);
-    convert_msp_to_blast($final_msp, $output_file);
-    
+    # Merge MSP files directly to output (same as parallel path)
+    merge_msp_files(\@msp_files, $output_file);
+
     # Cleanup
     for my $chunk_file (@chunk_files) {
         unlink($chunk_file);
@@ -627,7 +632,7 @@ sub run_sequential_chunked {
     for my $msp_file (@msp_files) {
         unlink($msp_file);
     }
-    
+
     my $hit_count = `wc -l < $output_file`;
     chomp $hit_count;
     return $hit_count;
@@ -653,7 +658,6 @@ sub merge_msp_files {
     
     close($out_fh);
 }
-
 
 1;
 

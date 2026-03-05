@@ -9,15 +9,17 @@ logger = logging.getLogger(__name__)
 
 def run_all_vs_all_blast(sequences: List[Dict], config) -> List[Dict]:
     """运行all-vs-all BLAST比较"""
-    # 创建临时FASTA文件
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as fasta_file:
-        for seq_data in sequences:
-            fasta_file.write(f">{seq_data['id']}\n{seq_data['sequence']}\n")
-        fasta_file_path = fasta_file.name
-    
-    # 创建BLAST数据库
-    db_path = fasta_file_path + '.db'
+    fasta_file_path = None
+    db_path = None
     try:
+        # 创建临时FASTA文件
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as fasta_file:
+            for seq_data in sequences:
+                fasta_file.write(f">{seq_data['id']}\n{seq_data['sequence']}\n")
+            fasta_file_path = fasta_file.name
+
+        # 创建BLAST数据库
+        db_path = fasta_file_path + '.db'
         # 构建数据库
         makedb_cmd = [
             config.makeblastdb_exe,
@@ -25,8 +27,8 @@ def run_all_vs_all_blast(sequences: List[Dict], config) -> List[Dict]:
             '-dbtype', 'nucl',
             '-out', db_path
         ]
-        subprocess.run(makedb_cmd, capture_output=True, text=True, check=True)
-        
+        subprocess.run(makedb_cmd, capture_output=True, text=True, check=True, timeout=300)
+
         # 运行BLAST
         blast_cmd = [
             config.blastn_exe,
@@ -36,8 +38,8 @@ def run_all_vs_all_blast(sequences: List[Dict], config) -> List[Dict]:
             '-num_threads', str(config.threads),
             '-max_target_seqs', '1000'
         ]
-        
-        result = subprocess.run(blast_cmd, capture_output=True, text=True, check=True)
+
+        result = subprocess.run(blast_cmd, capture_output=True, text=True, check=True, timeout=600)
         
         # 解析结果
         blast_results = []
@@ -76,12 +78,20 @@ def run_all_vs_all_blast(sequences: List[Dict], config) -> List[Dict]:
         
         return blast_results
         
+    except subprocess.TimeoutExpired:
+        logger.error("BLAST all-vs-all timed out")
+        return []
     except subprocess.CalledProcessError as e:
         logger.error(f"BLAST all-vs-all failed: {e}")
         return []
     finally:
         # 清理临时文件
-        for file_path in [fasta_file_path, db_path + '.nhr', db_path + '.nin', db_path + '.nsq']:
+        cleanup_paths = []
+        if fasta_file_path:
+            cleanup_paths.append(fasta_file_path)
+        if db_path:
+            cleanup_paths.extend([db_path + '.nhr', db_path + '.nin', db_path + '.nsq'])
+        for file_path in cleanup_paths:
             if os.path.exists(file_path):
                 os.unlink(file_path)
 
@@ -111,25 +121,28 @@ def extract_connected_components(similarity_graph: Dict[str, List[str]]) -> List
     
     return components
 
-def run_all_vs_all_blast_chunked(query_sequences: List[Dict], 
-                                 db_sequences: List[Dict], 
+def run_all_vs_all_blast_chunked(query_sequences: List[Dict],
+                                 db_sequences: List[Dict],
                                  config) -> List[Dict]:
     """分块运行BLAST比较以减少内存使用"""
-    # 创建数据库文件
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as db_file:
-        for seq_data in db_sequences:
-            db_file.write(f">{seq_data['id']}\n{seq_data['sequence']}\n")
-        db_file_path = db_file.name
-    
-    # 创建查询文件
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as query_file:
-        for seq_data in query_sequences:
-            query_file.write(f">{seq_data['id']}\n{seq_data['sequence']}\n")
-        query_file_path = query_file.name
-    
-    # 创建BLAST数据库
-    db_path = db_file_path + '.db'
+    db_file_path = None
+    query_file_path = None
+    db_path = None
     try:
+        # 创建数据库文件
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as db_file:
+            for seq_data in db_sequences:
+                db_file.write(f">{seq_data['id']}\n{seq_data['sequence']}\n")
+            db_file_path = db_file.name
+
+        # 创建查询文件
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as query_file:
+            for seq_data in query_sequences:
+                query_file.write(f">{seq_data['id']}\n{seq_data['sequence']}\n")
+            query_file_path = query_file.name
+
+        # 创建BLAST数据库
+        db_path = db_file_path + '.db'
         # 构建数据库
         makedb_cmd = [
             config.makeblastdb_exe,
@@ -137,8 +150,8 @@ def run_all_vs_all_blast_chunked(query_sequences: List[Dict],
             '-dbtype', 'nucl',
             '-out', db_path
         ]
-        subprocess.run(makedb_cmd, capture_output=True, text=True, check=True)
-        
+        subprocess.run(makedb_cmd, capture_output=True, text=True, check=True, timeout=300)
+
         # 运行BLAST - 使用更少的线程以减少内存
         blast_cmd = [
             config.blastn_exe,
@@ -149,8 +162,8 @@ def run_all_vs_all_blast_chunked(query_sequences: List[Dict],
             '-max_target_seqs', '500',  # 减少目标序列数
             '-evalue', '1e-5'  # 更严格的E值阈值
         ]
-        
-        result = subprocess.run(blast_cmd, capture_output=True, text=True, check=True)
+
+        result = subprocess.run(blast_cmd, capture_output=True, text=True, check=True, timeout=600)
         
         # 解析结果
         blast_results = []
@@ -189,25 +202,33 @@ def run_all_vs_all_blast_chunked(query_sequences: List[Dict],
         
         return blast_results
         
+    except subprocess.TimeoutExpired:
+        logger.error("BLAST chunked timed out")
+        return []
     except subprocess.CalledProcessError as e:
         logger.error(f"BLAST chunked failed: {e}")
         return []
     finally:
         # 清理临时文件
-        for file_path in [query_file_path, db_file_path, 
-                         db_path + '.nhr', db_path + '.nin', db_path + '.nsq']:
+        cleanup_paths = []
+        if query_file_path:
+            cleanup_paths.append(query_file_path)
+        if db_file_path:
+            cleanup_paths.append(db_file_path)
+        if db_path:
+            cleanup_paths.extend([db_path + '.nhr', db_path + '.nin', db_path + '.nsq'])
+        for file_path in cleanup_paths:
             if os.path.exists(file_path):
                 os.unlink(file_path)
 
 
 def run_blast_segments(segment: str, genome_file: str, config) -> List[Dict]:
     """对序列片段进行BLAST搜索"""
-    # 创建临时查询文件
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as query_file:
-        query_file.write(f">segment\n{segment}\n")
-        query_file_path = query_file.name
-    
+    query_file_path = None
     try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as query_file:
+            query_file.write(f">segment\n{segment}\n")
+            query_file_path = query_file.name
         # 运行BLAST
         cmd = [
             config.blastn_exe,
@@ -218,14 +239,14 @@ def run_blast_segments(segment: str, genome_file: str, config) -> List[Dict]:
             '-evalue', '1e-10'
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=600)
+
         # 解析结果
         hits = []
         for line in result.stdout.strip().split('\n'):
             if not line:
                 continue
-            
+
             fields = line.split('\t')
             if len(fields) >= 12:
                 hits.append({
@@ -237,13 +258,15 @@ def run_blast_segments(segment: str, genome_file: str, config) -> List[Dict]:
                     'evalue': float(fields[10]),
                     'score': float(fields[11])
                 })
-        
+
         return hits
-        
+
+    except subprocess.TimeoutExpired:
+        logger.error("BLAST segment search timed out after 10 minutes")
+        return []
     except subprocess.CalledProcessError as e:
         logger.error(f"BLAST segment search failed: {e}")
         return []
     finally:
-        # 清理临时文件
-        if os.path.exists(query_file_path):
+        if query_file_path and os.path.exists(query_file_path):
             os.unlink(query_file_path)

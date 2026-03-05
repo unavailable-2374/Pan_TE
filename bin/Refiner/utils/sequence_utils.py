@@ -1,4 +1,5 @@
 import logging
+import shutil
 from typing import Dict, List, Tuple, Optional
 from Bio import SeqIO
 from Bio.Seq import Seq
@@ -7,6 +8,57 @@ import tempfile
 import os
 
 logger = logging.getLogger(__name__)
+
+# Module-level cache for pysam.FastaFile handles (one per genome path)
+_fasta_handles = {}
+
+def _get_fasta_handle(genome_file: str):
+    """Get or create a pysam.FastaFile handle for indexed O(1) extraction.
+    Returns None if pysam is unavailable or the file can't be opened."""
+    global _fasta_handles
+    if genome_file in _fasta_handles:
+        return _fasta_handles[genome_file]
+    try:
+        import pysam
+        fai_path = genome_file + '.fai'
+        if not os.path.exists(fai_path):
+            # Try to create index
+            subprocess.run(['samtools', 'faidx', genome_file],
+                           capture_output=True, check=True, timeout=120)
+        if os.path.exists(fai_path):
+            handle = pysam.FastaFile(genome_file)
+            _fasta_handles[genome_file] = handle
+            logger.info(f"Opened pysam indexed FASTA: {genome_file}")
+            return handle
+    except ImportError:
+        logger.debug("pysam not available, will try samtools CLI")
+    except Exception as e:
+        logger.debug(f"pysam open failed: {e}")
+    _fasta_handles[genome_file] = None
+    return None
+
+def _has_samtools() -> bool:
+    """Check if samtools is available on PATH."""
+    return shutil.which('samtools') is not None
+
+def _samtools_faidx_extract(genome_file: str, chrom: str, start: int, end: int) -> str:
+    """Extract sequence using samtools faidx (0-based start, 0-based exclusive end).
+    samtools uses 1-based inclusive coordinates, so convert."""
+    region = f"{chrom}:{start+1}-{end}"
+    try:
+        result = subprocess.run(
+            ['samtools', 'faidx', genome_file, region],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return ""
+        lines = []
+        for line in result.stdout.split('\n'):
+            if not line.startswith('>') and line.strip():
+                lines.append(line.strip())
+        return ''.join(lines)
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+        return ""
 
 def reverse_complement(seq: str) -> str:
     """获取序列的反向互补"""
@@ -29,108 +81,94 @@ def calculate_sequence_identity(seq1: str, seq2: str) -> float:
 
 def extract_sequence_from_genome(genome_file: str, chrom: str,
                                start: int, end: int, strand: str = '+') -> str:
-    """从基因组中提取指定区域的序列"""
+    """Extract a genomic region using indexed access (O(1) per call).
+
+    Uses pysam if available, otherwise falls back to samtools faidx CLI,
+    and finally to BioPython sequential scan as last resort.
+    Coordinates are 0-based, half-open [start, end).
+    """
     logger.debug(f"Extracting sequence from {genome_file}: {chrom}:{start}-{end} ({strand})")
-    
-    # 检查输入参数
+
     if not os.path.exists(genome_file):
         logger.error(f"Genome file not found: {genome_file}")
         return ""
-    
-    if start < 0 or end < 0 or start >= end:
+
+    start = max(0, start)
+    if start >= end:
         logger.warning(f"Invalid coordinates: {chrom}:{start}-{end}")
         return ""
-    
-    # 首先收集所有可用的染色体名称
-    available_chroms = []
-    try:
-        with open(genome_file, 'r') as f:
-            for record in SeqIO.parse(f, 'fasta'):
-                available_chroms.append(record.id)
-                if record.id == chrom:
-                    genome_seq = str(record.seq)
-                    chrom_length = len(genome_seq)
-                    logger.debug(f"Found chromosome {chrom} with length {chrom_length}")
-                    
-                    # 确保坐标在合理范围内
-                    original_start, original_end = start, end
-                    start = max(0, start)
-                    end = min(len(genome_seq), end)
-                    
-                    if original_start != start or original_end != end:
-                        # 只在调整幅度较大时发出警告（超过100bp）
-                        adjustment = abs(original_start - start) + abs(original_end - end)
-                        if adjustment > 100:
-                            logger.warning(f"Large coordinate adjustment from {original_start}-{original_end} to {start}-{end} (adjusted by {adjustment}bp)")
-                        else:
-                            logger.debug(f"Minor coordinate adjustment from {original_start}-{original_end} to {start}-{end}")
-                    
-                    if start >= end:
-                        logger.warning(f"Invalid adjusted coordinates: {start}>={end}")
-                        return ""
-                    
-                    # 提取序列
-                    extracted_seq = genome_seq[start:end]
-                    logger.debug(f"Extracted sequence length: {len(extracted_seq)}")
-                    
-                    # 如果是负链，获取反向互补
-                    if strand == '-':
-                        extracted_seq = reverse_complement(extracted_seq)
-                        logger.debug(f"Applied reverse complement for negative strand")
-                    
-                    # 检查序列质量
-                    n_count = extracted_seq.count('N')
-                    n_percent = n_count / len(extracted_seq) if len(extracted_seq) > 0 else 1.0
-                    logger.debug(f"Extracted sequence: length={len(extracted_seq)}, N_content={n_percent:.3f}")
-                    
-                    return extracted_seq
-    except Exception as e:
-        logger.error(f"Error reading genome file {genome_file}: {e}")
-        return ""
-    
-    # 如果没有找到染色体，提供更详细的错误信息
-    logger.warning(f"Chromosome '{chrom}' not found in genome file")
-    logger.debug(f"Available chromosomes: {available_chroms[:10]}{'...' if len(available_chroms) > 10 else ''}")
-    
-    # 尝试模糊匹配
-    possible_matches = []
-    for avail_chrom in available_chroms:
-        if chrom in avail_chrom or avail_chrom in chrom:
-            possible_matches.append(avail_chrom)
-    
-    if possible_matches:
-        logger.info(f"Possible chromosome name matches: {possible_matches}")
-    
-    return ""
 
-def extract_sequence_with_flanking(genome_file: str, chrom: str, 
-                                  start: int, end: int, 
+    extracted_seq = ""
+
+    # Strategy 1: pysam (fastest — memory-mapped indexed access)
+    handle = _get_fasta_handle(genome_file)
+    if handle is not None:
+        try:
+            chrom_len = handle.get_reference_length(chrom)
+            adj_end = min(end, chrom_len)
+            if start >= adj_end:
+                logger.warning(f"Coordinates out of range: {chrom}:{start}-{end} (chrom_len={chrom_len})")
+                return ""
+            extracted_seq = handle.fetch(chrom, start, adj_end)
+        except (KeyError, ValueError):
+            # Chromosome not found in index
+            logger.debug(f"pysam: chromosome '{chrom}' not in index, trying samtools CLI")
+            extracted_seq = ""
+
+    # Strategy 2: samtools faidx CLI
+    if not extracted_seq and _has_samtools() and os.path.exists(genome_file + '.fai'):
+        extracted_seq = _samtools_faidx_extract(genome_file, chrom, start, end)
+
+    # Strategy 3: BioPython sequential scan (slowest fallback)
+    if not extracted_seq:
+        logger.debug(f"Falling back to BioPython for {chrom}:{start}-{end}")
+        try:
+            with open(genome_file, 'r') as f:
+                for record in SeqIO.parse(f, 'fasta'):
+                    if record.id == chrom:
+                        genome_seq = str(record.seq)
+                        adj_end = min(end, len(genome_seq))
+                        if start < adj_end:
+                            extracted_seq = genome_seq[start:adj_end]
+                        break
+        except Exception as e:
+            logger.error(f"BioPython extraction failed: {e}")
+            return ""
+
+    if not extracted_seq:
+        logger.warning(f"Chromosome '{chrom}' not found in genome file")
+        return ""
+
+    if strand == '-':
+        extracted_seq = reverse_complement(extracted_seq)
+
+    return extracted_seq
+
+def extract_sequence_with_flanking(genome_file: str, chrom: str,
+                                  start: int, end: int,
                                   flanking: int = 50) -> Dict:
-    """从基因组提取序列及其侧翼序列"""
-    sequences = {}
-    with open(genome_file, 'r') as f:
-        for record in SeqIO.parse(f, 'fasta'):
-            if record.id == chrom:
-                genome_seq = str(record.seq)
-                
-                # 计算提取范围
-                extract_start = max(0, start - flanking)
-                extract_end = min(len(genome_seq), end + flanking)
-                
-                # 提取序列
-                left_flank = genome_seq[extract_start:start]
-                target_seq = genome_seq[start:end]
-                right_flank = genome_seq[end:extract_end]
-                
-                return {
-                    'sequence': target_seq,
-                    'left_flank': left_flank,
-                    'right_flank': right_flank,
-                    'full_sequence': left_flank + target_seq + right_flank
-                }
-    
-    logger.warning(f"Chromosome {chrom} not found in genome file")
-    return {'sequence': '', 'left_flank': '', 'right_flank': '', 'full_sequence': ''}
+    """Extract target sequence plus flanking regions using indexed access."""
+    extract_start = max(0, start - flanking)
+    extract_end = end + flanking
+
+    full_seq = extract_sequence_from_genome(genome_file, chrom, extract_start, extract_end)
+    if not full_seq:
+        return {'sequence': '', 'left_flank': '', 'right_flank': '', 'full_sequence': ''}
+
+    # Calculate offsets within extracted sequence
+    left_len = start - extract_start
+    right_start = left_len + (end - start)
+
+    left_flank = full_seq[:left_len]
+    target_seq = full_seq[left_len:right_start]
+    right_flank = full_seq[right_start:]
+
+    return {
+        'sequence': target_seq,
+        'left_flank': left_flank,
+        'right_flank': right_flank,
+        'full_sequence': full_seq
+    }
 
 def find_best_genome_match(consensus_seq: str, genome_file: str, config) -> Dict:
     """找到共识序列在基因组中的最佳匹配位置"""
@@ -317,29 +355,104 @@ def build_consensus_from_alignment(alignment, min_coverage: float = 0.6) -> str:
     
     return ''.join(consensus)
 
-def build_consensus_from_msa(msa_result, min_coverage: float = 0.3, use_iupac: bool = True, quality_threshold: float = 0.5) -> str:
-    """从多序列比对结果构建共识序列"""
+def build_consensus_from_msa(msa_result, min_coverage: float = 0.3, use_iupac: bool = True,
+                             quality_threshold: float = 0.5,
+                             boundary_trim_coverage: float = 0.30) -> str:
+    """Build consensus from MSA with coverage-based boundary trimming.
+
+    After building the raw consensus, trims boundaries to the region where
+    at least ``boundary_trim_coverage`` fraction of aligned copies have
+    non-gap characters.  This prevents truncated copies from eroding
+    consensus boundaries with gap-dominated columns.
+
+    Args:
+        msa_result: BioPython MultipleSeqAlignment or list of aligned strings.
+        min_coverage: Minimum per-position coverage to include in consensus.
+        use_iupac: Use IUPAC ambiguity codes for polymorphic sites.
+        quality_threshold: Minimum dominant-base frequency for clean call.
+        boundary_trim_coverage: Minimum coverage fraction to retain at
+            consensus boundaries (default 0.30 = 30% of copies must have
+            non-gap bases).
+
+    Returns:
+        Consensus sequence string.
+    """
     from collections import Counter
-    
+
     if not msa_result or len(msa_result) == 0:
         return ""
-    
-    # 从BioPython MultipleSeqAlignment提取序列
+
+    # Extract sequences from BioPython alignment
     if hasattr(msa_result, '__iter__'):
         sequences = [str(record.seq) for record in msa_result]
     else:
         sequences = msa_result
-    
+
     if not sequences:
         return ""
-    
+
+    n_seqs = len(sequences)
     alignment_length = len(sequences[0])
-    consensus = []
-    
+
+    # Step 1: Compute per-position coverage for boundary trimming
+    coverage_profile = []
+    for pos in range(alignment_length):
+        column = [seq[pos].upper() for seq in sequences if pos < len(seq)]
+        non_gap = sum(1 for base in column if base != '-' and base in 'ACGTN')
+        cov_frac = non_gap / len(column) if column else 0
+        coverage_profile.append(cov_frac)
+
+    # Step 2: Find trim boundaries (region where coverage >= boundary_trim_coverage)
+    trim_start = 0
+    trim_end = alignment_length
+    for i in range(alignment_length):
+        if coverage_profile[i] >= boundary_trim_coverage:
+            trim_start = i
+            break
+    for i in range(alignment_length - 1, -1, -1):
+        if coverage_profile[i] >= boundary_trim_coverage:
+            trim_end = i + 1
+            break
+
+    if trim_start >= trim_end:
+        # Fallback: use full alignment
+        trim_start = 0
+        trim_end = alignment_length
+    else:
+        trimmed_cols = (trim_start) + (alignment_length - trim_end)
+        if trimmed_cols > 0:
+            logger.debug(f"Boundary trimming: removed {trim_start} left + "
+                         f"{alignment_length - trim_end} right columns "
+                         f"(coverage < {boundary_trim_coverage:.0%})")
+
+    # Step 3: Log copy type diagnostics
+    full_length_count = 0
+    five_prime_trunc = 0
+    three_prime_trunc = 0
+    for seq in sequences:
+        # A copy is "full length" if it has non-gap bases at both boundaries
+        has_left = any(seq[i] != '-' and seq[i].upper() in 'ACGTN'
+                       for i in range(min(20, len(seq))))
+        has_right = any(seq[i] != '-' and seq[i].upper() in 'ACGTN'
+                        for i in range(max(0, len(seq) - 20), len(seq)))
+        if has_left and has_right:
+            full_length_count += 1
+        elif has_left and not has_right:
+            five_prime_trunc += 1
+        elif has_right and not has_left:
+            three_prime_trunc += 1
+        # else: both-end truncated (very short fragment)
+
+    if n_seqs > 1:
+        logger.debug(f"Copy types in MSA ({n_seqs} total): "
+                     f"{full_length_count} full-length, "
+                     f"{five_prime_trunc} 5'-truncated, "
+                     f"{three_prime_trunc} 3'-truncated")
+
     # IUPAC ambiguous nucleotide codes
     iupac_codes = {
         frozenset(['A', 'G']): 'R',
-        frozenset(['C', 'T']): 'Y', 
+        frozenset(['C', 'T']): 'Y',
         frozenset(['G', 'C']): 'S',
         frozenset(['A', 'T']): 'W',
         frozenset(['G', 'T']): 'K',
@@ -350,48 +463,37 @@ def build_consensus_from_msa(msa_result, min_coverage: float = 0.3, use_iupac: b
         frozenset(['A', 'C', 'G']): 'V',
         frozenset(['A', 'C', 'G', 'T']): 'N'
     }
-    
-    for pos in range(alignment_length):
-        # 获取该位置的所有碱基
+
+    # Step 4: Build consensus within trimmed boundaries
+    consensus = []
+    for pos in range(trim_start, trim_end):
         column = [seq[pos].upper() for seq in sequences if pos < len(seq)]
-        
-        # 统计非gap字符
         non_gap_bases = [base for base in column if base != '-' and base in 'ACGTN']
-        
-        # 计算覆盖度
         coverage = len(non_gap_bases) / len(column) if column else 0
-        
+
         if coverage < min_coverage:
             continue
-        
         if not non_gap_bases:
             continue
-            
-        # 统计碱基频率
+
         base_counts = Counter(non_gap_bases)
         total_bases = len(non_gap_bases)
-        
-        # 找到最频繁的碱基
         most_common = base_counts.most_common()
         dominant_base = most_common[0][0]
         dominant_freq = most_common[0][1] / total_bases
-        
+
         if dominant_freq >= quality_threshold:
-            # 主导碱基频率足够高
             consensus.append(dominant_base)
         elif use_iupac and len(most_common) > 1:
-            # 使用IUPAC模糊碱基
             significant_bases = set()
             cumulative_freq = 0
-            
             for base, count in most_common:
                 freq = count / total_bases
-                if freq >= 0.2:  # 至少20%频率才考虑
+                if freq >= 0.2:
                     significant_bases.add(base)
                     cumulative_freq += freq
-                if cumulative_freq >= 0.8:  # 累计80%频率
+                if cumulative_freq >= 0.8:
                     break
-            
             if len(significant_bases) > 1:
                 iupac_key = frozenset(significant_bases)
                 iupac_code = iupac_codes.get(iupac_key, 'N')
@@ -400,118 +502,113 @@ def build_consensus_from_msa(msa_result, min_coverage: float = 0.3, use_iupac: b
                 consensus.append(dominant_base)
         else:
             consensus.append(dominant_base)
-    
+
     consensus_seq = ''.join(consensus)
-    
-    # 清理首尾的N
     consensus_seq = consensus_seq.strip('N')
-    
+
     return consensus_seq
 
-def extend_consensus_boundaries(consensus_seq: str, extended_sequence: str, aggressive: bool = True) -> str:
-    """使用扩展序列来改进共识序列的边界 - 优化版本，更积极地扩展"""
+def extend_consensus_boundaries(consensus_seq: str, extended_sequence: str, aggressive: bool = False) -> str:
+    """Extend consensus boundaries using a reference genomic copy.
+
+    Biology-aware boundary extension:
+    - Requires 80% similarity (not 60%) to accept extensions, preventing
+      host DNA flanking TE insertions from being incorporated.
+    - No aggressive fallback that blindly uses longer sequences.
+    - Maximum extension capped at 500bp per side.
+
+    Args:
+        consensus_seq: Current consensus sequence.
+        extended_sequence: Longer reference sequence (genomic copy with flanks).
+        aggressive: Deprecated, kept for API compatibility but ignored.
+
+    Returns:
+        Extended consensus or original if extension is unsupported.
+    """
     if not consensus_seq or not extended_sequence:
         return consensus_seq
-    
-    # 如果扩展序列本身就比共识序列长，直接返回扩展序列（积极策略）
-    if aggressive and len(extended_sequence) > len(consensus_seq) * 1.2:
-        # 检查是否有基本的相似性
-        similarity = calculate_quick_similarity(consensus_seq, extended_sequence)
-        if similarity > 0.6:  # 60%相似度
-            logger.debug(f"Using full extended sequence ({len(extended_sequence)}bp vs {len(consensus_seq)}bp consensus)")
-            return extended_sequence.strip('N')
-    
-    # 找到共识序列在扩展序列中的最佳匹配位置
-    best_match_pos = -1
-    best_score = 0
-    
-    # 简化的相似度匹配，支持IUPAC codes
+
+    # Skip if extended_sequence is not meaningfully longer
+    if len(extended_sequence) <= len(consensus_seq):
+        return consensus_seq
+
+    # IUPAC-aware base matching
     def matches_iupac(base1, base2):
-        """检查两个碱基是否匹配（支持IUPAC codes）"""
         base1, base2 = base1.upper(), base2.upper()
         if base1 == base2 or base1 == 'N' or base2 == 'N':
             return True
-        
         iupac_matches = {
             'R': 'AG', 'Y': 'CT', 'S': 'GC', 'W': 'AT',
             'K': 'GT', 'M': 'AC', 'B': 'CGT', 'D': 'AGT',
             'H': 'ACT', 'V': 'ACG', 'N': 'ACGT'
         }
-        
         if base1 in iupac_matches:
             return base2 in iupac_matches[base1]
         if base2 in iupac_matches:
             return base1 in iupac_matches[base2]
-        
         return False
-    
-    # 使用滑动窗口找到最佳匹配位置 - 扩大搜索范围
+
+    # Find best alignment position using sliding window
     search_range = len(extended_sequence) - len(consensus_seq) + 1
-    
-    # 使用采样搜索以提高效率
+    if search_range <= 0:
+        return consensus_seq
+
+    best_match_pos = -1
+    best_score = 0.0
     step = 1 if search_range < 1000 else max(1, search_range // 500)
-    
+
     for i in range(0, search_range, step):
-        # 快速检查前100个碱基
-        quick_matches = 0
+        # Quick screen on first 100 bases
         quick_checks = min(100, len(consensus_seq))
-        
-        for j in range(quick_checks):
-            if i + j < len(extended_sequence):
-                if matches_iupac(consensus_seq[j], extended_sequence[i + j]):
-                    quick_matches += 1
-        
-        quick_score = quick_matches / quick_checks if quick_checks > 0 else 0
-        
-        # 如果快速检查分数太低，跳过详细检查
-        if quick_score < 0.5:
+        quick_matches = sum(
+            1 for j in range(quick_checks)
+            if i + j < len(extended_sequence) and matches_iupac(consensus_seq[j], extended_sequence[i + j])
+        )
+        if quick_checks > 0 and quick_matches / quick_checks < 0.6:
             continue
-        
-        # 详细检查
+
+        # Full comparison
         matches = 0
         comparisons = 0
-        
         for j in range(len(consensus_seq)):
             if i + j < len(extended_sequence):
                 comparisons += 1
                 if matches_iupac(consensus_seq[j], extended_sequence[i + j]):
                     matches += 1
-        
+
         if comparisons > 0:
             score = matches / comparisons
             if score > best_score:
                 best_score = score
                 best_match_pos = i
-    
-    # 降低阈值以更积极地扩展 - 从70%降到60%
-    if best_match_pos >= 0 and best_score > 0.6:
-        # 获取左侧扩展 - 限制最大扩展长度避免过度扩展
-        max_left_extension = min(best_match_pos, len(consensus_seq) // 2)  # 最多扩展50%长度
-        left_extension = extended_sequence[max(0, best_match_pos - max_left_extension):best_match_pos]
-        
-        # 获取右侧扩展
-        right_start = best_match_pos + len(consensus_seq)
-        max_right_extension = min(len(extended_sequence) - right_start, len(consensus_seq) // 2)
-        right_extension = extended_sequence[right_start:right_start + max_right_extension]
-        
-        # 组合扩展序列
-        extended_consensus = left_extension + consensus_seq + right_extension
-        
-        # 清理首尾的N和低质量区域，但保留内部的N
-        extended_consensus = extended_consensus.strip('N')
-        
-        if len(extended_consensus) > len(consensus_seq):
-            logger.debug(f"Extended consensus from {len(consensus_seq)}bp to {len(extended_consensus)}bp ")
-        
-        return extended_consensus
-    
-    # 如果没有找到好的匹配，但扩展序列更长，考虑直接使用
-    if aggressive and len(extended_sequence) > len(consensus_seq) * 1.1:
-        logger.debug(f"No good match found, but using longer extended sequence anyway ({len(extended_sequence)}bp)")
-        return extended_sequence.strip('N')
-    
-    # 返回原序列
-    return consensus_seq
+
+    # Require 80% similarity to accept extension (prevents host DNA contamination)
+    if best_match_pos < 0 or best_score < 0.80:
+        logger.debug(f"Boundary extension rejected: best_score={best_score:.2f} < 0.80 threshold")
+        return consensus_seq
+
+    # Cap extension at 500bp per side
+    max_extension = 500
+
+    # Left extension
+    left_avail = best_match_pos
+    left_ext_len = min(left_avail, max_extension)
+    left_extension = extended_sequence[best_match_pos - left_ext_len:best_match_pos]
+
+    # Right extension
+    right_start = best_match_pos + len(consensus_seq)
+    right_avail = len(extended_sequence) - right_start
+    right_ext_len = min(right_avail, max_extension)
+    right_extension = extended_sequence[right_start:right_start + right_ext_len]
+
+    extended_consensus = left_extension + consensus_seq + right_extension
+    extended_consensus = extended_consensus.strip('N')
+
+    if len(extended_consensus) > len(consensus_seq):
+        logger.debug(f"Extended consensus from {len(consensus_seq)}bp to {len(extended_consensus)}bp "
+                     f"(match={best_score:.2f}, left=+{left_ext_len}bp, right=+{right_ext_len}bp)")
+
+    return extended_consensus
 
 def calculate_quick_similarity(seq1: str, seq2: str) -> float:
     """快速计算两个序列的相似度（采样方法）"""
