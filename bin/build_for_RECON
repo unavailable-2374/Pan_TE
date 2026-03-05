@@ -498,25 +498,26 @@ sub calculate_low_complexity {
     my $sequence = shift;
     my $seq_length = length($sequence);
     return 1.0 if $seq_length == 0;
-    
-    # Count mono-nucleotide runs and simple repeats
-    my $low_complexity_bases = 0;
-    
-    # Count mono-nucleotide runs (3+ consecutive identical bases)
+
+    # Use position-based tracking to avoid double-counting overlapping matches
+    my @marked = (0) x $seq_length;
+
+    # Mark mono-nucleotide runs (3+ consecutive identical bases)
     while ($sequence =~ /([ATGCN])\1{2,}/gi) {
-        $low_complexity_bases += length($&);
+        for my $i ($-[0] .. $+[0] - 1) { $marked[$i] = 1; }
     }
-    
-    # Count simple dinucleotide repeats (6+ bases of pattern)
+
+    # Mark simple dinucleotide repeats (6+ bases of pattern)
     while ($sequence =~ /([ATGCN]{2})\1{2,}/gi) {
-        $low_complexity_bases += length($&);
+        for my $i ($-[0] .. $+[0] - 1) { $marked[$i] = 1; }
     }
-    
-    # Count simple trinucleotide repeats (9+ bases of pattern)
+
+    # Mark simple trinucleotide repeats (9+ bases of pattern)
     while ($sequence =~ /([ATGCN]{3})\1{2,}/gi) {
-        $low_complexity_bases += length($&);
+        for my $i ($-[0] .. $+[0] - 1) { $marked[$i] = 1; }
     }
-    
+
+    my $low_complexity_bases = grep { $_ } @marked;
     return $low_complexity_bases / $seq_length;
 }
 

@@ -320,16 +320,20 @@ sub run_trf_masking {
         "dustmasker -in $input_file -out $output_file -outfmt fasta"
     );
     
+    my $success = 0;
     for my $cmd (@masking_tools) {
         eval {
             run_cmd($cmd);
-            return; # Success
+            $success = 1;
         };
+        last if $success;
     }
-    
+
     # If all masking tools fail, just copy the input
-    run_cmd("cp $input_file $output_file");
-    log_message("WARN", "TRF masking failed, using unmasked sequence", "file=$output_file");
+    unless ($success) {
+        run_cmd("cp $input_file $output_file");
+        log_message("WARN", "TRF masking failed, using unmasked sequence", "file=$output_file");
+    }
 }
 
 sub run_repeatmasker {

@@ -183,7 +183,7 @@ class LTRBoundaryRefiner:
         # Clean up temp file
         try:
             os.remove(temp_fasta)
-        except:
+        except OSError:
             pass
 
         if not alignments:
@@ -244,9 +244,9 @@ class LTRBoundaryRefiner:
                 for ext in ['.db.nhr', '.db.nin', '.db.nsq']:
                     try:
                         os.remove(fasta_file + ext)
-                    except:
+                    except OSError:
                         pass
-            except:
+            except OSError:
                 pass
 
             return alignments
@@ -304,9 +304,9 @@ class LTRBoundaryRefiner:
                 for ext in ['.db.nhr', '.db.nin', '.db.nsq']:
                     try:
                         os.remove(fasta_file + ext)
-                    except:
+                    except OSError:
                         pass
-            except:
+            except OSError:
                 pass
 
             return alignments

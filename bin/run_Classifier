@@ -6,15 +6,14 @@ set -o pipefail
 
 # Configuration
 LOG_FILE="classifier.log"
-TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
 # Logging function
 log() {
-    echo "[$TIMESTAMP] $1" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
 error() {
-    echo "[$TIMESTAMP] ERROR: $1" | tee -a "$LOG_FILE" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" | tee -a "$LOG_FILE" >&2
     exit 1
 }
 
@@ -72,31 +71,23 @@ else
     RC_THREADS=1
 fi
 
-# Create temporary files to track completion
-RC_DONE="/tmp/rc_done.$$"
-CT_DONE="/tmp/ct_done.$$"
+# Create temporary files to track completion (secure mktemp)
+RC_DONE=$(mktemp /tmp/rc_done.XXXXXX) && rm "$RC_DONE"
+CT_DONE=$(mktemp /tmp/ct_done.XXXXXX) && rm "$CT_DONE"
 
 # Run RepeatClassifier in background
 log "Starting RepeatClassifier with $RC_THREADS threads"
 (
-    RepeatClassifier -consensi data/re.fa --threads $RC_THREADS
-    touch "$RC_DONE"
+    RepeatClassifier -consensi data/re.fa --threads $RC_THREADS && touch "$RC_DONE"
 ) &
 RC_PID=$!
 
 # Run parallel feature generation and evaluation
 log "Starting feature generation and evaluation"
 (
-    # Generate feature file
-    if ! conda run -n ClassifyTE_env python "$CLASSIFYTE_DIR/generate_feature_file_parallel.py" -j $RC_THREADS -f re.fa -d sup_features -o sup.csv; then
-        error "Failed to generate feature file"
-    fi
-
-    # Evaluate features
-    if ! conda run -n ClassifyTE_env python "$CLASSIFYTE_DIR/evaluate.py" -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb; then
-        error "Feature evaluation failed"
-    fi
-    touch "$CT_DONE"
+    conda run -n ClassifyTE_env python "$CLASSIFYTE_DIR/generate_feature_file_parallel.py" -j $RC_THREADS -f re.fa -d sup_features -o sup.csv \
+    && conda run -n ClassifyTE_env python "$CLASSIFYTE_DIR/evaluate.py" -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb \
+    && touch "$CT_DONE"
 ) &
 CT_PID=$!
 
