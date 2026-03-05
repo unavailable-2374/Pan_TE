@@ -62,8 +62,3 @@ class RobustRunner:
         
         return result
     
-    def cleanup_checkpoints(self):
-        """清理所有检查点文件"""
-        for checkpoint_file in self.checkpoint_dir.glob("*.pkl"):
-            checkpoint_file.unlink()
-        logger.info("Cleaned up all checkpoints")

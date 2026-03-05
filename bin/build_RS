@@ -328,85 +328,6 @@ sub create_genome_sample {
     return $masked_sample;
 }
 
-sub create_non_overlapping_genome_samples {
-    my ($target_size, $num_samples) = @_;
-    
-    $logger->info("Creating $num_samples non-overlapping samples of " . sprintf("%.1f MB each", $target_size/1e6) . " using progressive BED-based sampling");
-    
-    # Create initial empty mask BED file
-    my $mask_bed = "$config{tmp_dir}/progressive_mask.bed";
-    open(my $mask_fh, '>', $mask_bed) or die "Cannot create mask BED file: $!";
-    close($mask_fh);
-    
-    # Generate progressive samples using BED-based approach
-    $logger->info("Generating progressive BED samples for $num_samples samples, target size: " . sprintf("%.1f MB each", $target_size/1e6));
-    my @sample_beds = generate_progressive_bed_samples($target_size, $num_samples, $mask_bed);
-    
-    unless (@sample_beds) {
-        $logger->error("No BED files were generated for any samples");
-        die "BED file generation failed for all samples\n";
-    }
-    
-    $logger->info("Generated " . scalar(@sample_beds) . " BED files");
-    
-    my @sample_files;
-    
-    # Extract sequences for each sample
-    for my $sample_id (1..$num_samples) {
-        my $sample_bed = $sample_beds[$sample_id - 1];
-        unless ($sample_bed) {
-            $logger->warn("No BED file for sample $sample_id, skipping");
-            next;
-        }
-        
-        $logger->info("Processing sample $sample_id with BED file: $sample_bed");
-        
-        # Check BED file before extraction
-        unless (-s $sample_bed) {
-            $logger->error("Sample $sample_id BED file is empty or missing: $sample_bed");
-            next;
-        }
-        
-        my $sample_file = "$config{tmp_dir}/genome_sample_${sample_id}.fa";
-        my $extraction_success = extract_sequences_from_bed($sample_bed, $sample_file);
-        
-        if ($extraction_success) {
-            $logger->info("Sample $sample_id extraction successful: " . sprintf("%.1f MB", (-s $sample_file)/1e6));
-            push @sample_files, $sample_file;
-        } else {
-            $logger->error("Failed to extract sequences for sample $sample_id from BED: $sample_bed");
-        }
-    }
-    
-    if (@sample_files == 0) {
-        $logger->error("No sample files were successfully created");
-        die "All sample extractions failed\n";
-    }
-    
-    $logger->info("Successfully created " . scalar(@sample_files) . " sample files out of $num_samples requested");
-    
-    # Apply soft masking to all samples in parallel
-    $logger->info("Applying soft masking to all " . scalar(@sample_files) . " samples...");
-    my @masked_files = apply_soft_masking_to_samples(@sample_files);
-    
-    # Filter out failed masking results
-    @masked_files = grep { -s $_ } @masked_files;
-    
-    if (@masked_files == 0) {
-        $logger->error("No masked files were successfully created");
-        die "All sample masking failed\n";
-    }
-    
-    # Log final results
-    for my $i (0..$#masked_files) {
-        my $actual_size = -s $masked_files[$i];
-        $logger->info("Progressive BED-based sample " . ($i + 1) . " created and masked: " . sprintf("%.1f MB", $actual_size/1e6));
-        $logger->info("Returning masked file " . ($i + 1) . " for mdl-repeat: $masked_files[$i]");
-    }
-    
-    return @masked_files;
-}
-
 sub generate_progressive_bed_samples {
     my ($target_size, $num_samples, $mask_bed) = @_;
     
@@ -566,24 +487,6 @@ sub read_genome_sizes {
     close($fai_fh);
     
     return %sizes;
-}
-
-sub choose_weighted_chromosome {
-    my ($chr_sizes_ref, $total_size) = @_;
-    my %chr_sizes = %$chr_sizes_ref;
-    
-    my $rand_pos = rand($total_size);
-    my $cumulative = 0;
-    
-    for my $chr (sort keys %chr_sizes) {
-        $cumulative += $chr_sizes{$chr};
-        if ($rand_pos <= $cumulative) {
-            return $chr;
-        }
-    }
-    
-    # Fallback to first chromosome if something goes wrong
-    return (sort keys %chr_sizes)[0];
 }
 
 sub region_overlaps_mask {

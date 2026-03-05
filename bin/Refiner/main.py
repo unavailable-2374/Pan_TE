@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import logging
 import argparse
-import json
 import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Any

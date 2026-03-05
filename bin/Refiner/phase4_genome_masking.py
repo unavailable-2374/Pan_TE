@@ -9,6 +9,7 @@ Phase 4: 高质量基因组硬屏蔽 (High-Quality Genome Hard Masking)
 
 import logging
 import os
+import shutil
 import tempfile
 import subprocess
 from typing import Dict, List, Set, Tuple, Optional
@@ -302,7 +303,6 @@ class GenomeMasker:
             
             if rm_output.exists():
                 # 重命名为标准名称
-                import shutil
                 shutil.move(str(rm_output), str(hard_masked_file))
                 logger.info(f"RepeatMasker hard masking completed: {hard_masked_file}")
             else:
@@ -795,7 +795,6 @@ class GenomeMasker:
             
             if masked_file.exists():
                 # 移动到最终位置
-                import shutil
                 shutil.move(str(masked_file), str(output_file))
                 logger.info(f"Second round masking completed: {output_file}")
                 return str(output_file)
@@ -1012,7 +1011,6 @@ class GenomeMasker:
                 logger.info(f"Created main output link: {main_output} → {main_restored.name}")
             except Exception:
                 # 如果符号链接失败，复制文件
-                import shutil
                 shutil.copy2(str(main_restored), str(main_output))
                 logger.info(f"Copied main output: {main_output}")
         

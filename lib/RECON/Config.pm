@@ -11,7 +11,6 @@ use RECON::Utils;
 
 our @EXPORT = qw(
     parse_arguments validate_inputs find_input_files
-    get_pipeline_config
 );
 
 # Default configuration
@@ -201,35 +200,6 @@ sub find_input_files {
                 "genome=$genome_file, bed_files=" . scalar(@bed_files));
     
     return $config;
-}
-
-sub get_pipeline_config {
-    my ($genome_size, $threads) = @_;
-    
-    my %pipeline_config = %DEFAULT_CONFIG;
-    
-    # Adjust configuration based on genome size
-    my $genome_class = classify_genome_size($genome_size);
-    
-    if ($genome_class eq 'HUGE') {
-        $pipeline_config{max_blast_chunk_size} = 50;  # Smaller chunks
-        $pipeline_config{sample_sizes} = [20, 60, 180, 360];  # Smaller samples
-    } elsif ($genome_class eq 'LARGE') {
-        $pipeline_config{max_blast_chunk_size} = 75;
-        $pipeline_config{sample_sizes} = [25, 75, 225, 450];
-    } elsif ($genome_class eq 'SMALL' || $genome_class eq 'TINY') {
-        $pipeline_config{sample_sizes} = [50, 150, 400];  # Fewer rounds
-        $pipeline_config{max_sampling_rounds} = 3;
-    }
-    
-    # Adjust for thread count
-    if ($threads <= 4) {
-        $pipeline_config{max_blast_chunk_size} = 200;  # Larger chunks for fewer threads
-    } elsif ($threads >= 32) {
-        $pipeline_config{max_blast_chunk_size} = 25;   # Smaller chunks for many threads
-    }
-    
-    return \%pipeline_config;
 }
 
 sub print_usage {

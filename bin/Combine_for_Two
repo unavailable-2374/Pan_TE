@@ -1,5 +1,6 @@
 #!/usr/bin/perl
 use strict;
+use warnings;
 
 my %unknown_seqs;  # Store sequences marked as Unknown by RepeatClassifier
 my %classified_seqs;  # Store sequences successfully classified by RepeatClassifier
@@ -8,7 +9,7 @@ my $flag;
 my $key;
 
 # Read RepeatClassifier results
-open(IN,"data/re.fa.classified ") or die "open file die for $!\n";
+open(IN,"data/re.fa.classified") or die "open file die for $!\n";
 while(<IN>){
     chomp;
     if(/>/){
@@ -40,7 +41,7 @@ close(IN);
 
 # Read ClassifyTE results
 if(-e "result.txt"){
-    open(LS,"result.txt ") or die "result.txt die for $!\n";
+    open(LS,"result.txt") or die "result.txt die for $!\n";
     while(<LS>){
         chomp;
         # Format: TE_00000001#Unknown,tRNA#E_00000010#Unknown,hAT

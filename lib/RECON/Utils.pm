@@ -10,8 +10,8 @@ use RECON::Logger;
 our @EXPORT = qw(
     run_cmd create_seq_name_list split_fasta_by_size rename_fasta_ids
     rename_and_fragment_fasta
-    perform_adaptive_sampling calculate_bed_size perform_sampling
-    calculate_available_size filter_self_hits
+    perform_adaptive_sampling calculate_bed_size
+    calculate_available_size
     run_trf_masking run_repeatmasker create_blast_database
     format_size classify_genome_size check_required_tools
 );
@@ -307,48 +307,6 @@ sub calculate_bed_size {
     my $total_size = `awk '{sum += (\$3 - \$2)} END {print sum+0}' $bed_file`;
     chomp $total_size;
     return $total_size || 0;
-}
-
-sub perform_sampling {
-    my ($genome_file, $bed_file, $output_file) = @_;
-    
-    my $cmd = "bedtools getfasta -fi $genome_file -bed $bed_file > $output_file";
-    run_cmd($cmd);
-    
-    log_message("INFO", "Sampling completed", "output=$output_file");
-}
-
-sub filter_self_hits {
-    my ($blast_file, $output_file, $min_length, $max_evalue) = @_;
-    $min_length ||= 50;
-    $max_evalue ||= 1e-5;
-    
-    open(my $input_fh, '<', $blast_file) or die "Cannot open $blast_file: $!\n";
-    open(my $output_fh, '>', $output_file) or die "Cannot create $output_file: $!\n";
-    
-    my $filtered_count = 0;
-    while (my $line = <$input_fh>) {
-        chomp $line;
-        my @fields = split /\t/, $line;
-        next if @fields < 12;
-        
-        my ($query, $subject, $identity, $length, $mismatches, $gaps,
-            $qstart, $qend, $sstart, $send, $evalue, $bitscore) = @fields;
-        
-        # Filter self-hits and low quality hits
-        next if $query eq $subject;
-        next if $length < $min_length;
-        next if $evalue > $max_evalue;
-        
-        print $output_fh "$line\n";
-        $filtered_count++;
-    }
-    
-    close($input_fh);
-    close($output_fh);
-    
-    log_message("INFO", "Filtered BLAST hits", "kept=$filtered_count hits");
-    return $filtered_count;
 }
 
 sub run_trf_masking {

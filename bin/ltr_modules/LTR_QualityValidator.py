@@ -15,15 +15,12 @@ Date: 2025-11-20
 """
 
 import os
-import sys
 import logging
 import subprocess
 import tempfile
 import random
 import numpy as np
 from Bio import SeqIO
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
 
 
 class LTRQualityValidator:

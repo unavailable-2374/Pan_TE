@@ -836,7 +836,6 @@ class EnhancedTERefiner:
         # For simple consensus, just use the longest sequence
         # In a more sophisticated implementation, we could do position-wise consensus
         longest = max(copies, key=lambda x: x['length'])
-        longest = max(copies, key=lambda x: x['length'])
         return longest['sequence']
     
     def _create_single_consensus(self, copy: Dict) -> Dict:

@@ -12,10 +12,8 @@ import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from dataclasses import dataclass
-import tempfile
-import shutil
 
 # Configure logging
 logging.basicConfig(
@@ -144,8 +142,7 @@ class VCFProcessor:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True,
-                    universal_newlines=True
+                    text=True
                 )
                 
                 while True:

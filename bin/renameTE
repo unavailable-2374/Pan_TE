@@ -3,15 +3,15 @@
 use warnings;
 use strict;
 
-open(IN,$ARGV[1]);
-open(OUT,">$ARGV[2]");
+open(my $in, '<', $ARGV[1]) or die "Cannot open $ARGV[1]: $!\n";
+open(my $out, '>', $ARGV[2]) or die "Cannot create $ARGV[2]: $!\n";
 
 my $num = 0;
-while (<IN>) {
+while (<$in>) {
     chomp;
     if(/>/){
         $num++;
         $num = sprintf("%08d", $num);
-        print OUT ">".$ARGV[0]."_".$num."#Unknown\n";
-    }else{print OUT $_."\n";}
+        print $out ">".$ARGV[0]."_".$num."#Unknown\n";
+    }else{print $out $_."\n";}
 }

@@ -120,69 +120,6 @@ def run_repeatmasker_batch_detailed(sequences: List[Dict], genome_file: str,
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
-def run_repeatmasker_batch(sequences: List[Dict], genome_file: str, 
-                          params: Dict, config) -> Dict[str, Dict]:
-    """批量运行RepeatMasker"""
-    results = {}
-    
-    # 创建临时库文件
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.fa', delete=False) as lib_file:
-        for seq_data in sequences:
-            lib_file.write(f">{seq_data['id']}\n{seq_data['sequence']}\n")
-        lib_file_path = lib_file.name
-    
-    # 创建临时输出目录
-    temp_dir = tempfile.mkdtemp(prefix='rm_batch_')
-    
-    try:
-        # 构建RepeatMasker命令
-        cmd = [config.repeatmasker_exe]
-        
-        # 添加快速模式参数（如果启用）
-        if getattr(config, 'repeatmasker_quick', False):
-            cmd.append('-q')
-        
-        # 添加参数
-        if params.get('s'):
-            cmd.append('-s')
-        if params.get('no_is'):
-            cmd.append('-no_is')
-        if params.get('nolow'):
-            cmd.append('-nolow')
-        if 'cutoff' in params:
-            cmd.extend(['-cutoff', str(params['cutoff'])])
-        if 'pa' in params:
-            cmd.extend(['-pa', str(params['pa'])])
-        
-        cmd.extend([
-            '-lib', lib_file_path,
-            '-dir', temp_dir,
-            genome_file
-        ])
-        
-        # 运行RepeatMasker
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)
-
-        # 解析输出文件
-        out_file = os.path.join(temp_dir, os.path.basename(genome_file) + '.out')
-        if os.path.exists(out_file):
-            results = parse_repeatmasker_output(out_file, sequences)
-
-    except subprocess.TimeoutExpired:
-        logger.error("RepeatMasker batch timed out after 6 hours")
-    except Exception as e:
-        logger.error(f"RepeatMasker batch run failed: {e}")
-    finally:
-        # 清理临时文件
-        if os.path.exists(lib_file_path):
-            os.unlink(lib_file_path)
-        # 清理临时目录
-        import shutil
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-    
-    return results
-
 def run_repeatmasker_single(sequence: Dict, genome_file: str, 
                            params: Dict, config) -> List[Dict]:
     """对单个序列运行RepeatMasker"""
@@ -256,55 +193,49 @@ def parse_repeatmasker_output(out_file: str, sequences: List[Dict]) -> Dict[str,
             'hits': []
         }
     
+    # Build O(1) lookup set from sequence IDs
+    seq_id_set = {seq_data['id'] for seq_data in sequences}
+
     try:
         with open(out_file, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith('SW') or line.startswith('score'):
                     continue
-                
+
                 fields = line.split()
                 if len(fields) >= 15:
-                    # 解析字段
                     repeat_name = fields[9]
-                    
-                    # 找到对应的序列
-                    for seq_data in sequences:
-                        if seq_data['id'] == repeat_name:
-                            identity = 100 - float(fields[1])  # 转换为相似度
-                            length = int(fields[6]) - int(fields[5]) + 1
 
-                            # 处理染色体名称中可能包含的坐标信息
-                            chrom = fields[4]
-                            if ':' in chrom:
-                                chrom = chrom.split(':')[0]
+                    if repeat_name in seq_id_set:
+                        identity = 100 - float(fields[1])
+                        length = int(fields[6]) - int(fields[5]) + 1
 
-                            # Extract query coordinates (matching repeat begin/end)
-                            # RM .out fields[11] = repeat begin, fields[12] = repeat end
-                            query_start = 0
-                            query_end = 0
-                            try:
-                                # fields[11] is "repeat begin" (query start in consensus)
-                                # fields[12] is "repeat end" (query end in consensus)
-                                qs = fields[11].strip('()')
-                                qe = fields[12].strip('()')
-                                query_start = int(qs) if qs.isdigit() else 0
-                                query_end = int(qe) if qe.isdigit() else 0
-                            except (IndexError, ValueError):
-                                pass
+                        chrom = fields[4]
+                        if ':' in chrom:
+                            chrom = chrom.split(':')[0]
 
-                            results[repeat_name]['copy_number'] += 1
-                            results[repeat_name]['total_length'] += length
-                            results[repeat_name]['hits'].append({
-                                'chrom': chrom,
-                                'start': int(fields[5]),
-                                'end': int(fields[6]),
-                                'identity': identity,
-                                'length': length,
-                                'query_start': query_start,
-                                'query_end': query_end
-                            })
-                            break
+                        query_start = 0
+                        query_end = 0
+                        try:
+                            qs = fields[11].strip('()')
+                            qe = fields[12].strip('()')
+                            query_start = int(qs) if qs.isdigit() else 0
+                            query_end = int(qe) if qe.isdigit() else 0
+                        except (IndexError, ValueError):
+                            pass
+
+                        results[repeat_name]['copy_number'] += 1
+                        results[repeat_name]['total_length'] += length
+                        results[repeat_name]['hits'].append({
+                            'chrom': chrom,
+                            'start': int(fields[5]),
+                            'end': int(fields[6]),
+                            'identity': identity,
+                            'length': length,
+                            'query_start': query_start,
+                            'query_end': query_end
+                        })
         
         # 计算平均相似度
         for seq_id, data in results.items():

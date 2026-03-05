@@ -1,16 +1,17 @@
 #!/usr/bin/perl
 use strict;
+use warnings;
 
-open(IN,"$ARGV[0]");
-open(OUT,">$ARGV[0].translation");
+open(my $in, '<', $ARGV[0]) or die "Cannot open $ARGV[0]: $!\n";
+open(my $out, '>', "$ARGV[0].translation") or die "Cannot create $ARGV[0].translation: $!\n";
 
 my $i=1;
 
-while(<IN>){
-	chomp;
-	if(/>/){
-		s/>//;
-		print OUT $_."\t".$i."\n";
-		$i++;
-	}
+while(<$in>){
+    chomp;
+    if(/>/){
+        s/>//;
+        print $out $_."\t".$i."\n";
+        $i++;
+    }
 }

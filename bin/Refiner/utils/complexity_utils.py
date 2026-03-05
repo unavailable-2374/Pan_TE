@@ -80,53 +80,6 @@ def calculate_shannon_entropy(sequence: str, k: int = 1) -> float:
     
     return entropy
 
-def get_iupac_ambiguity(base_votes: Dict[str, float], total_weight: float) -> str:
-    """
-    根据碱基投票结果返回IUPAC兼并碱基
-    """
-    if not base_votes or total_weight == 0:
-        return 'N'
-    
-    # IUPAC兼并碱基编码
-    iupac_codes = {
-        frozenset(['A']): 'A',
-        frozenset(['C']): 'C',
-        frozenset(['G']): 'G',
-        frozenset(['T']): 'T',
-        frozenset(['A', 'G']): 'R',
-        frozenset(['C', 'T']): 'Y',
-        frozenset(['G', 'C']): 'S',
-        frozenset(['A', 'T']): 'W',
-        frozenset(['G', 'T']): 'K',
-        frozenset(['A', 'C']): 'M',
-        frozenset(['C', 'G', 'T']): 'B',
-        frozenset(['A', 'G', 'T']): 'D',
-        frozenset(['A', 'C', 'T']): 'H',
-        frozenset(['A', 'C', 'G']): 'V',
-        frozenset(['A', 'C', 'G', 'T']): 'N'
-    }
-    
-    # 确定有效碱基（权重超过阈值）
-    threshold = total_weight * 0.2  # 20%阈值
-    significant_bases = set()
-    
-    for base, weight in base_votes.items():
-        if weight >= threshold and base in 'ACGT':
-            significant_bases.add(base)
-    
-    if not significant_bases:
-        # 如果没有显著碱基，选择权重最高的
-        best_base = max(base_votes, key=base_votes.get)
-        return best_base if best_base in 'ACGT' else 'N'
-    
-    # 查找对应的IUPAC代码
-    for bases, code in iupac_codes.items():
-        if significant_bases == bases:
-            return code
-    
-    # 如果没有精确匹配，返回N
-    return 'N'
-
 def calculate_sequence_complexity(sequence: str) -> Dict[str, float]:
     """
     计算序列的多维度复杂度指标

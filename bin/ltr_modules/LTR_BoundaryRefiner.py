@@ -11,12 +11,9 @@ New Strategy:
 """
 
 import os
-import re
-import math
 import logging
 import subprocess
 import tempfile
-from collections import defaultdict, Counter
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord

@@ -75,10 +75,6 @@ def calculate_identity(seq1: str, seq2: str) -> float:
     
     return matches / min_len if min_len > 0 else 0.0
 
-def calculate_sequence_identity(seq1: str, seq2: str) -> float:
-    """计算两个序列的相似度（与calculate_identity相同的实现）"""
-    return calculate_identity(seq1, seq2)
-
 def extract_sequence_from_genome(genome_file: str, chrom: str,
                                start: int, end: int, strand: str = '+') -> str:
     """Extract a genomic region using indexed access (O(1) per call).
@@ -609,28 +605,6 @@ def extend_consensus_boundaries(consensus_seq: str, extended_sequence: str, aggr
                      f"(match={best_score:.2f}, left=+{left_ext_len}bp, right=+{right_ext_len}bp)")
 
     return extended_consensus
-
-def calculate_quick_similarity(seq1: str, seq2: str) -> float:
-    """快速计算两个序列的相似度（采样方法）"""
-    if not seq1 or not seq2:
-        return 0.0
-    
-    # 采样比较，每100bp取一个点
-    sample_size = min(100, min(len(seq1), len(seq2)))
-    step = max(1, min(len(seq1), len(seq2)) // sample_size)
-    
-    matches = 0
-    comparisons = 0
-    
-    for i in range(0, min(len(seq1), len(seq2)), step):
-        if i < len(seq1) and i < len(seq2):
-            comparisons += 1
-            if seq1[i].upper() == seq2[i].upper() or seq1[i] == 'N' or seq2[i] == 'N':
-                matches += 1
-    
-    return matches / comparisons if comparisons > 0 else 0.0
-
-
 
 def run_cdhit(sequences: List[Dict], identity_threshold: float, config) -> List[Dict]:
     """使用CD-HIT-EST进行序列去冗余"""
