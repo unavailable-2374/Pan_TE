@@ -1,0 +1,45 @@
+{% set name = "mdl-repeat" %}
+{% set version = "1.0.0" %}
+
+# NOTE (bioconda submission):
+#   1. https://github.com/unavailable-2374/mdl-repeat has NO LICENSE file yet — bioconda
+#      REQUIRES one. Add a LICENSE to the repo and align the `license:` field below to its
+#      actual SPDX identifier (the GPL-3.0-or-later placeholder is a guess, not a fact).
+#   2. Needs a tagged release. After `git tag v{{ version }}` && push, set the sha256 via:
+#        curl -sL https://github.com/unavailable-2374/mdl-repeat/archive/refs/tags/v{{ version }}.tar.gz | sha256sum
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/unavailable-2374/mdl-repeat/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000  # TODO: real sha256 of the release tarball
+
+build:
+  number: 0
+  run_exports:
+    - {{ pin_subpackage(name, max_pin="x") }}
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - make
+
+test:
+  commands:
+    - mdl-repeat --help 2>&1 | head -1 || mdl-repeat 2>&1 | head -1
+
+about:
+  home: https://github.com/unavailable-2374/mdl-repeat
+  license: GPL-3.0-or-later          # TODO: set to the actual SPDX id of the LICENSE you add
+  license_family: GPL
+  license_file: LICENSE              # TODO: this file must exist in the release tarball
+  summary: "De novo repeat discovery via the Minimum Description Length (MDL) principle."
+  description: |
+    mdl-repeat performs de novo repeat-family discovery on genomic FASTA using the MDL
+    principle. It is the broad-spectrum de novo track of the Pan_TE pipeline.
+
+extra:
+  recipe-maintainers:
+    - unavailable-2374

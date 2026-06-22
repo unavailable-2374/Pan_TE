@@ -1,0 +1,49 @@
+{% set name = "look4ltrs" %}
+{% set version = "1.0.0" %}
+
+# NOTE (bioconda submission): this recipe needs a tagged release of
+# https://github.com/unavailable-2374/Look4LTRs. After you `git tag v{{ version }}`
+# and push, replace the sha256 below with:
+#   curl -sL https://github.com/unavailable-2374/Look4LTRs/archive/refs/tags/v{{ version }}.tar.gz | sha256sum
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/unavailable-2374/Look4LTRs/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000  # TODO: real sha256 of the release tarball
+
+build:
+  number: 0
+  run_exports:
+    - {{ pin_subpackage(name, max_pin="x") }}
+
+requirements:
+  build:
+    - {{ compiler('cxx') }}
+    - cmake
+    - make
+  host:
+    - zlib
+  run:
+    - python >=3.8        # build_ltr_library.py helper ships with this tool (used by pan_te)
+    - biopython
+
+test:
+  commands:
+    - look4ltrs --help 2>&1 | head -1 || look4ltrs 2>&1 | head -1
+
+about:
+  home: https://github.com/unavailable-2374/Look4LTRs
+  license: AGPL-1.0-only
+  license_family: AGPL
+  license_file: LICENSE
+  summary: "LTR retrotransposon detection (Look4LTRs), C++17 + OpenMP."
+  description: |
+    Look4LTRs detects LTR retrotransposons from genomic FASTA. Used as the
+    LTR-detection track of the Pan_TE pan-genome TE annotation pipeline.
+
+extra:
+  recipe-maintainers:
+    - unavailable-2374

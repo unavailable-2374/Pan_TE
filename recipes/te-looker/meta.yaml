@@ -1,0 +1,56 @@
+{% set name = "te-looker" %}
+{% set version = "0.3.0" %}
+
+# NOTE (bioconda submission): te-looker's source is currently PRIVATE/local-only.
+# Per the chosen plan it must become a PUBLIC GitHub repo with a tagged release before
+# this recipe can be submitted (bioconda forbids private/unfetchable source).
+#   1. Create public repo (assumed: https://github.com/unavailable-2374/te-looker).
+#   2. Add a LICENSE file (bioconda REQUIRES it) and align `license:` below to its SPDX id.
+#   3. `git tag v{{ version }}` && push, then set sha256 via:
+#        curl -sL https://github.com/unavailable-2374/te-looker/archive/refs/tags/v{{ version }}.tar.gz | sha256sum
+# The Rust crate inside is `te-core` v{{ version }}; binaries: dtr, te-discover, te-refine, te-seed.
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/unavailable-2374/te-looker/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000  # TODO: real sha256 of the release tarball
+
+build:
+  number: 0
+  run_exports:
+    - {{ pin_subpackage(name, max_pin="x.x") }}
+
+requirements:
+  build:
+    - {{ compiler('rust') }}
+    - {{ compiler('c') }}
+    - make
+  run:
+    # Runtime tools the dtr pipeline shells out to (design tracks / consensus).
+    - abpoa
+    - spoa
+
+test:
+  commands:
+    - dtr --help 2>&1 | head -1 || dtr --version 2>&1 | head -1
+    - test -x "$PREFIX/bin/te-discover"
+    - test -x "$PREFIX/bin/te-refine"
+    - test -x "$PREFIX/bin/te-seed"
+
+about:
+  home: https://github.com/unavailable-2374/te-looker
+  license: GPL-3.0-or-later          # TODO: set to the actual SPDX id of the LICENSE you add
+  license_family: GPL
+  license_file: LICENSE              # TODO: this file must exist in the release tarball
+  summary: "TE-looker (dtr): de novo discovery of divergent ('twilight-zone') transposable elements (Rust)."
+  description: |
+    TE-looker provides the `dtr` (Dark TE Rebuilder) CLI plus te-discover / te-refine /
+    te-seed helpers. It targets older, divergent TEs (D_cc 45-75%) as the Step-4 track of
+    the Pan_TE pipeline.
+
+extra:
+  recipe-maintainers:
+    - unavailable-2374
