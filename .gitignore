@@ -1,0 +1,23 @@
+# Logs
+*.log
+bin/*.log
+bin/Refiner/pipeline.log
+
+# Python caches / checkpoints
+__pycache__/
+*.pyc
+bin/Refiner/checkpoints/
+bin/**/checkpoints/
+
+# Machine-specific symlinks to the te-looker build. dtr is resolved at runtime via PATH
+# or TE_LOOKER_BIN; these absolute links must never be committed (they break on any other
+# host and are the main portability hazard).
+bin/dtr
+bin/te-discover
+bin/te-refine
+bin/te-seed
+
+# conda recipe local build outputs (regenerable via recipes/build_local.sh)
+recipes/local_channel/
+recipes/.build_tmp/
+recipes/build_local.log

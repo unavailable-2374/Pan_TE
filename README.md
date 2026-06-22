@@ -1,7 +1,24 @@
 # Zhou Lab @ AGIS Pan_TE 
 Design for linear or graph genome TE detection and annotation
 
-## Software Installation 
+## Install via conda (bioconda)
+
+Once the recipes in [`recipes/`](recipes/) are published to bioconda, the whole pipeline
+(plus every tool dependency) installs in one command:
+
+    conda create -n pan_te -c conda-forge -c bioconda pan_te
+    conda activate pan_te
+    # Fetch the non-redistributable data assets (Dfam libraries + ClassifyTE models):
+    pan_te-setup-data --dfam-list
+    pan_te-setup-data --classifyte-dir ~/Pan_TE_data/ClassifyTE \
+        --dfam-url https://www.dfam.org/releases/Dfam_3.9/families/dfam39_full.0.h5.gz
+
+The bioconda packaging (4 recipes: `look4ltrs`, `mdl-repeat`, `te-looker`, `pan_te`) and the
+submission steps still pending (release tags, LICENSE files, sha256, PRs) are documented in
+[`recipes/BIOCONDA_SUBMISSION.md`](recipes/BIOCONDA_SUBMISSION.md). To verify the recipes
+build from local source before submitting, run `recipes/build_local.sh build`.
+
+## Software Installation (from source)
 
 ### 1.Download the latest Pipeline:
 
