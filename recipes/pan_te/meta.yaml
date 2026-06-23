@@ -1,14 +1,10 @@
 {% set name = "pan_te" %}
 {% set version = "1.0.0" %}
 
-# NOTE (bioconda submission):
-#   * Submit AFTER look4ltrs, mdl-repeat, te-looker recipes are merged (pan_te depends on them).
-#   * Pan_TE repo needs a LICENSE file (bioconda REQUIRES it) and a tagged release.
-#   * Two sources are pulled: the Pan_TE release, and the Look4LTRs release (only to vendor
-#     build_ltr_library.py at the in-tree path Pan_TE expects). Set both sha256 via:
-#       curl -sL <tarball-url> | sha256sum
-#   * Non-redistributable data (Dfam libraries, ClassifyTE models) are NOT shipped here;
-#     users run `pan_te-setup-data` after install (see that script / BIOCONDA_SUBMISSION.md).
+# Submit AFTER look4ltrs, mdl-repeat, te-looker are merged into bioconda (pan_te depends on them).
+# Two sources: the Pan_TE release, and the Look4LTRs release (only to vendor build_ltr_library.py
+# at the in-tree path Pan_TE expects). Non-redistributable data (Dfam libraries, ClassifyTE
+# models) are NOT shipped here; users run `pan_te-setup-data` after install.
 
 package:
   name: {{ name }}
@@ -16,7 +12,7 @@ package:
 
 source:
   - url: https://github.com/unavailable-2374/Pan_TE/archive/refs/tags/v{{ version }}.tar.gz
-    sha256: 0000000000000000000000000000000000000000000000000000000000000000  # TODO: Pan_TE release sha256
+    sha256: 1eac3abfc07423f5497c91c726dbc885ccb899151496a4864d4e6e93d2aa4300
     folder: pan_te
   - url: https://github.com/unavailable-2374/Look4LTRs/archive/refs/tags/v1.0.0.tar.gz
     sha256: 2c5bb2184229de680805aaf7cea06838c89091f00c6b37d6dea6c43ec71ed316
@@ -75,9 +71,9 @@ test:
 
 about:
   home: https://github.com/unavailable-2374/Pan_TE
-  license: GPL-3.0-or-later          # TODO: set to the actual SPDX id of the LICENSE you add to Pan_TE
+  license: GPL-3.0-or-later
   license_family: GPL
-  license_file: pan_te/LICENSE       # TODO: this file must exist in the Pan_TE release tarball
+  license_file: pan_te/LICENSE
   summary: "Pan-genome transposable-element annotation pipeline (LTR + mdl-repeat + TE-looker)."
   description: |
     Pan_TE combines three de novo TE-detection tracks (Look4LTRs for LTR retrotransposons,
