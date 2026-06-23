@@ -62,7 +62,7 @@ class SequenceScreenerOptimized:
     """Phase 1: 序列筛选与共识候选识别
     
     主要功能：
-    1. 对RepeatScout输出进行质量评分
+    1. 对repeat finder输出进行质量评分
     2. 识别需要构建共识的候选序列
     3. 为候选序列收集RepeatMasker信息
     4. 将候选序列传递给Phase2进行嵌合体分析
@@ -165,9 +165,9 @@ class SequenceScreenerOptimized:
         import re
         sequences = []
 
-        logger.info(f"Loading sequences from {self.config.repeatscout_file}")
+        logger.info(f"Loading sequences from {self.config.input_file}")
         
-        for record in SeqIO.parse(self.config.repeatscout_file, "fasta"):
+        for record in SeqIO.parse(self.config.input_file, "fasta"):
             seq_str = str(record.seq).upper()
             seq_len = len(seq_str)
 
@@ -186,7 +186,7 @@ class SequenceScreenerOptimized:
             if gc_content < 0.1 or gc_content > 0.9:
                 continue
 
-            # CRITICAL FIX: Use full unique ID to distinguish sequences from different RepeatScout runs
+            # CRITICAL FIX: Use full unique ID to distinguish sequences from different repeat finder runs
             # record.id only returns part before first space (e.g., "R=0")
             # record.description contains full header with run suffix (e.g., "R=0 (RR=1...)_l20_t3_set0")
             # Extract unique ID: "R=X_suffix" format
@@ -290,7 +290,7 @@ class SequenceScreenerOptimized:
                 seq_length = 1000  # 默认长度
 
             # Processing low copy number sequences
-            # Key insight: RepeatScout already filtered sequences with <10 k-mer occurrences
+            # Key insight: the repeat finder already filtered sequences with <10 k-mer occurrences
             # Low RepeatMasker copy count may indicate:
             # 1. Ancient/divergent TE (RM can't detect all copies)
             # 2. Young TE with few copies
@@ -304,8 +304,8 @@ class SequenceScreenerOptimized:
                     avg_identity, seq_length, copy_number
                 )
             elif copy_number < 3:
-                # 2 copies: moderate score, RepeatScout found it so it's likely real
-                logger.debug(f"{seq_id}: Low copy number ({copy_number}) - trusting RepeatScout detection")
+                # 2 copies: moderate score, the repeat finder found it so it's likely real
+                logger.debug(f"{seq_id}: Low copy number ({copy_number}) - trusting repeat finder detection")
                 copy_score = 0.45  # Reasonable base score
                 identity_score = adaptive_scorer.calculate_adaptive_identity_score(
                     avg_identity, seq_length, copy_number
@@ -335,7 +335,7 @@ class SequenceScreenerOptimized:
                 self.scores[seq_id] = {}
             if 'copy_number' not in self.scores[seq_id]:
                 missing_count += 1
-                # RepeatScout already validated these as repetitive — trust that
+                # The repeat finder already validated these as repetitive — trust that
                 self.scores[seq_id]['copy_score'] = 0.35
                 self.scores[seq_id]['identity_score'] = 0.3
                 self.scores[seq_id]['copy_number'] = 0
@@ -509,7 +509,7 @@ class SequenceScreenerOptimized:
         
         # 步骤7: 识别需要构建共识的候选序列
         # Strategy change: Rescue C-class sequences that have biological evidence
-        # Rationale: RepeatScout already filtered by copy number (≥10 k-mer occurrences)
+        # Rationale: the repeat finder already filtered by copy number (≥10 k-mer occurrences)
         # C-class may contain real TEs that:
         # - Are ancient/divergent (low RM detection)
         # - Have structural features (TIR, LTR, poly-A)
@@ -526,12 +526,12 @@ class SequenceScreenerOptimized:
             copy_number = score_data.get('copy_number', 0)
 
             # C-class rescue conditions - AGGRESSIVE STRATEGY
-            # Rationale: RepeatScout already requires ≥10 k-mer occurrences
+            # Rationale: the repeat finder already requires ≥10 k-mer occurrences
             # These sequences ARE repetitive, just not detected well by RepeatMasker
             # Default: RESCUE unless obviously problematic
 
             should_rescue = True  # Default to rescue
-            rescue_reason = ["repeatscout_trusted"]
+            rescue_reason = ["input_trusted"]
             should_reject = False
             reject_reason = []
 
@@ -612,13 +612,13 @@ class SequenceScreenerOptimized:
                 filter_reason.append(f"too_short({seq_length}bp)")
 
             # Check identity - but with biological evidence override
-            # RELAXED: Trust RepeatScout - if it found the sequence with ≥10 k-mers, it's likely real
+            # RELAXED: Trust the repeat finder - if it found the sequence with ≥10 k-mers, it's likely real
             if avg_identity < MIN_IDENTITY_THRESHOLD:
                 # Low identity is acceptable if:
                 # 1. Sequence is long (>500bp) - likely real TE even if divergent
                 # 2. Has structural features
                 # 3. Is A-class (high score from other factors)
-                # 4. Is C_rescued (already passed RepeatScout's filter)
+                # 4. Is C_rescued (already passed the repeat finder's filter)
                 has_override = (
                     seq_length >= 500 or
                     quality_class in ['A', 'C_rescued'] or
@@ -629,8 +629,8 @@ class SequenceScreenerOptimized:
                     filter_reason.append(f"low_identity({avg_identity:.1f}%)")
 
             # Check copy number - VERY lenient
-            # Trust RepeatScout: only filter extremely short sequences with no evidence
-            # C_rescued are always allowed (RepeatScout already validated them)
+            # Trust the repeat finder: only filter extremely short sequences with no evidence
+            # C_rescued are always allowed (the repeat finder already validated them)
             if copy_number < 1 and quality_class not in ['A', 'B', 'C_rescued'] and seq_length < 200:
                 should_filter = True
                 filter_reason.append(f"no_copies_and_short")

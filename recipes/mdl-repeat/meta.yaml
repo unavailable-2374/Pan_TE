@@ -1,12 +1,8 @@
 {% set name = "mdl-repeat" %}
 {% set version = "1.0.0" %}
 
-# NOTE (bioconda submission):
-#   1. https://github.com/unavailable-2374/mdl-repeat has NO LICENSE file yet — bioconda
-#      REQUIRES one. Add a LICENSE to the repo and align the `license:` field below to its
-#      actual SPDX identifier (the GPL-3.0-or-later placeholder is a guess, not a fact).
-#   2. Needs a tagged release. After `git tag v{{ version }}` && push, set the sha256 via:
-#        curl -sL https://github.com/unavailable-2374/mdl-repeat/archive/refs/tags/v{{ version }}.tar.gz | sha256sum
+# mdl-repeat is PUBLIC at github.com/unavailable-2374/mdl-repeat, GPL-3.0, tagged v1.0.0
+# (rmblastn resolved from $RMBLASTN_BIN/PATH). Build verified from main. Ready to submit.
 
 package:
   name: {{ name }}
@@ -14,7 +10,7 @@ package:
 
 source:
   url: https://github.com/unavailable-2374/mdl-repeat/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000  # TODO: real sha256 of the release tarball
+  sha256: 126310a7c90ea1f39fa6f6c5c5b3b0136e1fa7d44105a72f7789c361ad17813b
 
 build:
   number: 0
@@ -32,9 +28,9 @@ test:
 
 about:
   home: https://github.com/unavailable-2374/mdl-repeat
-  license: GPL-3.0-or-later          # TODO: set to the actual SPDX id of the LICENSE you add
+  license: GPL-3.0-or-later
   license_family: GPL
-  license_file: LICENSE              # TODO: this file must exist in the release tarball
+  license_file: LICENSE
   summary: "De novo repeat discovery via the Minimum Description Length (MDL) principle."
   description: |
     mdl-repeat performs de novo repeat-family discovery on genomic FASTA using the MDL

@@ -867,10 +867,10 @@ def determine_processing_path(seed_seq: Dict, rm_hits: list, config: PipelineCon
 
 def fast_path_consensus(seed_seq: Dict, copies: list, config: PipelineConfig) -> Dict:
     """
-    Fast path: keep RepeatScout's original consensus, only extend boundaries.
+    Fast path: keep the repeat finder's original consensus, only extend boundaries.
     Skips expensive MAFFT MSA entirely.
 
-    For high-copy, high-identity sequences where RepeatScout's consensus
+    For high-copy, high-identity sequences where the repeat finder's consensus
     is already reliable.
     """
     from utils.sequence_utils import extend_consensus_boundaries
@@ -2326,7 +2326,7 @@ def improve_with_single_copy(seed_seq: Dict, copy: Dict) -> Dict:
     Improve original sequence using single copy.
 
     Key change: Single-copy sequences are no longer penalized with fixed low score.
-    Rationale: RepeatScout already filtered for copy number (≥10 k-mer occurrences).
+    Rationale: the repeat finder already filtered for copy number (≥10 k-mer occurrences).
     A single RepeatMasker hit may indicate:
     - Ancient TE with divergent copies not detected by RM
     - Young TE just starting to amplify

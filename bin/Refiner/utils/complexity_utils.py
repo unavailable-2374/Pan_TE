@@ -5,6 +5,24 @@ from typing import Dict
 
 logger = logging.getLogger(__name__)
 
+def calculate_lowcomplexity_fraction(sequence: str, window: int = 64,
+                                     dust_cut: float = 0.7) -> float:
+    """Fraction of non-overlapping windows that are low-complexity (DUST > dust_cut).
+
+    Complements the average DUST score: a consensus that is mostly simple-repeat with
+    a complex patch can pass the global DUST gate yet be >50% junk by window. Returns
+    0.0 (no low-complexity windows) .. 1.0 (entirely low-complexity).
+    """
+    s = sequence.upper()
+    if len(s) < window:
+        return 1.0 if calculate_dust_score(s) > dust_cut else 0.0
+    n = lc = 0
+    for i in range(0, len(s) - window + 1, window):
+        n += 1
+        if calculate_dust_score(s[i:i + window]) > dust_cut:
+            lc += 1
+    return lc / n if n else 0.0
+
 def calculate_dust_score(sequence: str, window: int = 64, threshold: int = 7) -> float:
     """
     计算序列的DUST复杂度分数

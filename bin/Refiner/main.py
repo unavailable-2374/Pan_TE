@@ -38,7 +38,7 @@ class TEConsensusPipeline:
     Phase 1: 识别共识构建候选序列
     Phase 2: 嵌合体检测和拆分
     Phase 3: 全面的共识序列构建
-    Phase 4: 基因组屏蔽为RECON做准备
+    Phase 4: 基因组屏蔽为RepGraph做准备
     """
     
     def __init__(self, config: PipelineConfig):
@@ -159,7 +159,7 @@ class TEConsensusPipeline:
         """执行完整流程"""
         logger.info("="*60)
         logger.info("Starting TE Consensus Pipeline")
-        logger.info(f"Input: {self.config.repeatscout_file}")
+        logger.info(f"Input: {self.config.input_file}")
         logger.info(f"Genome: {self.config.genome_file}")
         logger.info(f"Output: {self.config.output_dir}")
         logger.info("="*60)
@@ -250,8 +250,8 @@ def main():
     )
     
     # 必需参数
-    parser.add_argument('-r', '--repeatscout', required=True, 
-                       help='RepeatScout output file (filtered)')
+    parser.add_argument('-r', '--input', required=True,
+                       help='Repeat finder output file (filtered)')
     parser.add_argument('-g', '--genome', required=True,
                        help='Reference genome file (FASTA)')
     parser.add_argument('-o', '--output', required=True,
@@ -281,13 +281,13 @@ def main():
     if args.config:
         config = PipelineConfig.load(args.config)
         # 覆盖命令行参数
-        config.repeatscout_file = args.repeatscout
+        config.input_file = args.input
         config.genome_file = args.genome
         config.output_dir = args.output
         config.threads = args.threads
     else:
         config = PipelineConfig(
-            repeatscout_file=args.repeatscout,
+            input_file=args.input,
             genome_file=args.genome,
             output_dir=args.output,
             threads=args.threads

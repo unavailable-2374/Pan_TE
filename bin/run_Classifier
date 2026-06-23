@@ -6,6 +6,10 @@ set -o pipefail
 
 # Configuration
 LOG_FILE="classifier.log"
+TE_LIBRARY="raw_te_library.fa"
+if [ ! -s "$TE_LIBRARY" ] && [ -s "raw_TEs.fa" ]; then
+    TE_LIBRARY="raw_TEs.fa"
+fi
 
 # Logging function
 log() {
@@ -43,6 +47,11 @@ fi
 log "Starting TE classification process"
 log "ClassifyTE directory: $CLASSIFYTE_DIR"
 log "Using $THREADS threads for classification"
+log "Input TE library: $TE_LIBRARY"
+
+if [ ! -s "$TE_LIBRARY" ]; then
+    error "Input TE library not found or empty: raw_te_library.fa"
+fi
 
 # Create data directory
 log "Setting up environment"
@@ -50,7 +59,7 @@ mkdir -p data || error "Failed to create data directory"
 
 # Rename TEs
 log "Renaming TE sequences"
-if ! renameTE TE raw_TEs.fa data/re.fa; then
+if ! renameTE TE "$TE_LIBRARY" data/re.fa; then
     error "Failed to rename TE sequences"
 fi
 

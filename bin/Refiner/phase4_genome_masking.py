@@ -104,7 +104,7 @@ class GenomeMasker:
             consensus_library_file  # consensus_library
         )
         
-        # 计算注释比例并写入文件供RECON使用
+        # 计算注释比例并写入文件供RepGraph使用
         annotation_ratio = final_stats['hard_masked_percent'] / 100.0  # 转换为0-1范围
         annotation_file = Path(self.config.output_dir) / "annotation_ratio.txt"
         
@@ -501,7 +501,7 @@ class GenomeMasker:
         """生成输出文件"""
         output_dir = Path(self.config.output_dir)
         
-        # 创建最终输出文件（genome_final_masked.fa用于RECON）
+        # 创建最终输出文件（genome_final_masked.fa用于RepGraph）
         final_genome_file = output_dir / "genome_final_masked.fa"
         import shutil
         shutil.copy2(hard_masked_genome, final_genome_file)
@@ -572,7 +572,7 @@ class GenomeMasker:
 # 2. Uses only high-quality consensus sequences (quality >= 0.8, copies >= 3)  
 # 3. Performs soft masking (-xsmall) instead of hard masking
 # 4. Filters consensus by complexity to exclude low-complexity sequences
-# 5. Generates genome_final_masked.fa for downstream RECON usage
+# 5. Generates genome_final_masked.fa for downstream RepGraph usage
 # 
 # All methods below this line are DEPRECATED and should not be used.
 
@@ -751,28 +751,28 @@ class GenomeMasker:
         
         # 运行RepeatMasker进行第二轮masking
         try:
-            # 构建RepeatMasker命令（为RECON优化的参数）
+            # 构建RepeatMasker命令（为RepGraph优化的参数）
             cmd = [
                 self.config.repeatmasker_exe,
                 '-lib', lib_file_path,
                 '-no_is',  # 不搜索细菌插入序列
-                '-nolow',  # 不mask低复杂度区域，让RECON处理
+                '-nolow',  # 不mask低复杂度区域，让RepGraph处理
                 '-cutoff', '200',  # 降低cutoff，保留更多候选
                 '-s',      # 慢速但更敏感的搜索
-                '-small',  # 返回较短的匹配，保留RECON发现机会
+                '-small',  # 返回较短的匹配，保留RepGraph发现机会
                 '-pa', str(max(1, self.config.threads // 2)),
                 '-dir', str(Path(self.config.output_dir) / 'round2_rm'),
                 preliminary_masked
             ]
             
-            # 如果启用RECON友好模式，添加额外参数
+            # 如果启用RepGraph友好模式，添加额外参数
             if self.round2_strict_mode == False:
                 cmd.extend([
                     '-frag', '20'  # 允许片段化匹配
                     # Note: removed invalid -maxsize option that doesn't exist in RepeatMasker
                 ])
             
-            logger.info("Using RECON-optimized parameters for second round masking:")
+            logger.info("Using RepGraph-optimized parameters for second round masking:")
             logger.info(f"  - Identity threshold: {self.round2_min_identity}%")
             logger.info(f"  - Sensitive mode: enabled")
             logger.info(f"  - Fragment matching: enabled")
@@ -918,7 +918,7 @@ class GenomeMasker:
         
         # 创建基因组重命名器
         work_dir = Path(self.config.output_dir) / "genome_renaming"
-        work_dir.mkdir(exist_ok=True)
+        work_dir.mkdir(parents=True, exist_ok=True)
         
         self.genome_renamer = GenomeRenamer(str(work_dir))
         
@@ -954,7 +954,7 @@ class GenomeMasker:
         
         restored_files = {}
         restored_dir = Path(self.config.output_dir) / "restored_output"
-        restored_dir.mkdir(exist_ok=True)
+        restored_dir.mkdir(parents=True, exist_ok=True)
         
         # 需要还原ID的文件类型
         files_to_restore = [

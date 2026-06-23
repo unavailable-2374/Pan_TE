@@ -1,0 +1,83 @@
+# Pan_TE main environment — all third-party tools the pipeline shells out to, from
+# conda-forge + bioconda. Create with:
+#     conda env create -f environment.yml      (or: mamba env create -f environment.yml)
+#     conda activate pan_te
+#
+# NOT covered here (handled separately):
+#   * The 3 custom binaries — look4ltrs, mdl-repeat, dtr (te-looker) — are built as conda
+#     packages from their own recipes into a local channel (see recipes/, step ②). In the
+#     container build they are resolved into this same env; for a source install run the
+#     recipe build script first.
+#   * ClassifyTE runs in its OWN Python-3.8 env (environment-classifyte.yml) because its
+#     pinned deps conflict with this env.
+#   * Data assets with redistribution limits — RepeatMasker/Dfam libraries and the
+#     ClassifyTE models — are fetched/mounted at setup time, not via conda.
+#
+# Versions are intentionally unpinned so the solver picks a mutually compatible set; pin
+# them in a lockfile (conda-lock / `conda env export`) once a working combination is built.
+
+name: pan_te
+
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+  # --- interpreters ---
+  - python=3.10
+  - perl
+
+  # --- build toolchain (compiles the 4 custom tools via ./build_tools.sh; conda-forge
+  #     compilers keep the build self-contained. Safe to drop from a slim runtime image
+  #     after build_tools.sh has run.) ---
+  - c-compiler          # gcc (mdl-repeat, FastGA)
+  - cxx-compiler        # g++ (look4ltrs, C++17 + OpenMP)
+  - make
+  - cmake               # look4ltrs
+  - rust                # cargo -> dtr / te-discover / te-refine / te-seed
+  - zlib                # FastGA / look4ltrs I/O
+
+  # --- genome / sequence handling ---
+  - samtools
+  - bedtools
+  - cd-hit            # cd-hit-est (Combine dedup, te-looker merge, Refiner pre-dedup)
+
+  # --- alignment / MSA / consensus ---
+  - mafft
+  - abpoa             # partial-order MSA consensus (Refiner_mdl, te-looker te-refine)
+  - spoa              # te-refine gapped POA (de-hardcoded from te-refine.rs)
+
+  # --- BLAST stack ---
+  - blast             # ncbi-blast+: blastn / blastx / makeblastdb / dustmasker
+  - rmblast           # rmblastn (RepeatMasker-sensitivity copy recruitment)
+
+  # --- repeat masking / classification ---
+  - repeatmasker      # RepeatMasker + dustmasker/trf integration
+  - repeatmodeler     # provides RepeatClassifier (run_Classifier)
+  - trf               # tandem-repeat finder (build_mdl masking, non-TE separation)
+
+  # --- profile HMM (Track-1 seed build + boundary refine) ---
+  - hmmer             # hmmbuild / nhmmer
+
+  # --- de novo TE classification / structural ---
+  - tesorter          # TEsorter (Refiner_mdl rescue)  [verify channel; else recipe]
+  - sourmash          # k-mer sketch gather (te-looker design track)
+  - iqtree            # phylo gate (te-looker family-merger design)
+
+  # --- non-TE separation ---
+  - barrnap           # rRNA detection (de-hardcoded from build_mdl)
+
+  # --- Perl modules (build_mdl) ---
+  - perl-parallel-forkmanager   # parallel TRF
+  - perl-log-log4perl           # logging
+
+  # --- Python libraries ---
+  - biopython         # Bio.* (MSA, SeqIO)
+  - numpy
+  - scipy             # hierarchical clustering (Refiner consensus)
+  - psutil            # resource accounting
+
+  # --- NOTE: FastGA is used by build_ltr_library (cross-family LTR) and the te-looker
+  #     design Track 3. It is NOT reliably on bioconda; if `conda install fastga` fails it
+  #     joins the custom-recipe set (step ②) rather than this file.
+  # - fastga

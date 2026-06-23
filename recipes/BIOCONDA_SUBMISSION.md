@@ -12,7 +12,7 @@ what is left.
 |--------|--------|-------|
 | `look4ltrs/` | `look4ltrs` (C++/CMake) + ships `build_ltr_library.py` | repo already has a LICENSE (AGPL-1.0) |
 | `mdl-repeat/` | `mdl-repeat` (C/Make, `PORTABLE=1`) | **needs a LICENSE added upstream** |
-| `te-looker/` | `dtr`, `te-discover`, `te-refine`, `te-seed` (Rust/cargo) | **needs a public repo + LICENSE** |
+| `te-looker/` | `dtr`, `te-discover`, `te-refine`, `te-seed` (Rust/cargo) | public at `unavailable-2374/te-looker`; **still needs a LICENSE** |
 | `pan_te/` | the pipeline scripts + `pan_te-setup-data` | depends on the three above **plus** `fastga` (already on bioconda) |
 | `build_local.sh` | local smoke test from local source | verifies builds before any release exists |
 | `pan_te/pan_te-setup-data` | post-install fetch of Dfam libs + ClassifyTE models | data assets can't ship in conda |
@@ -32,9 +32,10 @@ te-looker  ┘
 
 ## Pre-submission checklist (the external steps)
 
-1. **Make te-looker a public GitHub repo.** Assumed URL in the recipe:
-   `https://github.com/unavailable-2374/te-looker`. If you use a different URL, update
-   `te-looker/meta.yaml` (`source.url`, `about.home`) and `pan_te/meta.yaml` description.
+1. **Make te-looker a public GitHub repo.** ✅ DONE — hosted at
+   `https://github.com/unavailable-2374/te-looker` (the old RepGraph repo was force-overwritten
+   with the te-looker source and renamed `repgraph` → `te-looker`). The `te-looker/meta.yaml`
+   `source.url` / `about.home` point there.
 
 2. **Add a `LICENSE` file** to each repo that lacks one and set the recipe's `license:` to
    the matching SPDX id. Status today:

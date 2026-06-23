@@ -7,13 +7,13 @@ class PipelineConfig:
     """Pipeline配置参数"""
     
     # 输入输出
-    repeatscout_file: str
+    input_file: str
     genome_file: str
     output_dir: str
     temp_dir: str = "temp_work"
     cache_dir: str = "cache"
     checkpoint_dir: str = "checkpoints"
-    
+
     # Phase 1 parameters
     min_length: int = 50
     max_length: int = 50000  # Maximum length limit
@@ -21,9 +21,9 @@ class PipelineConfig:
     dust_window: int = 64
     dust_threshold: int = 7
 
-    # Phase 1 sensitivity parameters (new)
-    # Trust RepeatScout's initial filtering - it already requires ≥10 k-mer occurrences
-    trust_repeatscout: bool = True
+    # Phase 1 sensitivity parameters
+    # Trust the repeat finder's initial filtering
+    trust_input: bool = True
     # Rescue C-class sequences that have biological evidence
     rescue_c_class: bool = True
     # Relaxed identity threshold for ancient TEs (from 50 to 40)
@@ -39,7 +39,7 @@ class PipelineConfig:
     # Phase 3 parameters
     redundancy_threshold_masking: float = 0.95
     redundancy_threshold_analysis: float = 0.90
-    # Reduced from 5 to 2 - trust RepeatScout's detection
+    # Reduced from 5 to 2 - trust the repeat finder's detection
     min_copy_number: int = 2
     min_consensus_quality: float = 0.85
     skip_phase3_redundancy_removal: bool = True  # Skip Phase 3 CD-HIT deduplication

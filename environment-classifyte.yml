@@ -1,0 +1,26 @@
+# ClassifyTE's isolated environment. Its pinned ML deps (scikit-learn 0.23.1 / numpy
+# 1.19.1 / Python 3.8) conflict with the main pan_te env, so run_Classifier invokes
+# ClassifyTE via `conda run -n ClassifyTE_env`. Create with:
+#     conda env create -f environment-classifyte.yml
+#
+# Versions mirror the upstream ClassifyTE repo's own environment.yml (verified against a
+# working ClassifyTE_env install) and must stay pinned — the shipped models/*.pkl were
+# trained with this scikit-learn and will not unpickle under a newer one.
+#
+# Note: this env only provides the Python deps. The ClassifyTE code + models/features/nodes
+# are a separate data/code asset cloned/fetched at setup (not via conda).
+
+name: ClassifyTE_env
+
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+  - python=3.8
+  - networkx=2.4
+  - numpy=1.19.1
+  - pandas=1.0.5
+  - scikit-learn=0.23.1
+  - scipy=1.5.2
+  - joblib

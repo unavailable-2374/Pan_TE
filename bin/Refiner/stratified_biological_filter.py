@@ -228,7 +228,7 @@ def apply_stratified_filtering(consensus_list: List[Dict], genome_stats: Dict) -
 
     VERSION v3.0: Distribution-aware trust levels instead of fixed thresholds
 
-    Key insight: RepeatScout already filtered sequences (≥10 k-mer occurrences),
+    Key insight: the repeat finder already filtered sequences (≥10 k-mer occurrences),
     so we trust the distribution and apply validation proportionally.
 
     Trust levels based on copy number/I-value percentiles:

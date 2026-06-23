@@ -5,14 +5,19 @@ import sys
 import logging
 import argparse
 import subprocess
+import shutil
 import time
 import gzip
 import bz2
 import tempfile
+import shlex
+import re
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
-from vcf_processor import VCFProcessor  
+from vcf_processor import VCFProcessor
+from paf_processor import PAFProcessor, count_fasta_sequences
+from gfa_processor import GfaProcessor
 
 VERSION = '1.0.0'
 
@@ -21,19 +26,40 @@ USAGE = f'''Usage:
 Pan_TE [options]
 
 Example:
+    # Single genome mode
     Pan_TE --genome genome.fasta --threads 80 --model-dir Your_Path_To_ClassifyTE
+
+    # Pan-genome mode (reference-free PAF)
+    Pan_TE --paf all_vs_all.paf --paf-fasta asm1.fna asm2.fna ... --threads 80
+
+    # Enrichment mode (genome + PAF)
+    Pan_TE --genome ref.fasta --paf all_vs_all.paf --paf-fasta assemblies.fa --threads 80
+
+    # Pan-genome mode (GFA)
+    Pan_TE --gfa pangenome.gfa --threads 80
+
+    # Enrichment mode (genome + GFA)
+    Pan_TE --genome ref.fasta --gfa pangenome.gfa --threads 80
 
 Parameters:
 [General]
-    --genome <string>         Required. Genome file in FASTA format (.fa, .fasta, .fna, .fas), optionally compressed (.gz, .bz2).
+    --genome <string>         Genome file in FASTA format. Required unless --paf or --gfa is provided.
     --model-dir <string>      Provide path to ClassifyTE for classification.
 
 [Other]
     --vcf-dir <string>        Default: NA. Path for VCF, see gfa.list for format.
-    --out <string>           Default: current directory. The work directory.
+    --paf <string>           PAF file from all-vs-all genome alignment (FastGA/wfmash/minimap2).
+    --paf-fasta <string...>  Assembly FASTA file(s) for PAF. Accepts multiple files.
+    --paf-mapping <string>   Optional: chromosome mapping TSV (seqname, assembly_id, chr_id).
+    --gfa <string>           GFA file from pangenome graph (minigraph-cactus rGFA or PGGB smoothxg).
+    --gfa-ref <string>       Reference path/sample name in GFA (auto-detected if omitted).
+    --out-dir <string>       Default: current directory. The work directory.
+    --te-looker-bin <string> Path to te-looker dtr binary. Default: TE_LOOKER_BIN or PATH.
+    --te-looker-extra-args <string>
+                             Extra arguments passed verbatim to "dtr run".
     -M <int>                 Memory limit (in MB), default: 0 (unlimited).
     --threads <int>          Default: 4. Number of threads, preferably in multiples of 4.
-    --fragment_size <int>    Default: 40000. Length for fragment.
+    --fragment-size <int>    Default: 40000. Length for fragment.
     --help|-h                Display this help information.
 
 Version: {VERSION}
@@ -50,10 +76,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DIR_GENOME = 'genome'
+DIR_LTR = 'ltr'
+DIR_LTR_LEGACY = 'Look4LTRs'
+DIR_MDL_REPEAT = 'mdl-repeat'
+DIR_MDL_REPEAT_LEGACY = 'mdl_repeat'
+DIR_TE_LOOKER = 'te-looker'
+DIR_TE_LOOKER_LEGACY = 'RepGraph'
+DIR_COMBINE = 'combine'
+DIR_COMBINE_LEGACY = 'Combine'
+
+FILE_CONSENSUS = 'consensus.fa'
+FILE_CONSENSUS_LEGACY = 'consensi.fa'
+FILE_COMBINED_LIBRARY = 'raw_te_library.all.fa'
+FILE_TE_LIBRARY = 'raw_te_library.fa'
+FILE_COMBINED_LIBRARY_LEGACY = 'raw_TEs_combined.fa'
+FILE_TE_LIBRARY_LEGACY = 'raw_TEs.fa'
+
+# --- TE-looker discovery post-processing -------------------------------------
+# The bundled `dtr` is a discovery-only core (te-discover A1 + te-refine spoa): it
+# emits one rough per-seed consensus per repetitive 16-mer with NO cross-seed family
+# merge and NO copy/TE gate. On a large, repeat-rich genome (e.g. maize, 2.4 Gb /
+# ~85% repeat) this inflates families.fasta to tens of thousands of redundant, offset
+# fragments (observed: 58,711 families / 97 MB), which then dominate the combined
+# library. The cross-seed merge + gating stages described in the TE-looker design spec
+# live only as prototypes and were never built into `dtr`. Until a gating `dtr` exists,
+# Pan_TE merges + gates the discovery output itself before Combine. A gated `dtr` build
+# is expected to write provenance.json; when present, its families.fasta is trusted
+# as-is and this post-processing is skipped.
+TE_LOOKER_PROVENANCE = 'provenance.json'  # marker of a gated (full) dtr run
+TE_LOOKER_MIN_COPIES = 5                  # drop families with fewer recruited members
+TE_LOOKER_MIN_LEN = 100                   # drop consensi shorter than this (bp)
+TE_LOOKER_MERGE_IDENTITY = 0.80           # cd-hit-est identity for cross-seed merge
+# Loud-warning bound on the gated family count: maize-scale genomes legitimately carry
+# thousands of TE families, but a count above genome_Mb * this factor signals the gate
+# did not collapse the discovery inflation and the library should not be trusted.
+TE_LOOKER_SANITY_FAMILIES_PER_MB = 15
+
+
+def q(path) -> str:
+    """Shell-quote one command argument."""
+    return shlex.quote(os.fspath(path))
+
+
 def _cmd_label(cmd: str) -> str:
     """Extract a short label from a command string for logging."""
-    # Get the first token (binary name), strip path
-    token = cmd.split()[0]
+    try:
+        token = shlex.split(cmd)[0]
+    except ValueError:
+        token = cmd.split()[0]
     return os.path.basename(token)
 
 def detect_compression_format(file_path: str) -> str:
@@ -151,10 +222,34 @@ def parse_arguments():
     parser.add_argument('--vcf-dir',
                        type=str,
                        help='Path for VCF files')
-    parser.add_argument('--out',
+    parser.add_argument('--paf',
+                       type=str,
+                       help='PAF file from all-vs-all genome alignment')
+    parser.add_argument('--paf-fasta',
+                       type=str,
+                       nargs='+',
+                       help='Assembly FASTA file(s) for PAF (accepts multiple files)')
+    parser.add_argument('--paf-mapping',
+                       type=str,
+                       help='Chromosome mapping TSV (seqname, assembly_id, chr_id)')
+    parser.add_argument('--gfa',
+                       type=str,
+                       help='GFA file from pangenome graph (rGFA or PGGB)')
+    parser.add_argument('--gfa-ref',
+                       type=str,
+                       help='Reference path/sample name in GFA (auto-detected if omitted)')
+    parser.add_argument('--out-dir', '--out',
+                       dest='out_dir',
                        type=str,
                        default=os.getcwd(),
                        help='Work directory')
+    parser.add_argument('--te-looker-bin',
+                       type=str,
+                       help='Path to te-looker dtr binary')
+    parser.add_argument('--te-looker-extra-args',
+                       type=str,
+                       default='',
+                       help='Extra arguments passed verbatim to dtr run')
     parser.add_argument('-M',
                        type=int,
                        default=0,
@@ -163,7 +258,8 @@ def parse_arguments():
                        type=int,
                        default=4,
                        help='Number of threads')
-    parser.add_argument('--fragment_size',
+    parser.add_argument('--fragment-size', '--fragment_size',
+                       dest='fragment_size',
                        type=int,
                        default=40000,
                        help='Length for fragment')
@@ -172,18 +268,41 @@ def parse_arguments():
                        help='Display help information')
     
     args = parser.parse_args()
-    
-    # Validate required arguments
-    if not args.genome:
-        parser.error('--genome is required')
-    
+
+    # Validate: at least --genome, --paf, or --gfa required
+    if not args.genome and not args.paf and not args.gfa:
+        parser.error('At least one of --genome, --paf, or --gfa must be provided')
+
+    # --paf and --gfa are mutually exclusive
+    if args.paf and args.gfa:
+        parser.error('--paf and --gfa are mutually exclusive; provide one or the other')
+
     # Validate genome file exists and is FASTA format
     if args.genome:
         if not os.path.exists(args.genome):
             parser.error(f'Genome file not found: {args.genome}')
         if not is_fasta_file(args.genome):
             parser.error(f'Genome file must be in FASTA format (.fa, .fasta, .fna, .fas), optionally compressed (.gz, .bz2): {args.genome}')
-        
+
+    # Validate PAF arguments
+    if args.paf:
+        if not os.path.exists(args.paf):
+            parser.error(f'PAF file not found: {args.paf}')
+        if not args.paf_fasta:
+            parser.error('--paf-fasta is required when --paf is specified')
+        for fasta_file in args.paf_fasta:
+            if not os.path.exists(fasta_file):
+                parser.error(f'PAF FASTA not found: {fasta_file}')
+        if args.paf_mapping and not os.path.exists(args.paf_mapping):
+            parser.error(f'PAF mapping file not found: {args.paf_mapping}')
+
+    # Validate GFA arguments
+    if args.gfa:
+        if not os.path.exists(args.gfa):
+            parser.error(f'GFA file not found: {args.gfa}')
+    if args.gfa_ref and not args.gfa:
+        parser.error('--gfa-ref requires --gfa')
+
     return args
 
 BIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -193,16 +312,28 @@ class PanTEPipeline:
     """Implementation of the Pan TE Pipeline with step tracking and checkpoints."""
 
     def __init__(self, genome_file: Optional[str], output_dir: str, threads: int = 4,
-                 model_dir: Optional[str] = None, vcf_dir: Optional[str] = None):
+                 model_dir: Optional[str] = None, vcf_dir: Optional[str] = None,
+                 paf_file: Optional[str] = None, paf_fasta=None,
+                 paf_mapping: Optional[str] = None,
+                 gfa_file: Optional[str] = None, gfa_ref: Optional[str] = None,
+                 te_looker_bin: Optional[str] = None,
+                 te_looker_extra_args: str = ''):
         """Initialize the pipeline with configuration parameters."""
         self.original_genome_file = os.path.abspath(genome_file) if genome_file else None
         self.genome_file = None  # Will be set after decompression if needed
         self.decompressed_genome_file = None  # Track decompressed temp file for cleanup
         self.vcf_dir = os.path.abspath(vcf_dir) if vcf_dir else None
+        self.paf_file = os.path.abspath(paf_file) if paf_file else None
+        self.paf_fasta_files = [os.path.abspath(f) for f in paf_fasta] if paf_fasta else None
+        self.paf_mapping = os.path.abspath(paf_mapping) if paf_mapping else None
+        self.gfa_file = os.path.abspath(gfa_file) if gfa_file else None
+        self.gfa_ref = gfa_ref
         self.output_dir = os.path.abspath(output_dir)
         self.threads = threads
         self.model_dir = os.path.abspath(model_dir) if model_dir else None
-        self.processed_genome = os.path.join(self.output_dir, 'genome', 'genome.fa')
+        self.te_looker_bin = os.path.abspath(te_looker_bin) if te_looker_bin else None
+        self.te_looker_extra_args = te_looker_extra_args or ''
+        self.processed_genome = os.path.join(self.output_dir, DIR_GENOME, 'genome.fa')
 
         # Set genome_file initially to original file path for validation
         # Actual decompression will happen in process_genome() only if needed
@@ -210,33 +341,50 @@ class PanTEPipeline:
             self.genome_file = self.original_genome_file
 
         # Verify inputs
-        if not self.genome_file and not self.vcf_dir:
-            raise ValueError("Either genome_file or vcf_dir must be provided")
+        if not self.genome_file and not self.vcf_dir and not self.paf_file and not self.gfa_file:
+            raise ValueError("Either genome_file, vcf_dir, paf_file, or gfa_file must be provided")
         
-        # Calculate chunk count for dynamic thread allocation
-        self.chunk_count = self.calculate_chunk_count()
-        self.ltr_threads = max(1, threads - (self.chunk_count * 3))  # Each RS chunk uses 3 threads
-        self.rs_threads = max(1, threads)
-        
-        logger.info(f"Thread allocation: Total={threads}, Chunks={self.chunk_count}, LTR={self.ltr_threads}, RS={self.rs_threads}")
+        # Thread allocation: LTR and mdl-repeat share threads
+        self.ltr_threads = max(1, threads // 2)
+        self.mdl_threads = max(1, threads)
+
+        logger.info(f"Thread allocation: Total={threads}, LTR={self.ltr_threads}, mdl-repeat={self.mdl_threads}")
 
         # Pipeline steps and their checkpoints
         self.steps = {
+            'vcf': 'vcf.ok',
             'genome': 'genome.ok',
             'ltr': 'LTR.ok',
-            'repeatscout': 'RepeatScout.ok',
-            'recon': 'RECON.ok',
+            'mdl_repeat': 'mdl-repeat.ok',
+            'te_looker': 'te-looker.ok',
+            'combine': 'combine.ok'
+        }
+        self.legacy_steps = {
+            'mdl_repeat': 'mdl_repeat.ok',
+            'te_looker': 'RepGraph.ok',
             'combine': 'Combine.ok'
         }
         self.processes = {
             'genome': self.process_genome,
             'ltr': self.process_ltr,
-            'repeatscout': self.process_repeatscout,
-            'recon': self.process_recon,
+            'mdl_repeat': self.process_mdl_repeat,
+            'te_looker': self.process_te_looker,
             'combine': self.combine_results
         }
         # Create output directory structure
         self.setup_directories()
+
+    def stage_dir(self, canonical: str, legacy: Optional[str] = None) -> str:
+        """Return the canonical stage directory, falling back to an existing legacy one."""
+        canonical_path = os.path.join(self.output_dir, canonical)
+        legacy_path = os.path.join(self.output_dir, legacy) if legacy else None
+        canonical_has_files = False
+        if os.path.isdir(canonical_path):
+            with os.scandir(canonical_path) as entries:
+                canonical_has_files = any(entries)
+        if legacy_path and os.path.exists(legacy_path) and not canonical_has_files:
+            return legacy_path
+        return canonical_path
 
     def prepare_genome_file(self):
         """Handle decompression of genome file if needed."""
@@ -249,7 +397,7 @@ class PanTEPipeline:
             self.genome_file = self.original_genome_file
         else:
             logger.info(f"Decompressing {compression_format} genome...")
-            temp_genome = os.path.join(self.output_dir, 'genome', 'decompressed_genome.fa')
+            temp_genome = os.path.join(self.output_dir, DIR_GENOME, 'decompressed_genome.fa')
             os.makedirs(os.path.dirname(temp_genome), exist_ok=True)
             self.genome_file = decompress_file(self.original_genome_file, temp_genome)
             self.decompressed_genome_file = temp_genome
@@ -262,38 +410,31 @@ class PanTEPipeline:
             except Exception:
                 pass
 
-    def calculate_chunk_count(self):
-        """Calculate the number of chunks that will be used by build_RS based on genome size."""
-        if not self.genome_file or not os.path.exists(self.genome_file):
-            return 1  # Default to 1 chunk if genome file doesn't exist yet
-            
-        genome_size = os.path.getsize(self.genome_file)
-        
-        # Constants from build_RS determine_sampling_strategy
-        mb_500 = 500 * 1024 * 1024    # 500MB
-        gb_1 = 1024 * 1024 * 1024     # 1GB
-        gb_3 = 3 * 1024 * 1024 * 1024 # 3GB
-        gb_5 = 5 * 1024 * 1024 * 1024 # 5GB
-        
-        if genome_size < mb_500:
-            # Small genome (<500Mb): single run
-            return 1
-        elif genome_size >= mb_500 and genome_size < gb_1:
-            # Medium genome (500Mb-1Gb): single run
-            return 1
-        elif genome_size >= gb_1 and genome_size < gb_3:
-            # Large genome (1Gb-3Gb): 2 parallel chunks
-            return 2
-        elif genome_size >= gb_3 and genome_size < gb_5:
-            # Very large genome (3Gb-5Gb): 3 parallel chunks
-            return 3
-        else:
-            # Massive genome (>5Gb): 4 parallel chunks
-            return 4
+    def _prepare_paf_fasta(self, work_dir: str) -> str:
+        """Prepare a single indexed FASTA from paf_fasta_files.
+
+        If a single file is provided, indexes and returns it directly.
+        If multiple files, concatenates into a combined FASTA, indexes, and returns.
+        """
+        if len(self.paf_fasta_files) == 1:
+            fasta = self.paf_fasta_files[0]
+            if not os.path.exists(fasta + '.fai'):
+                self.run_cmd(f"samtools faidx {q(fasta)}")
+            return fasta
+
+        combined = os.path.join(work_dir, 'multi_assembly.fa')
+        logger.info(f"Combining {len(self.paf_fasta_files)} assembly FASTA files...")
+        with open(combined, 'wb') as out:
+            for fasta in self.paf_fasta_files:
+                with open(fasta, 'rb') as inp:
+                    shutil.copyfileobj(inp, out)
+                out.write(b'\n')
+        self.run_cmd(f"samtools faidx {q(combined)}")
+        return combined
 
     def setup_directories(self):
         """Create the necessary directory structure."""
-        for sub in ['genome', 'RepeatScout', 'RECON', 'Combine']:
+        for sub in [DIR_GENOME, DIR_MDL_REPEAT, DIR_TE_LOOKER, DIR_COMBINE]:
             os.makedirs(os.path.join(self.output_dir, sub), exist_ok=True)
 
     def create_checkpoint(self, step: str):
@@ -302,12 +443,17 @@ class PanTEPipeline:
 
     def check_checkpoint(self, step: str) -> bool:
         """Check if a step's checkpoint exists."""
-        exists = os.path.exists(os.path.join(self.output_dir, self.steps[step]))
+        candidates = [self.steps[step]]
+        if step in self.legacy_steps:
+            candidates.append(self.legacy_steps[step])
+        exists = any(os.path.exists(os.path.join(self.output_dir, name))
+                     for name in candidates)
         if exists:
             logger.info(f"{step}: skipped (checkpoint exists)")
         return exists
 
-    def run_cmd(self, cmd: str, workdir: Optional[str] = None) -> subprocess.CompletedProcess:
+    def run_cmd(self, cmd: str, workdir: Optional[str] = None,
+                env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
         """Run shell command with error handling and logging."""
         start_time = time.time()
         label = _cmd_label(cmd)
@@ -321,7 +467,8 @@ class PanTEPipeline:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 encoding='utf-8',
-                cwd=workdir
+                cwd=workdir,
+                env=env
             )
 
             duration = time.time() - start_time
@@ -344,32 +491,172 @@ class PanTEPipeline:
             self.genome_file = self.processed_genome
             return
 
-        genome_dir = os.path.join(self.output_dir, 'genome')
+        genome_dir = os.path.join(self.output_dir, DIR_GENOME)
         processed_genome = os.path.join(genome_dir, 'genome.fa')
         os.makedirs(genome_dir, exist_ok=True)
 
         if self.original_genome_file:
+            # Standard mode: use provided genome
             self.prepare_genome_file()
 
-        combined_input = None
-        if self.vcf_dir:
-            logger.info("Processing VCF files...")
-            vcf_processor = VCFProcessor(
-                vcf_dir=self.vcf_dir,
-                output_dir=genome_dir,
-                total_threads=self.threads
-            )
-            try:
-                vcf_sequences = vcf_processor.process_all_vcfs()
+            if self.vcf_dir:
                 combined_input = os.path.join(genome_dir, 'combined_input.fa')
-                self.run_cmd(f"cat {vcf_sequences} {self.genome_file} > {combined_input}")
-                self.genome_file = combined_input
-            except Exception as e:
-                logger.error(f"VCF processing failed: {e}")
-                raise
+                # Resume: VCF processing can be slow on large SV sets; if it already
+                # completed (vcf.ok) and the combined input is present, reuse it instead
+                # of re-running when a later genome step failed on a previous attempt.
+                if self.check_checkpoint('vcf') and os.path.exists(combined_input):
+                    logger.info("VCF processing already completed, using cached combined input...")
+                    self.genome_file = combined_input
+                else:
+                    logger.info("Processing VCF files...")
+                    vcf_processor = VCFProcessor(
+                        vcf_dir=self.vcf_dir,
+                        output_dir=genome_dir,
+                        total_threads=self.threads
+                    )
+                    try:
+                        vcf_sequences = vcf_processor.process_all_vcfs()
+                        self.run_cmd(
+                            f"cat {q(vcf_sequences)} {q(self.genome_file)} > {q(combined_input)}"
+                        )
+                        self.genome_file = combined_input
+                        self.create_checkpoint('vcf')
+                    except Exception as e:
+                        logger.error(f"VCF processing failed: {e}")
+                        raise
 
-        logger.info("Processing genome...")
-        self.process_single_genome(processed_genome)
+            logger.info("Processing genome...")
+            self.process_single_genome(processed_genome)
+
+            # PAF enrichment: append non-reference TE insertions to genome
+            if self.paf_file:
+                logger.info("PAF enrichment starting...")
+                paf_work = os.path.join(genome_dir, 'paf_enrichment')
+                os.makedirs(paf_work, exist_ok=True)
+                try:
+                    combined_fasta = self._prepare_paf_fasta(paf_work)
+                    paf_proc = PAFProcessor(
+                        paf_file=self.paf_file,
+                        paf_fasta=combined_fasta,
+                        output_dir=paf_work,
+                        reference_genome=processed_genome,
+                        threads=self.threads,
+                        mapping_file=self.paf_mapping
+                    )
+                    scaffold_path = paf_proc.process()
+                    n_scaffolds = count_fasta_sequences(scaffold_path)
+                    if n_scaffolds > 0:
+                        with open(processed_genome, 'rb') as check:
+                            check.seek(0, 2)
+                            if check.tell() > 0:
+                                check.seek(-1, 2)
+                                if check.read(1) != b'\n':
+                                    with open(processed_genome, 'ab') as fix:
+                                        fix.write(b'\n')
+                        with open(processed_genome, 'ab') as out:
+                            with open(scaffold_path, 'rb') as inp:
+                                shutil.copyfileobj(inp, out)
+                        self.run_cmd(f"samtools faidx {q(processed_genome)}")
+                        self.run_cmd(f"{q(os.path.join(BIN_DIR, 'index'))} {q(processed_genome)}")
+                        logger.info(f"PAF enrichment: {n_scaffolds} scaffold(s) "
+                                    f"appended to genome")
+                    else:
+                        logger.info("PAF enrichment: no candidates passed filters")
+                except Exception as e:
+                    logger.warning(f"PAF enrichment failed (non-fatal): {e}")
+
+            # GFA enrichment: append non-reference TE insertions to genome
+            if self.gfa_file:
+                logger.info("GFA enrichment starting...")
+                gfa_work = os.path.join(genome_dir, 'gfa_enrichment')
+                os.makedirs(gfa_work, exist_ok=True)
+                try:
+                    gfa_proc = GfaProcessor(
+                        gfa_file=self.gfa_file,
+                        output_dir=gfa_work,
+                        reference_genome=processed_genome,
+                        threads=self.threads,
+                        gfa_ref=self.gfa_ref
+                    )
+                    scaffold_path = gfa_proc.process()
+                    n_scaffolds = count_fasta_sequences(scaffold_path)
+                    if n_scaffolds > 0:
+                        with open(processed_genome, 'rb') as check:
+                            check.seek(0, 2)
+                            if check.tell() > 0:
+                                check.seek(-1, 2)
+                                if check.read(1) != b'\n':
+                                    with open(processed_genome, 'ab') as fix:
+                                        fix.write(b'\n')
+                        with open(processed_genome, 'ab') as out:
+                            with open(scaffold_path, 'rb') as inp:
+                                shutil.copyfileobj(inp, out)
+                        self.run_cmd(f"samtools faidx {q(processed_genome)}")
+                        self.run_cmd(f"{q(os.path.join(BIN_DIR, 'index'))} {q(processed_genome)}")
+                        logger.info(f"GFA enrichment: {n_scaffolds} scaffold(s) "
+                                    f"appended to genome")
+                    else:
+                        logger.info("GFA enrichment: no candidates passed filters")
+                except Exception as e:
+                    logger.warning(f"GFA enrichment failed (non-fatal): {e}")
+
+        elif self.paf_file:
+            # Reference-free PAF mode: construct genome from assemblies
+            logger.info("Reference-free PAF mode: constructing genome from assemblies")
+            paf_work = os.path.join(genome_dir, 'paf_enrichment')
+            os.makedirs(paf_work, exist_ok=True)
+
+            combined_fasta = self._prepare_paf_fasta(paf_work)
+            paf_proc = PAFProcessor(
+                paf_file=self.paf_file,
+                paf_fasta=combined_fasta,
+                output_dir=paf_work,
+                reference_genome=None,
+                threads=self.threads,
+                mapping_file=self.paf_mapping,
+                assembly_fastas=self.paf_fasta_files
+            )
+            pan_genome_path = paf_proc.process()
+
+            n_seqs = count_fasta_sequences(pan_genome_path)
+            if n_seqs == 0:
+                raise RuntimeError(
+                    "PAF processing produced no sequences — "
+                    "check PAF file and assembly FASTAs")
+            logger.info(f"Pan-genome from PAF: {n_seqs} sequences")
+
+            self.genome_file = pan_genome_path
+            logger.info("Processing genome...")
+            self.process_single_genome(processed_genome)
+
+        elif self.gfa_file:
+            # Reference-free GFA mode: reconstruct genome from GFA graph
+            logger.info("Reference-free GFA mode: constructing genome from GFA graph")
+            gfa_work = os.path.join(genome_dir, 'gfa_enrichment')
+            os.makedirs(gfa_work, exist_ok=True)
+
+            gfa_proc = GfaProcessor(
+                gfa_file=self.gfa_file,
+                output_dir=gfa_work,
+                reference_genome=None,
+                threads=self.threads,
+                gfa_ref=self.gfa_ref
+            )
+            pan_genome_path = gfa_proc.process()
+
+            n_seqs = count_fasta_sequences(pan_genome_path)
+            if n_seqs == 0:
+                raise RuntimeError(
+                    "GFA processing produced no sequences — "
+                    "check GFA file format and content")
+            logger.info(f"Pan-genome from GFA: {n_seqs} sequences")
+
+            self.genome_file = pan_genome_path
+            logger.info("Processing genome...")
+            self.process_single_genome(processed_genome)
+
+        else:
+            raise RuntimeError("No genome source: provide --genome, --paf, or --gfa")
 
         self.genome_file = processed_genome
         self.create_checkpoint('genome')
@@ -377,9 +664,11 @@ class PanTEPipeline:
 
     def process_single_genome(self, output_file: str):
         """Process a single genome file."""
-        self.run_cmd(f"{BIN_DIR}/clean_seq_fast {self.genome_file} {output_file}")
-        self.run_cmd(f"samtools faidx {output_file}")
-        self.run_cmd(f"{BIN_DIR}/index {output_file}")
+        self.run_cmd(
+            f"{q(os.path.join(BIN_DIR, 'clean_seq_fast'))} {q(self.genome_file)} {q(output_file)}"
+        )
+        self.run_cmd(f"samtools faidx {q(output_file)}")
+        self.run_cmd(f"{q(os.path.join(BIN_DIR, 'index'))} {q(output_file)}")
 
     def process_ltr(self):
         """Process LTRs using allocated threads."""
@@ -388,14 +677,17 @@ class PanTEPipeline:
 
         logger.info(f"LTR detection starting (threads={self.ltr_threads})")
 
-        genome_file = os.path.join(self.output_dir, 'genome', 'genome.fa')
+        genome_file = os.path.join(self.output_dir, DIR_GENOME, 'genome.fa')
         if not os.path.exists(genome_file):
             raise FileNotFoundError(f"Processed genome not found: {genome_file}")
 
         if not os.path.exists(f"{genome_file}.fai"):
-            self.run_cmd(f"samtools faidx {genome_file}")
+            self.run_cmd(f"samtools faidx {q(genome_file)}")
 
-        self.run_cmd(f"{BIN_DIR}/LTR_detect {genome_file} {self.ltr_threads} {self.output_dir}")
+        self.run_cmd(
+            f"{q(os.path.join(BIN_DIR, 'LTR_detect'))} {q(genome_file)} "
+            f"{self.ltr_threads} {q(self.output_dir)}"
+        )
         self.build_ltr_consensus()
 
         self.create_checkpoint('ltr')
@@ -404,7 +696,7 @@ class PanTEPipeline:
     def build_ltr_consensus(self):
         """Build LTR consensus library from Look4LTRs .rtr output."""
         look4ltrs_dir = os.path.join(self.output_dir, "Look4LTRs")
-        genome_file = os.path.join(self.output_dir, 'genome', 'genome.fa')
+        genome_file = os.path.join(self.output_dir, DIR_GENOME, 'genome.fa')
 
         build_script = os.path.join(
             BIN_DIR, '..', 'submodule', 'Look4LTRs', 'build_ltr_library.py')
@@ -428,20 +720,20 @@ class PanTEPipeline:
         os.makedirs(lib_dir, exist_ok=True)
 
         if len(rtr_files) == 1:
-            cmd = (f"python3 {build_script} "
-                   f"--rtr {rtr_files[0]} "
-                   f"--genome {genome_file} "
-                   f"--output {lib_dir} "
+            cmd = (f"python3 {q(build_script)} "
+                   f"--rtr {q(rtr_files[0])} "
+                   f"--genome {q(genome_file)} "
+                   f"--output {q(lib_dir)} "
                    f"--threads {self.ltr_threads}")
             self.run_cmd(cmd)
         else:
             part_libs = []
             for i, rtr_file in enumerate(rtr_files):
                 part_dir = os.path.join(lib_dir, f'part_{i}')
-                cmd = (f"python3 {build_script} "
-                       f"--rtr {rtr_file} "
-                       f"--genome {genome_file} "
-                       f"--output {part_dir} "
+                cmd = (f"python3 {q(build_script)} "
+                       f"--rtr {q(rtr_file)} "
+                       f"--genome {q(genome_file)} "
+                       f"--output {q(part_dir)} "
                        f"--threads {self.ltr_threads}")
                 try:
                     self.run_cmd(cmd)
@@ -454,10 +746,12 @@ class PanTEPipeline:
 
             if part_libs:
                 combined = os.path.join(lib_dir, 'combined_raw.fa')
-                self.run_cmd(f"cat {' '.join(part_libs)} > {combined}")
+                self.run_cmd(
+                    f"cat {' '.join(q(path) for path in part_libs)} > {q(combined)}"
+                )
                 final = os.path.join(lib_dir, 'ltr_library.fa')
                 self.run_cmd(
-                    f"cd-hit-est -i {combined} -o {final} "
+                    f"cd-hit-est -i {q(combined)} -o {q(final)} "
                     f"-c 0.8 -aS 0.8 -T {self.ltr_threads} -M 0 "
                     f"> /dev/null 2>&1")
                 logger.info(f"Combined {len(part_libs)} part libraries")
@@ -466,63 +760,436 @@ class PanTEPipeline:
 
         final_lib = os.path.join(lib_dir, 'ltr_library.fa')
         if os.path.exists(final_lib):
-            result = subprocess.run(
-                f"grep -c '^>' {final_lib}",
-                shell=True, capture_output=True, text=True)
-            count = (int(result.stdout.strip())
-                     if result.returncode == 0 else 0)
+            count = count_fasta_sequences(final_lib)
             logger.info(f"LTR library: {count} families")
 
-    def process_repeatscout(self):
+    def process_mdl_repeat(self):
         """Process mdl-repeat with allocated threads."""
-        if self.check_checkpoint('repeatscout'):
+        if self.check_checkpoint('mdl_repeat'):
             return
 
-        logger.info(f"mdl-repeat starting (threads={self.rs_threads})")
-        rs_dir = os.path.join(self.output_dir, 'RepeatScout')
-        tmp_dir = os.path.join(rs_dir, 'tmp')
+        logger.info(f"mdl-repeat starting (threads={self.mdl_threads})")
+        mdl_dir = self.stage_dir(DIR_MDL_REPEAT, DIR_MDL_REPEAT_LEGACY)
+        tmp_dir = os.path.join(mdl_dir, 'tmp')
         os.makedirs(tmp_dir, exist_ok=True)
-        processed_genome = os.path.join(self.output_dir, 'genome', 'genome.fa')
-        cmd = (f"{BIN_DIR}/build_RS --genome {processed_genome} --threads {self.rs_threads} "
-               f"--tmp {tmp_dir} --workdir {rs_dir} ")
+        processed_genome = os.path.join(self.output_dir, DIR_GENOME, 'genome.fa')
+        cmd = " ".join([
+            q(os.path.join(BIN_DIR, "build_mdl")),
+            "--genome", q(processed_genome),
+            "--threads", str(self.mdl_threads),
+            "--tmp-dir", q(tmp_dir),
+            "--work-dir", q(mdl_dir),
+        ])
 
-        if hasattr(self, 'rmblast_dir'):
-            cmd += f" --rmblast {self.rmblast_dir}"
-
-        self.run_cmd(cmd, rs_dir)
-        self.create_checkpoint('repeatscout')
+        self.run_cmd(cmd, mdl_dir)
+        self.create_checkpoint('mdl_repeat')
         logger.info("mdl-repeat done")
 
-    def process_recon(self):
-        """Step 4: Process RECON."""
-        if self.check_checkpoint('recon'):
+    def find_mdl_repeat_for_dfam(self) -> Optional[str]:
+        """Return the best mdl-repeat FASTA library for hmmbuild → dtr --dfam-hmm.
+
+        Prefers consensus_masking.fa (T1+T2, high+medium confidence) for HMM
+        quality; falls back to wider/lower-confidence libraries only if missing.
+        """
+        mdl_dir = self.stage_dir(DIR_MDL_REPEAT, DIR_MDL_REPEAT_LEGACY)
+        candidates = [
+            os.path.join(mdl_dir, 'refiner_output', 'consensus_masking.fa'),
+            os.path.join(mdl_dir, 'refiner_output', 'phase3_analysis_library.fa'),
+            os.path.join(mdl_dir, FILE_CONSENSUS),
+            os.path.join(mdl_dir, FILE_CONSENSUS_LEGACY),
+        ]
+        return next((p for p in candidates
+                     if os.path.exists(p) and os.path.getsize(p) > 0), None)
+
+    def build_dfam_hmm_from_consensus(self, fa_in: str, hmm_out: str,
+                                       work_dir: str) -> bool:
+        """Build a multi-HMM bundle from a FASTA of consensus sequences.
+
+        Each consensus is emitted as its own single-sequence Stockholm block,
+        then a single hmmbuild call writes one HMM per block, all concatenated
+        into hmm_out. Returns True if hmm_out exists and is non-empty.
+        """
+        sto_path = os.path.join(work_dir, "dfam_seed.sto")
+        n_blocks = 0
+        with open(fa_in) as fin, open(sto_path, 'w') as fout:
+            name, chunks = None, []
+
+            def _flush() -> int:
+                if not name or not chunks:
+                    return 0
+                seq = ''.join(chunks)
+                if len(seq) < 30:  # too short for hmmbuild to model usefully
+                    return 0
+                fout.write("# STOCKHOLM 1.0\n")
+                fout.write(f"#=GF ID {name}\n")
+                fout.write(f"{name}    {seq}\n//\n")
+                return 1
+
+            for raw in fin:
+                line = raw.rstrip()
+                if line.startswith('>'):
+                    n_blocks += _flush()
+                    # First whitespace-token; sanitize for Stockholm
+                    tok = line[1:].split()[0] if len(line) > 1 else ""
+                    name = tok.replace(' ', '_').replace('\t', '_') or None
+                    chunks = []
+                else:
+                    chunks.append(line)
+            n_blocks += _flush()
+
+        if n_blocks == 0:
+            logger.warning(f"No usable consensus sequences in {fa_in} for HMM build")
+            try:
+                os.remove(sto_path)
+            except OSError:
+                pass
+            return False
+
+        try:
+            self.run_cmd(
+                f"hmmbuild --dna --cpu {self.threads} "
+                f"{q(hmm_out)} {q(sto_path)}",
+                work_dir
+            )
+        finally:
+            try:
+                os.remove(sto_path)
+            except OSError:
+                pass
+
+        return os.path.exists(hmm_out) and os.path.getsize(hmm_out) > 0
+
+    def get_genome_size_bp(self) -> int:
+        """Total genome size in bp from the .fai of the processed genome."""
+        fai = (self.processed_genome or '') + '.fai'
+        if not fai or not os.path.exists(fai):
+            return 0
+        total = 0
+        with open(fai) as f:
+            for line in f:
+                parts = line.split('\t')
+                if len(parts) >= 2:
+                    try:
+                        total += int(parts[1])
+                    except ValueError:
+                        continue
+        return total
+
+    @staticmethod
+    def choose_te_looker_min_count(genome_bp: int) -> int:
+        """Pick te-discover --min-count (seed = canonical 16-mer occurring >=C times)
+        by genome size. dtr's built-in default is 20, which is an order of magnitude
+        BELOW the >=200 validated on TAIR10 (135 Mb) and far too permissive on a
+        multi-Gb genome: it admits a huge spurious low-copy seed set, inflating the
+        family count. Background k-mer collisions grow with genome size, so the seed
+        floor must rise with it.
+
+        XS  (<300 Mb)        : 50
+        S   (300 Mb – 1 Gb)  : 100
+        M   (1 Gb – 3 Gb)    : 200   (maize-scale)
+        L   (3 Gb – 10 Gb)   : 300
+        XL  (>10 Gb)         : 500
+        """
+        if genome_bp <= 0:
+            return 50
+        if genome_bp < 300 * 10**6:
+            return 50
+        if genome_bp < 1 * 10**9:
+            return 100
+        if genome_bp < 3 * 10**9:
+            return 200
+        if genome_bp < 10 * 10**9:
+            return 300
+        return 500
+
+    @staticmethod
+    def choose_te_looker_window_stride(genome_bp: int) -> int:
+        """Pick --window-stride by SCALABILITY_STRATEGY.md tier.
+
+        XS  (<100 Mb)        : 50
+        S/M (100 Mb – 3 Gb)  : 100  (default; mammal-scale)
+        L   (3 Gb – 10 Gb)   : 200
+        XL  (10 Gb – 30 Gb)  : 500
+        XXL (>30 Gb)         : 1000
+        """
+        if genome_bp <= 0:
+            return 100
+        if genome_bp < 100 * 10**6:
+            return 50
+        if genome_bp < 3 * 10**9:
+            return 100
+        if genome_bp < 10 * 10**9:
+            return 200
+        if genome_bp < 30 * 10**9:
+            return 500
+        return 1000
+
+    def resolve_te_looker_bin(self) -> str:
+        """Resolve the dtr binary used for the TE-looker step."""
+        candidates = []
+        if self.te_looker_bin:
+            candidates.append(self.te_looker_bin)
+        env_bin = os.environ.get('TE_LOOKER_BIN')
+        if env_bin:
+            candidates.append(env_bin)
+        path_bin = shutil.which('dtr')
+        if path_bin:
+            candidates.append(path_bin)
+        # Fallback: te-looker dtr shipped alongside the other detectors in bin/
+        candidates.append(os.path.join(BIN_DIR, 'dtr'))
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                return os.path.abspath(candidate)
+
+        raise FileNotFoundError(
+            'te-looker dtr binary not found. Set TE_LOOKER_BIN, add dtr to PATH, '
+            'or provide --te-looker-bin.'
+        )
+
+    def te_looker_env(self, dtr_bin: str) -> Dict[str, str]:
+        """Build an environment with local tool paths needed by dtr."""
+        env = os.environ.copy()
+        path_parts = [os.path.dirname(dtr_bin)]
+        for var in ('FASTGA_BIN', 'ABPOA_BIN', 'TE_LOOKER_TOOL_PATH'):
+            value = env.get(var)
+            if value:
+                path_parts.extend(value.split(os.pathsep))
+        existing = [p for p in path_parts if p and os.path.isdir(p)]
+        if existing:
+            env['PATH'] = os.pathsep.join(existing + [env.get('PATH', '')])
+        return env
+
+    def _gate_and_merge_te_looker(self, families_fasta: str, work_dir: str) -> str:
+        """Merge + gate discovery-grade TE-looker output before Combine.
+
+        The bundled `dtr` emits rough per-seed consensi with no cross-seed merge and
+        no copy/length gate. This (1) drops families below the copy/length floor and
+        (2) collapses cross-seed fragment redundancy with cd-hit-est, bringing the
+        library into the size range expected of a TE consensus set. Returns the path
+        to the gated+merged library (an empty file if nothing survives the gate).
+        """
+        gated = os.path.join(work_dir, 'discovery_gated.fa')
+        merged = os.path.join(work_dir, 'discovery_merged.fa')
+
+        # (1) copy/length gate — read members= from header, seq length from sequence
+        kept = dropped = 0
+        header = None
+        seq_parts: list = []
+
+        def _flush(fout):
+            nonlocal kept, dropped
+            if header is None:
+                return
+            seq = ''.join(seq_parts)
+            m = re.search(r'members=(\d+)', header)
+            members = int(m.group(1)) if m else TE_LOOKER_MIN_COPIES
+            if members >= TE_LOOKER_MIN_COPIES and len(seq) >= TE_LOOKER_MIN_LEN:
+                fout.write(header + '\n')
+                for i in range(0, len(seq), 80):
+                    fout.write(seq[i:i + 80] + '\n')
+                kept += 1
+            else:
+                dropped += 1
+
+        with open(families_fasta) as fin, open(gated, 'w') as fout:
+            for line in fin:
+                if line.startswith('>'):
+                    _flush(fout)
+                    header = line.rstrip('\n')
+                    seq_parts = []
+                else:
+                    seq_parts.append(line.strip())
+            _flush(fout)
+        logger.info(
+            f"TE-looker gate (members>={TE_LOOKER_MIN_COPIES}, "
+            f"len>={TE_LOOKER_MIN_LEN}bp): kept {kept}, dropped {dropped}"
+        )
+        if kept == 0:
+            logger.warning("TE-looker gate left no families; merged library is empty")
+            Path(merged).touch()
+            return merged
+
+        # (2) cross-seed merge — cd-hit-est collapses the offset-fragment redundancy
+        # that the per-seed A1 discovery leaves behind (the 0.9 dedup in Combine is too
+        # tight to merge partial/offset consensi of the same element).
+        self.run_cmd(
+            f"cd-hit-est -i {q(gated)} -o {q(merged)} "
+            f"-c {TE_LOOKER_MERGE_IDENTITY} -aS 0.6 -n 5 -r 1 -g 1 -d 0 "
+            f"-M 0 -T {self.threads}",
+            work_dir
+        )
+        return merged
+
+    def process_te_looker(self):
+        """Step 4: Process TE-looker."""
+        if self.check_checkpoint('te_looker'):
             return
 
-        logger.info("RECON starting")
-        recon_dir = os.path.join(self.output_dir, 'RECON')
+        logger.info("TE-looker starting")
+        te_stage_dir = self.stage_dir(DIR_TE_LOOKER, DIR_TE_LOOKER_LEGACY)
+        te_run_dir = os.path.join(te_stage_dir, 'run')
+        os.makedirs(te_run_dir, exist_ok=True)
 
-        original_genome = self.processed_genome
-        genome_size = os.path.getsize(original_genome)
-        gb_1 = 1024 ** 3
+        te_looker_genome = self.processed_genome
+        logger.info(f"Using processed genome for TE-looker: {te_looker_genome}")
 
-        if genome_size < gb_1:
-            # Small genome: pass original genome, run_RECON_advanced will
-            # pre-mask it with mdl-repeat consensus then run masked track
-            recon_genome = original_genome
-            logger.info(f"Small genome ({genome_size/1e6:.0f}MB) - RECON in-situ masked track on original genome")
+        # Resume convenience: dtr discovery (te-discover + te-refine + the expensive
+        # mdl→HMM seed build) is the multi-hour step. If a families.fasta already exists
+        # from a prior run, skip dtr entirely and only re-apply the gate/merge below.
+        # Delete te-looker/run/families.fasta to force a full re-discovery.
+        te_looker_families = os.path.join(te_run_dir, 'families.fasta')
+        need_discovery = not (os.path.exists(te_looker_families)
+                              and os.path.getsize(te_looker_families) > 0)
+        if not need_discovery:
+            logger.info(f"TE-looker resume: reusing existing {te_looker_families}; "
+                        f"skipping dtr discovery, re-applying gate only")
+
+        dtr_bin = self.resolve_te_looker_bin()
+        extra_tokens = shlex.split(self.te_looker_extra_args)
+        cmd_parts = [
+            q(dtr_bin),
+            'run',
+            '--genome', q(te_looker_genome),
+            '--out', q(te_run_dir),
+            '--threads', str(self.threads),
+        ]
+
+        # Auto-feed mdl-repeat consensus → Track 1 nhmmer HMM library.
+        # This replaces the older --track2-library seeding: HMM profile search
+        # is the right vehicle for "known-family fast detection" so windows
+        # without Track 1 hits leave Tracks 2/3 free for de novo discovery of
+        # the divergent / fragmented TEs that TE-looker is designed for.
+        if (need_discovery
+                and '--dfam-hmm' not in extra_tokens
+                and '--seed-from-repeatscout' not in extra_tokens):
+            mdl_fa = self.find_mdl_repeat_for_dfam()
+            if mdl_fa:
+                dfam_hmm = os.path.join(te_stage_dir, 'mdl_repeat_seed.hmm')
+                logger.info(f"Building Track 1 HMM seed from mdl-repeat consensus: {mdl_fa}")
+                ok = self.build_dfam_hmm_from_consensus(mdl_fa, dfam_hmm, te_stage_dir)
+                if ok:
+                    logger.info(f"Track 1 HMM seed ready: {dfam_hmm}")
+                    # dtr ignores --dfam-hmm unless --enable-known-hmm-discovery
+                    # is also set (the latter is a master switch that gates the
+                    # legacy library-seeded mode). Pass both so the mdl-repeat
+                    # HMM actually reaches Track 1 nhmmer.
+                    cmd_parts.extend([
+                        '--dfam-hmm', q(dfam_hmm),
+                        '--enable-known-hmm-discovery',
+                    ])
+                else:
+                    logger.warning(
+                        "hmmbuild produced no usable HMMs; Track 1 will run "
+                        "without a seed library (de novo Tracks 2/3 only)"
+                    )
+            else:
+                logger.warning(
+                    "No mdl-repeat consensus found for Track 1 HMM seeding; "
+                    "Track 1 will run without a seed library"
+                )
+
+        # Auto-scale --min-count (seed occurrence floor) to genome size. dtr's
+        # built-in default (20) over-seeds large genomes and inflates the family
+        # count; this raises the floor with genome size (e.g. ~200 at maize scale).
+        if '--min-count' not in extra_tokens:
+            genome_bp = self.get_genome_size_bp()
+            min_count = self.choose_te_looker_min_count(genome_bp)
+            logger.info(
+                f"Genome size {genome_bp/1e9:.2f} Gb → --min-count {min_count} (auto)"
+            )
+            cmd_parts.extend(['--min-count', str(min_count)])
+
+        # Auto-adapt --window-stride to genome size (Stage 2 graph memory
+        # scales as |V| ≈ genome / stride; see design_v2/SCALABILITY_STRATEGY.md).
+        if '--window-stride' not in extra_tokens:
+            genome_bp = self.get_genome_size_bp()
+            stride = self.choose_te_looker_window_stride(genome_bp)
+            logger.info(
+                f"Genome size {genome_bp/1e9:.2f} Gb → "
+                f"--window-stride {stride} (auto)"
+            )
+            cmd_parts.extend(['--window-stride', str(stride)])
+
+        if need_discovery:
+            if self.te_looker_extra_args:
+                cmd_parts.append(self.te_looker_extra_args)
+            self.run_cmd(' '.join(cmd_parts), te_stage_dir,
+                         env=self.te_looker_env(dtr_bin))
+            if not os.path.exists(te_looker_families):
+                raise FileNotFoundError(
+                    f"TE-looker completed but required output is missing: {te_looker_families}"
+                )
+
+        # Fragment-chain stitching (discovery-grade only). The discovery dtr emits one real
+        # element as several co-linear fragment families; stitch them into full-length
+        # consensi BEFORE the gate so the library is full-length, not many short pieces.
+        # Uses disc.members.bed + reuses Refiner_mdl's extract+MSA. Non-fatal on failure.
+        disc_members_bed = os.path.join(te_run_dir, 'disc.members.bed')
+        if (os.path.exists(te_looker_families)
+                and os.path.getsize(te_looker_families) > 0
+                and not os.path.exists(os.path.join(te_run_dir, TE_LOOKER_PROVENANCE))
+                and os.path.exists(disc_members_bed)
+                and os.path.getsize(disc_members_bed) > 0):
+            try:
+                import fragment_stitcher
+                stitched_fa = os.path.join(te_run_dir, 'families_stitched.fasta')
+                before = count_fasta_sequences(te_looker_families)
+                logger.info("TE-looker fragment-chain stitching (pre-gate)...")
+                fragment_stitcher.stitch_te_looker(
+                    te_looker_families, disc_members_bed,
+                    te_looker_genome, stitched_fa)
+                if os.path.exists(stitched_fa) and os.path.getsize(stitched_fa) > 0:
+                    after = count_fasta_sequences(stitched_fa)
+                    logger.info(f"TE-looker stitched: {before} -> {after} families")
+                    te_looker_families = stitched_fa
+            except Exception as e:
+                logger.warning(f"TE-looker fragment stitching failed "
+                               f"(continuing unstitched): {e}")
+
+        # Integrity gate. A gated (full) dtr writes provenance.json and its families.fasta
+        # is final. A discovery-only dtr does not, and its raw per-seed consensi must be
+        # merged + gated here before Combine — otherwise tens of thousands of redundant
+        # fragments dominate the library (see TE_LOOKER_* notes above).
+        final_consensus = os.path.join(te_stage_dir, FILE_CONSENSUS)
+        legacy_consensus = os.path.join(te_stage_dir, FILE_CONSENSUS_LEGACY)
+        provenance = os.path.join(te_run_dir, TE_LOOKER_PROVENANCE)
+
+        if os.path.getsize(te_looker_families) == 0:
+            Path(final_consensus).touch()
+            logger.warning("TE-looker produced an empty families.fasta")
+        elif os.path.exists(provenance):
+            logger.info("TE-looker output is gated (provenance.json present); using as-is")
+            shutil.copyfile(te_looker_families, final_consensus)
         else:
-            # Large genome: use masked genome for dual-track processing
-            recon_genome = os.path.join(self.output_dir, 'RepeatScout', 'refiner_output', 'genome_final_masked.fa')
-            if not os.path.exists(recon_genome):
-                raise FileNotFoundError(f"Masked genome not found: {recon_genome}")
-            logger.info(f"Large genome ({genome_size/1e9:.1f}GB) - RECON on masked genome")
+            raw_count = count_fasta_sequences(te_looker_families)
+            logger.info(
+                f"TE-looker output is discovery-grade (no {TE_LOOKER_PROVENANCE}); "
+                f"merging + gating {raw_count} raw families before Combine"
+            )
+            merged = self._gate_and_merge_te_looker(te_looker_families, te_run_dir)
+            if os.path.getsize(merged) > 0:
+                shutil.copyfile(merged, final_consensus)
+            else:
+                Path(final_consensus).touch()
+        shutil.copyfile(final_consensus, legacy_consensus)
 
-        sample_size = os.path.getsize(recon_genome)
-        cmd = f"{BIN_DIR}/run_RECON_advanced {self.threads} {recon_genome} {sample_size}"
-        self.run_cmd(cmd, recon_dir)
+        count = count_fasta_sequences(final_consensus)
+        logger.info(f"TE-looker consensus library: {count} families")
 
-        self.create_checkpoint('recon')
-        logger.info("RECON done")
+        # Sanity bound: the gate must collapse the discovery inflation. A surviving count
+        # far above what a genome of this size can carry means the merge/gate failed —
+        # fail loudly rather than ship a bloated library into Combine.
+        genome_mb = self.get_genome_size_bp() / 1e6
+        if genome_mb > 0 and count > genome_mb * TE_LOOKER_SANITY_FAMILIES_PER_MB:
+            raise RuntimeError(
+                f"TE-looker library has {count} families for a {genome_mb:.0f} Mb genome "
+                f"(> {TE_LOOKER_SANITY_FAMILIES_PER_MB}/Mb); the merge/gate did not "
+                f"collapse the discovery inflation. Refusing to pass a bloated library to "
+                f"Combine — inspect {te_run_dir}."
+            )
+
+        self.create_checkpoint('te_looker')
+        logger.info("TE-looker step done")
 
     def combine_results(self):
         """Step 5: Combine and classify results."""
@@ -530,70 +1197,84 @@ class PanTEPipeline:
             return
 
         logger.info("Combining results")
-        combine_dir = os.path.join(self.output_dir, 'Combine')
+        combine_dir = self.stage_dir(DIR_COMBINE, DIR_COMBINE_LEGACY)
+        os.makedirs(combine_dir, exist_ok=True)
 
         # Collect mdl-repeat consensus
-        rs_consensus = "../RepeatScout/refiner_output/phase3_analysis_library.fa"
-        if not os.path.exists(os.path.join(combine_dir, rs_consensus)):
-            rs_consensus = "../RepeatScout/consensi.fa"
+        mdl_dir = self.stage_dir(DIR_MDL_REPEAT, DIR_MDL_REPEAT_LEGACY)
+        mdl_consensus_candidates = [
+            os.path.join(mdl_dir, 'refiner_output', 'phase3_analysis_library.fa'),
+            os.path.join(mdl_dir, FILE_CONSENSUS),
+            os.path.join(mdl_dir, FILE_CONSENSUS_LEGACY),
+        ]
+        mdl_consensus = next((p for p in mdl_consensus_candidates
+                              if os.path.exists(p) and os.path.getsize(p) > 0), None)
+        if not mdl_consensus:
+            raise FileNotFoundError("mdl-repeat consensus library not found")
 
-        # Collect all RECON consensi
-        recon_dir = os.path.join(self.output_dir, 'RECON')
-        recon_consensi = []
+        # Collect TE-looker consensus
+        te_stage_dir = self.stage_dir(DIR_TE_LOOKER, DIR_TE_LOOKER_LEGACY)
+        te_consensus_files = []
 
-        direct_consensi = os.path.join(recon_dir, 'consensi.fa')
-        if os.path.exists(direct_consensi) and os.path.getsize(direct_consensi) > 0:
-            recon_consensi.append("../RECON/consensi.fa")
-
-        masked_track_consensi = os.path.join(recon_dir, 'masked_track', 'consensi.fa')
-        if os.path.exists(masked_track_consensi) and os.path.getsize(masked_track_consensi) > 0:
-            recon_consensi.append("../RECON/masked_track/consensi.fa")
-
-        sampling_track_dir = os.path.join(recon_dir, 'sampling_track')
-        if os.path.isdir(sampling_track_dir):
-            round_dirs = sorted(
-                [d for d in os.listdir(sampling_track_dir) if d.startswith('round_')],
-                key=lambda x: int(x.split('_')[1]) if x.split('_')[1].isdigit() else 0)
-            for round_dir in round_dirs:
-                rc = os.path.join(sampling_track_dir, round_dir, 'consensi.fa')
-                if os.path.exists(rc) and os.path.getsize(rc) > 0:
-                    recon_consensi.append(f"../RECON/sampling_track/{round_dir}/consensi.fa")
+        for filename in (FILE_CONSENSUS, FILE_CONSENSUS_LEGACY):
+            candidate = os.path.join(te_stage_dir, filename)
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                te_consensus_files.append(candidate)
+                break
 
         # LTR consensus
-        ltr_consensus = "../Look4LTRs/consensus_lib/ltr_library.fa"
-        if not os.path.exists(os.path.join(combine_dir, ltr_consensus)):
-            ltr_consensus = "../Look4LTRs/consensi.fa"
+        ltr_consensus_candidates = [
+            os.path.join(self.output_dir, "Look4LTRs", "consensus_lib", "ltr_library.fa"),
+            os.path.join(self.output_dir, "Look4LTRs", FILE_CONSENSUS_LEGACY),
+        ]
+        ltr_consensus = next((p for p in ltr_consensus_candidates
+                              if os.path.exists(p) and os.path.getsize(p) > 0), None)
+        if not ltr_consensus:
+            raise FileNotFoundError("LTR consensus library not found")
 
-        input_files = [ltr_consensus, rs_consensus] + recon_consensi
+        input_files = [ltr_consensus, mdl_consensus] + te_consensus_files
 
-        if not recon_consensi:
-            logger.warning("No RECON consensus files found")
+        if not te_consensus_files:
+            logger.warning("No TE-looker consensus files found")
 
-        logger.info(f"Merging {len(input_files)} sources (LTR + RS + {len(recon_consensi)} RECON)")
-        self.run_cmd(f"cat {' '.join(input_files)} > raw_TEs_combined.fa", combine_dir)
+        logger.info(f"Merging {len(input_files)} sources "
+                    f"(LTR + mdl-repeat + {len(te_consensus_files)} TE-looker)")
+        combined_library = os.path.join(combine_dir, FILE_COMBINED_LIBRARY)
+        te_library = os.path.join(combine_dir, FILE_TE_LIBRARY)
+        legacy_combined_library = os.path.join(combine_dir, FILE_COMBINED_LIBRARY_LEGACY)
+        legacy_te_library = os.path.join(combine_dir, FILE_TE_LIBRARY_LEGACY)
+        quoted_inputs = " ".join(q(path) for path in input_files)
+        self.run_cmd(
+            f"cat {quoted_inputs} > {q(combined_library)}",
+            combine_dir
+        )
+        shutil.copyfile(combined_library, legacy_combined_library)
 
-        # Deduplication
-        logger.info("Deduplicating with cd-hit-est...")
+        # Deduplication. Three upstream sources (LTR / mdl-repeat / TE-looker)
+        # are each internally deduplicated/merged, so the final cross-library
+        # merger uses a tighter identity threshold (0.9) to avoid collapsing
+        # related-but-distinct families across detectors.
+        logger.info("Deduplicating with cd-hit-est (identity 0.9)...")
         self.run_cmd(
             f"cd-hit-est "
-            f"-i raw_TEs_combined.fa -o raw_TEs.fa "
-            f"-c 0.8 -aS 0.8 -aL 0.8 -G 0 -n 8 -r 1 "
+            f"-i {q(combined_library)} -o {q(te_library)} "
+            f"-c 0.9 -aS 0.8 -aL 0.8 -G 0 -n 8 -r 1 "
             f"-mask NX -M 0 -T {self.threads} -d 0",
             combine_dir
         )
+        shutil.copyfile(te_library, legacy_te_library)
 
-        raw_count = int(subprocess.check_output(
-            f"grep -c '^>' raw_TEs_combined.fa",
-            shell=True, cwd=combine_dir).decode().strip())
-        final_count = int(subprocess.check_output(
-            f"grep -c '^>' raw_TEs.fa",
-            shell=True, cwd=combine_dir).decode().strip())
+        raw_count = count_fasta_sequences(combined_library)
+        final_count = count_fasta_sequences(te_library)
         logger.info(f"Dedup: {raw_count} -> {final_count} ({raw_count - final_count} removed)")
 
         # Classification
         if self.model_dir:
             logger.info("Classifying TEs...")
-            self.run_cmd(f"{BIN_DIR}/run_Classifier {self.model_dir} {self.threads}", combine_dir)
+            self.run_cmd(
+                f"{q(os.path.join(BIN_DIR, 'run_Classifier'))} {q(self.model_dir)} {self.threads}",
+                combine_dir
+            )
 
         self.create_checkpoint('combine')
         logger.info("Combine done")
@@ -603,21 +1284,28 @@ class PanTEPipeline:
         try:
             if not self.check_checkpoint('genome'):
                 self.process_genome()
+            else:
+                # Checkpoint exists — verify the processed genome is actually present
+                if not os.path.exists(self.processed_genome):
+                    logger.warning("Genome checkpoint exists but processed genome missing, re-running")
+                    self.process_genome()
+                else:
+                    self.genome_file = self.processed_genome
 
             logger.info("Parallel detection: LTR + mdl-repeat")
             with ThreadPoolExecutor(max_workers=2) as executor:
                 ltr_future = executor.submit(self.process_ltr)
-                rs_future = executor.submit(self.process_repeatscout)
+                mdl_future = executor.submit(self.process_mdl_repeat)
 
-                for future in [ltr_future, rs_future]:
+                for future in [ltr_future, mdl_future]:
                     try:
                         future.result()
                     except Exception as e:
                         logger.error(f"Detection failed: {e}")
                         raise
 
-            if not self.check_checkpoint('recon'):
-                self.process_recon()
+            if not self.check_checkpoint('te_looker'):
+                self.process_te_looker()
 
             if not self.check_checkpoint('combine'):
                 self.combine_results()
@@ -635,10 +1323,17 @@ def main():
 
         pipeline = PanTEPipeline(
             genome_file=args.genome,
-            output_dir=args.out,
+            output_dir=args.out_dir,
             threads=args.threads,
             model_dir=args.model_dir,
-            vcf_dir=args.vcf_dir
+            vcf_dir=args.vcf_dir,
+            paf_file=args.paf,
+            paf_fasta=args.paf_fasta,       # list from nargs='+'
+            paf_mapping=args.paf_mapping,
+            gfa_file=args.gfa,
+            gfa_ref=args.gfa_ref,
+            te_looker_bin=args.te_looker_bin,
+            te_looker_extra_args=args.te_looker_extra_args
         )
 
         if args.M > 0:

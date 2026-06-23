@@ -3,7 +3,7 @@
 TE Structure Scoring Module v1.0 (based on stct.md)
 
 Comprehensive structure evidence detection and scoring for TE families
-from RepeatScout libraries.
+from repeat finder libraries.
 
 Scoring components:
   A. Terminal structure & boundary coherence (max +0.40)

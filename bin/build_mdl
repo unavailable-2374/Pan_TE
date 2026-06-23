@@ -1,0 +1,1061 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Cwd qw(getcwd);
+use FindBin;
+use lib $FindBin::RealBin;
+# Portable @INC: the script dir (FindBin) covers bundled .pm; site/vendor perl libs come
+# from the active conda env's perl. An optional PAN_TE_PERL5LIB lets a non-conda install
+# point at extra module dirs without editing this file.
+use lib (split /:/, ($ENV{PAN_TE_PERL5LIB} // ''));
+
+use File::Path qw(make_path);
+use File::Spec;
+use Getopt::Long;
+use Pod::Usage;
+use POSIX qw(:sys_wait_h ceil floor);
+use File::Basename;
+use Log::Log4perl qw(:easy);
+use Parallel::ForkManager;
+use List::Util qw(min max);
+
+# Configure logging
+Log::Log4perl->easy_init({
+    level   => $INFO,
+    layout  => '[%d] %p %m%n',
+    file    => '>>' . getcwd() . '/build_mdl.log'
+});
+my $logger = Log::Log4perl->get_logger();
+
+our $VERSION = '3.0.0';
+
+# Program Configuration
+my %config = (
+    tmp_dir => undef,
+    genome_file => undef,
+    threads => 4,
+    rmblast_dir => undef,
+    work_dir => undef,
+    force_overwrite => 0
+);
+
+sub shell_quote {
+    my ($value) = @_;
+    return "''" unless defined $value && length $value;
+    $value =~ s/'/'"'"'/g;
+    return "'$value'";
+}
+
+# Parse and validate arguments
+get_and_validate_args();
+
+# Set up environment
+$logger->info("Setting up environment...");
+setup_environment();
+
+# Main execution flow
+run_pipeline();
+
+exit(0);
+
+sub get_and_validate_args {
+    GetOptions(
+        'help|h'        => \my $help,
+        'version|v'     => \my $version,
+        'tmp-dir|tmp=s' => \$config{tmp_dir},
+        'genome=s'      => \$config{genome_file},
+        'threads=i'     => \$config{threads},
+        'work-dir|workdir=s' => \$config{work_dir},
+        'force|f'       => \$config{force_overwrite}
+    ) or pod2usage(2);
+
+    pod2usage(-exitval => 0, -verbose => 1) if $help;
+    if ($version) {
+        print "build_mdl version $VERSION\n";
+        exit(0);
+    }
+
+    # Try to locate rmblast directory through multiple methods
+    $config{rmblast_dir} = $ENV{RMBLAST_DIR};
+    unless ($config{rmblast_dir}) {
+        eval {
+            use RepModelConfig;
+            $config{rmblast_dir} = $RepModelConfig::configuration->{'RMBLAST_DIR'}->{'value'};
+        };
+    }
+
+    # If still not found, try locating rmblastn
+    unless ($config{rmblast_dir} && -x "$config{rmblast_dir}/rmblastn") {
+        $config{rmblast_dir} = locate_rmblastn();
+    }
+
+    my %required = (
+        tmp_dir => 'tmp-dir',
+        genome_file => 'genome',
+        work_dir => 'work-dir',
+    );
+    for my $req (keys %required) {
+        unless (defined $config{$req}) {
+            my $option = $required{$req};
+            $logger->error("Missing required parameter: --$option");
+            die "Error: --$option is required\n";
+        }
+    }
+
+    unless ($config{rmblast_dir}) {
+        $logger->error("RMBLAST_DIR environment variable or configuration not found");
+        die "Error: RMBLAST_DIR must be set in environment or configuration\n";
+    }
+
+    # Log configuration
+    $logger->info("Configuration:");
+    $logger->info("  Genome file: $config{genome_file}");
+    $logger->info("  Threads: $config{threads}");
+    $logger->info("  Working directory: $config{work_dir}");
+    $logger->info("  RMBlast directory: $config{rmblast_dir}");
+}
+
+sub locate_rmblastn {
+    $logger->info("Attempting to locate rmblastn...");
+
+    # Try whereis command
+    my $whereis_out = `whereis rmblastn`;
+    if ($whereis_out =~ /rmblastn:\s+(\S+)/) {
+        my $path = $1;
+        if (-x $path) {
+            $logger->info("Found rmblastn via whereis: $path");
+            return dirname($path);
+        }
+    }
+
+    # Try find command in common locations
+    for my $base_dir ("/usr/local", "/usr", $ENV{HOME}, "/opt") {
+        my $cmd = "find $base_dir -name rmblastn -type f 2>/dev/null";
+        my $find_out = `$cmd`;
+        if ($find_out) {
+            chomp($find_out);
+            my @paths = split(/\n/, $find_out);
+            foreach my $path (@paths) {
+                if (-x $path) {
+                    $logger->info("Found rmblastn via find: $path");
+                    return dirname($path);
+                }
+            }
+        }
+    }
+
+    $logger->error("Could not locate rmblastn executable");
+    die "Error: rmblastn not found in system\n";
+}
+
+sub setup_environment {
+    # Create necessary directories
+    for my $dir ($config{tmp_dir}, $config{work_dir}) {
+        unless (-d $dir) {
+            $logger->info("Creating directory: $dir");
+            make_path($dir) or die "Failed to create directory $dir: $!\n";
+        }
+    }
+
+    # Change to work directory
+    chdir $config{work_dir} or die "Cannot change to work directory: $!\n";
+    $logger->info("Changed to working directory: " . getcwd());
+}
+
+sub run_pipeline {
+    $logger->info("Starting mdl-repeat pipeline...");
+
+    my $genome_size = -s $config{genome_file};
+    my $readable_size = sprintf("%.2f", $genome_size/1e9) . " GB";
+    $logger->info("Processing genome of size: $readable_size");
+
+    # ── Large-genome SAMPLED mode ────────────────────────────────────────────────
+    # A genome too large to align / run mdl-repeat on whole (wheat 16 Gb, conifer 24 Gb)
+    # is sampled into representative contiguous windows: mdl-repeat AND every Refiner_mdl
+    # rmblastn run against the SAMPLE, and the COMPLETE genome is used only at the very end
+    # (Refiner_mdl phase2b) for the genome-wide copy count / recurrence floor. mdl targets
+    # HIGH-copy families, which a 5% sample still represents (a C>=100 family leaves >=5
+    # sampled copies). Below the threshold the path is byte-identical to before.
+    my $LARGE_GENOME_BP = 2_000_000_000;     # 2 Gb
+    if ($genome_size && $genome_size > $LARGE_GENOME_BP) {
+        $logger->info(sprintf(
+            "Large genome (%.2f Gb > 2 Gb) -> SAMPLED mode (mdl-repeat + refine on a sample; "
+            . "full genome used only for the final phase2b count)", $genome_size/1e9));
+        my $sample = build_genome_sample($config{genome_file});
+        $config{mdl_genome}    = $sample;            # mdl-repeat runs on the sample
+        $config{refine_genome} = $sample;            # Refiner aligns against the sample
+        $config{genome_full}   = $config{genome_file}; # full genome -> --genome-full (phase2b)
+    } else {
+        $config{mdl_genome}    = $config{genome_file};  # unchanged full-genome path
+        $config{refine_genome} = '';
+        $config{genome_full}   = '';
+    }
+
+    # ── Stale-genome guard ────────────────────────────────────────────────────────
+    # The masked genome, mdl-repeat output, and instances BED are all in the coordinate
+    # space of the genome mdl-repeat ran on. If a prior run used a DIFFERENT genome (e.g.
+    # a full-genome run later resumed in SAMPLED mode), the cached BED (chr1..chrN) no
+    # longer matches the genome Refiner extracts from (sample windows chr*_w*) — Phase 1's
+    # copy extraction then silently recruits nothing (no-op) and ships RAW mdl fragments.
+    # Detect via a genome stamp and invalidate the stale masking + mdl checkpoints.
+    {
+        my $stamp_file = "$config{tmp_dir}/mdl_genome.stamp";
+        my $cur_stamp  = genome_stamp($config{mdl_genome});
+        my $prev_stamp = '';
+        if (-f $stamp_file) {
+            if (open(my $sfh, '<', $stamp_file)) {
+                local $/;
+                $prev_stamp = <$sfh>;
+                close($sfh);
+            }
+            $prev_stamp = '' unless defined $prev_stamp;
+            chomp $prev_stamp;
+        }
+        if (defined $prev_stamp && $prev_stamp ne '' && $prev_stamp ne $cur_stamp) {
+            $logger->warn("mdl-repeat genome changed ('$prev_stamp' -> '$cur_stamp'); "
+                . "invalidating stale masking + mdl-repeat outputs to keep BED coordinates "
+                . "consistent with the refine genome");
+            unlink "$config{work_dir}/dust_trf_masking.ok";
+            unlink "$config{work_dir}/mdl_repeat_complete.ok";
+            unlink "$config{tmp_dir}/genome_masked.fa";
+        }
+    }
+
+    # Check for existing mdl-repeat checkpoint
+    my $mdl_output = "$config{tmp_dir}/mdl_repeat.raw.fa";
+    my $legacy_mdl_output = "$config{tmp_dir}/repeats.fa";
+    my $mdl_checkpoint = "mdl_repeat_complete";
+
+    if (check_checkpoint($mdl_checkpoint) && (-s $mdl_output || -s $legacy_mdl_output) && !$config{force_overwrite}) {
+        if (!-s $mdl_output && -s $legacy_mdl_output) {
+            run_cmd("cp " . shell_quote($legacy_mdl_output) . " " . shell_quote($mdl_output));
+        }
+        $logger->info("Found existing mdl-repeat checkpoint and results, skipping to refinement...");
+    } elsif ((-s $mdl_output || -s $legacy_mdl_output) && !$config{force_overwrite}) {
+        if (!-s $mdl_output && -s $legacy_mdl_output) {
+            run_cmd("cp " . shell_quote($legacy_mdl_output) . " " . shell_quote($mdl_output));
+        }
+        $logger->info("Found existing mdl-repeat results without checkpoint, creating checkpoint...");
+        create_checkpoint($mdl_checkpoint);
+    } else {
+        # Run mdl-repeat
+        run_mdl_repeat();
+
+        # Create checkpoint after successful completion
+        if (-s $mdl_output) {
+            create_checkpoint($mdl_checkpoint);
+            $logger->info("mdl-repeat completion checkpoint created successfully");
+        } else {
+            $logger->error("mdl-repeat did not produce output file: $mdl_output");
+            die "mdl-repeat pipeline failed\n";
+        }
+    }
+
+    # Record which genome this mdl-repeat output was produced on, so a later resume in a
+    # different mode (e.g. full -> SAMPLED) detects the stale BED via the stamp above.
+    write_genome_stamp($config{mdl_genome}) if -s $mdl_output;
+
+    # Run Refiner_mdl pipeline
+    refine_consensus();
+
+    # Final cleanup of tmp directory
+    cleanup_tmp_directory();
+
+    $logger->info("Pipeline completed successfully");
+}
+
+sub run_mdl_repeat {
+    $logger->info("Running mdl-repeat analysis on full genome...");
+
+    # Check for dust_trf_masking checkpoint first
+    my $masking_checkpoint = "dust_trf_masking";
+    my $masked_file = "$config{tmp_dir}/genome_masked.fa";
+
+    if (check_checkpoint($masking_checkpoint) && -s $masked_file && !$config{force_overwrite}) {
+        $logger->info("Found existing masked genome: $masked_file");
+    } else {
+        # Copy genome and apply dust+TRF masking. In SAMPLED mode this is the sample
+        # (set in run_pipeline); otherwise the full genome — unchanged behaviour.
+        my $mdl_input = $config{mdl_genome} || $config{genome_file};
+        $logger->info("Preparing genome for mdl-repeat: $mdl_input");
+        my $tmp_genome = "$config{tmp_dir}/genome_input.fa";
+        run_cmd("cp " . shell_quote($mdl_input) . " " . shell_quote($tmp_genome));
+        $masked_file = apply_masking($tmp_genome);
+    }
+
+    # Run mdl-repeat on masked genome
+    my $output = "$config{tmp_dir}/mdl_repeat.raw.fa";
+    my $instances_bed = "$config{tmp_dir}/mdl_repeat.instances.bed";
+    my $stats_tsv = "$config{tmp_dir}/mdl_repeat.stats.tsv";
+    my $legacy_output = "$config{tmp_dir}/repeats.fa";
+    my $legacy_instances_bed = "$config{tmp_dir}/repeats.bed";
+    my $legacy_stats_tsv = "$config{tmp_dir}/repeats.stats";
+    my $mdl_cmd = join(" ",
+        "mdl-repeat",
+        "-sequence", shell_quote($masked_file),
+        "-output", shell_quote($output),
+        "-threads", $config{threads},
+        "-instances", shell_quote($instances_bed),
+        "-stats", shell_quote($stats_tsv)
+    );
+    $logger->info("Running: $mdl_cmd");
+    run_cmd($mdl_cmd);
+
+    if (-s $output) {
+        run_cmd("cp " . shell_quote($output) . " " . shell_quote($legacy_output));
+        run_cmd("cp " . shell_quote($instances_bed) . " " . shell_quote($legacy_instances_bed)) if -s $instances_bed;
+        run_cmd("cp " . shell_quote($stats_tsv) . " " . shell_quote($legacy_stats_tsv)) if -s $stats_tsv;
+        my $seq_count = `grep -c '^>' '$output' 2>/dev/null || echo 0`;
+        chomp($seq_count);
+        $logger->info("mdl-repeat completed: $seq_count repeat families discovered");
+    } else {
+        $logger->error("mdl-repeat produced no output");
+        die "mdl-repeat failed\n";
+    }
+}
+
+sub apply_masking {
+    my ($input_file) = @_;
+
+    $logger->info("Applying dust + TRF masking");
+
+    # Validate input file format
+    unless (validate_fasta_format($input_file)) {
+        die "Input file is not valid FASTA: $input_file\n";
+    }
+
+    my $input_basename = basename($input_file, '.fa');
+    my $working_dir = dirname($input_file);
+
+    # Step 1: Apply dust masking
+    my $dust_masked = "$working_dir/${input_basename}_dust.fa";
+    my $dust_success = apply_dust_masking($input_file, $dust_masked);
+
+    unless ($dust_success && -s $dust_masked) {
+        $logger->error("Dust masking failed");
+        die "Dust masking failed\n";
+    }
+
+    # Step 2: Apply TRF masking with parallel processing
+    my $final_masked = "$working_dir/genome_masked.fa";
+    my $trf_success = apply_trf_masking_parallel_threaded($dust_masked, $final_masked, $config{threads});
+
+    unless ($trf_success && -s $final_masked) {
+        $logger->error("TRF masking failed");
+        die "TRF masking failed\n";
+    }
+
+    # Clean up intermediate files
+    cleanup_trf_files($working_dir);
+    unlink($dust_masked) if -f $dust_masked;
+
+    # Log masking statistics
+    my $original_size = -s $input_file;
+    my $masked_size = -s $final_masked;
+    $logger->info("Masking done: " .
+                 sprintf("%.1f MB -> %.1f MB", $original_size/1e6, $masked_size/1e6));
+
+    # Create masking checkpoint
+    create_checkpoint("dust_trf_masking");
+
+    return $final_masked;
+}
+
+sub apply_dust_masking {
+    my ($input_file, $output_file) = @_;
+
+    $logger->info("Applying dust hard masking to: " . basename($input_file));
+
+    unless (validate_fasta_format($input_file)) {
+        $logger->error("Input file is not in valid FASTA format: $input_file");
+        return 0;
+    }
+
+    my $simple_cmd = "dustmasker -in " . shell_quote($input_file)
+        . " -outfmt fasta -hard_masking > " . shell_quote($output_file);
+
+    eval {
+        run_cmd($simple_cmd);
+    };
+
+    if ($@ || !-s $output_file || !validate_fasta_format($output_file)) {
+        $logger->error("dustmasker failed or produced invalid output: $@");
+        return 0;
+    }
+
+    # Convert soft masking to hard masking (N characters)
+    my $conversion_success = convert_soft_to_hard_masking($output_file);
+    unless ($conversion_success) {
+        $logger->error("Hard masking conversion failed for: $output_file");
+        return 0;
+    }
+
+    return 1;
+}
+
+sub apply_trf_masking_parallel_threaded {
+    my ($input_file, $output_file, $num_threads) = @_;
+
+    $num_threads = max(1, $num_threads // 4);
+
+    my $input_basename = basename($input_file, '.fa');
+    my $working_dir = dirname($input_file);
+
+    $logger->info("Applying TRF masking with $num_threads parallel threads");
+
+    # Split the file into parts based on thread count
+    my @split_files = split_fasta_for_trf($input_file, $num_threads);
+
+    unless (@split_files) {
+        $logger->warn("Failed to split file for parallel TRF, falling back to sequential");
+        return apply_trf_masking($input_file, $output_file);
+    }
+
+    $logger->info("Split file into " . scalar(@split_files) . " parts for parallel TRF");
+
+    # Run TRF on each part in parallel
+    my @trf_masked_files = run_parallel_trf(@split_files);
+
+    unless (@trf_masked_files) {
+        $logger->error("Parallel TRF processing failed");
+        unlink @split_files;
+        return 0;
+    }
+
+    # Merge the TRF-masked results
+    my $merge_success = merge_trf_results(\@trf_masked_files, $output_file);
+
+    # Clean up temporary files
+    unlink @split_files;
+    unlink @trf_masked_files;
+
+    return $merge_success;
+}
+
+sub split_fasta_for_trf {
+    my ($input_file, $num_threads) = @_;
+
+    return ($input_file) if $num_threads <= 1;
+
+    # TRF algorithm complexity is super-linear with sequence length.
+    # A 24 Mb chromosome can hang indefinitely, but 500 KB windows finish in seconds.
+    # Split each sequence into windows before feeding to TRF.
+    my $max_window = 500_000;
+
+    my $input_basename = basename($input_file, '.fa');
+    my $working_dir = dirname($input_file);
+
+    # Estimate window count from file size to determine split file count
+    my $file_size = -s $input_file;
+    my $est_windows = max(1, int($file_size / $max_window));
+    my $actual_splits = min($num_threads, $est_windows);
+    $actual_splits = max(1, $actual_splits);
+
+    # Create output split files
+    my @split_files;
+    my @out_fhs;
+    for my $i (1..$actual_splits) {
+        my $sf = "$working_dir/${input_basename}_trf_part${i}.fa";
+        push @split_files, $sf;
+        open(my $fh, '>', $sf) or die "Cannot create $sf: $!";
+        push @out_fhs, $fh;
+    }
+
+    # Stream through input: split long sequences into windows, distribute round-robin
+    open(my $in_fh, '<', $input_file) or die "Cannot open $input_file: $!";
+
+    my $window_count = 0;
+    my $cur_name = '';
+    my $seq_buf = '';
+    my $win_idx = 0;
+
+    my $flush_window = sub {
+        my ($name, $idx, $seq) = @_;
+        return unless length($seq) > 0;
+        my $wname = "${name}__w${idx}";
+        my $fh = $out_fhs[$window_count % $actual_splits];
+        print $fh ">$wname\n";
+        for (my $p = 0; $p < length($seq); $p += 80) {
+            print $fh substr($seq, $p, 80) . "\n";
+        }
+        $window_count++;
+    };
+
+    while (my $line = <$in_fh>) {
+        chomp $line;
+        if ($line =~ /^>(\S+)/) {
+            # Flush remaining buffer for previous sequence
+            if ($cur_name ne '' && length($seq_buf) > 0) {
+                $flush_window->($cur_name, $win_idx, $seq_buf);
+            }
+            $cur_name = $1;
+            $seq_buf = '';
+            $win_idx = 0;
+        } else {
+            $seq_buf .= $line;
+            # Flush full windows as buffer accumulates
+            while (length($seq_buf) >= $max_window) {
+                my $window = substr($seq_buf, 0, $max_window, '');
+                $flush_window->($cur_name, $win_idx, $window);
+                $win_idx++;
+            }
+        }
+    }
+    # Flush final buffer
+    if ($cur_name ne '' && length($seq_buf) > 0) {
+        $flush_window->($cur_name, $win_idx, $seq_buf);
+    }
+
+    close($in_fh);
+    close($_) for @out_fhs;
+
+    $logger->info("Split sequences into $window_count windows (${max_window}bp each) across $actual_splits files");
+    return @split_files;
+}
+
+sub run_parallel_trf {
+    my @split_files = @_;
+
+    # Limit concurrency to the number of split files (already capped by num_threads)
+    my $max_procs = scalar(@split_files);
+    my $pm = Parallel::ForkManager->new($max_procs);
+    my @trf_masked_files;
+
+    $pm->run_on_finish(sub {
+        my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data) = @_;
+        if ($data && $data->{masked_file} && -s $data->{masked_file}) {
+            push @trf_masked_files, $data->{masked_file};
+        }
+    });
+
+    for my $split_file (@split_files) {
+        $pm->start and next;
+
+        my $split_basename = basename($split_file, '.fa');
+        my $working_dir = dirname($split_file);
+        my $trf_masked = "$working_dir/${split_basename}_masked.fa";
+
+        my $success = apply_trf_masking($split_file, $trf_masked);
+
+        if ($success && -s $trf_masked) {
+            $pm->finish(0, { masked_file => $trf_masked });
+        } else {
+            $logger->error("TRF masking failed for split file: $split_file");
+            $pm->finish(1);
+        }
+    }
+
+    $pm->wait_all_children;
+
+    $logger->info("Parallel TRF completed for " . scalar(@trf_masked_files) . " files");
+    return sort @trf_masked_files;
+}
+
+sub apply_trf_masking {
+    my ($input_file, $output_file) = @_;
+
+    unless (validate_fasta_format($input_file)) {
+        $logger->error("Input file is not valid FASTA for TRF: $input_file");
+        return 0;
+    }
+
+    my $working_dir = dirname($input_file);
+    my $input_basename = basename($input_file, '.fa');
+
+    # TRF parameters: match=2, mismatch=7, delta=7, PM=80, PI=10, minscore=50, maxperiod=500
+    # -m: mask file output, -h: suppress HTML (no -d: skip huge .dat data file)
+    my $cmd = "trf " . shell_quote($input_file) . " 2 7 7 80 10 50 500 -m -h";
+
+    my $original_dir = getcwd();
+    eval {
+        chdir($working_dir) or die "Cannot change to $working_dir: $!";
+
+        my $trf_output = `$cmd 2>&1`;
+
+        # Find TRF mask file
+        my $base_without_ext = basename($input_file);
+        my @possible_mask_files = (
+            "$input_basename.fa.2.7.7.80.10.50.500.mask",
+            "${input_basename}_dust.fa.2.7.7.80.10.50.500.mask",
+            basename($input_file) . ".2.7.7.80.10.50.500.mask",
+            "$base_without_ext.2.7.7.80.10.50.500.mask"
+        );
+
+        my @trf_mask_files = glob("*.2.7.7.80.10.50.500.mask");
+        push @possible_mask_files, @trf_mask_files;
+
+        my $found_mask = 0;
+        for my $trf_mask_file (@possible_mask_files) {
+            if (-s $trf_mask_file) {
+                run_cmd("mv " . shell_quote($trf_mask_file) . " " . shell_quote($output_file));
+                $found_mask = 1;
+                last;
+            }
+        }
+
+        if ($found_mask) {
+            convert_soft_to_hard_masking($output_file);
+        } else {
+            $logger->warn("TRF mask file not found, copying input file");
+            run_cmd("cp " . shell_quote($input_file) . " " . shell_quote($output_file));
+        }
+    };
+
+    chdir($original_dir) or $logger->error("Cannot return to original directory: $!");
+
+    if ($@ || !-s $output_file) {
+        $logger->warn("TRF masking failed: $@");
+        $logger->info("Copying input file without TRF masking");
+        run_cmd("cp " . shell_quote($input_file) . " " . shell_quote($output_file));
+    }
+
+    return 1;
+}
+
+sub merge_trf_results {
+    my ($trf_files_ref, $output_file) = @_;
+    my @trf_files = @$trf_files_ref;
+
+    $logger->info("Reconstructing sequences from " . scalar(@trf_files) . " TRF-masked files");
+
+    # Read all masked windows, group by original sequence name
+    my %seq_windows;   # orig_name => { window_idx => seq_string }
+    my @seq_order;     # preserve original sequence order
+    my %seen_seq;
+
+    for my $trf_file (sort @trf_files) {
+        next unless -s $trf_file;
+        open(my $fh, '<', $trf_file) or die "Cannot open $trf_file: $!";
+        my ($cur_name, $cur_seq) = ('', '');
+
+        while (my $line = <$fh>) {
+            chomp $line;
+            if ($line =~ /^>(\S+)/) {
+                _store_trf_window(\%seq_windows, \@seq_order, \%seen_seq, $cur_name, $cur_seq)
+                    if $cur_name ne '';
+                $cur_name = $1;
+                $cur_seq = '';
+            } else {
+                $cur_seq .= $line;
+            }
+        }
+        _store_trf_window(\%seq_windows, \@seq_order, \%seen_seq, $cur_name, $cur_seq)
+            if $cur_name ne '';
+        close($fh);
+    }
+
+    # Write reconstructed sequences (windows concatenated in order)
+    open(my $out_fh, '>', $output_file) or die "Cannot create $output_file: $!";
+
+    for my $orig_name (@seq_order) {
+        print $out_fh ">$orig_name\n";
+        my $windows = $seq_windows{$orig_name};
+        for my $idx (sort { $a <=> $b } keys %$windows) {
+            my $seq = $windows->{$idx};
+            for (my $p = 0; $p < length($seq); $p += 80) {
+                print $out_fh substr($seq, $p, 80) . "\n";
+            }
+        }
+    }
+
+    close($out_fh);
+
+    my $output_size = -s $output_file;
+    $logger->info("Reconstruction completed: " . format_size($output_size) .
+                  " (" . scalar(@seq_order) . " sequences)");
+
+    return $output_size > 0;
+}
+
+sub _store_trf_window {
+    my ($seq_windows, $seq_order, $seen_seq, $name, $seq) = @_;
+
+    my ($orig_name, $win_idx);
+    if ($name =~ /^(.+)__w(\d+)$/) {
+        ($orig_name, $win_idx) = ($1, int($2));
+    } else {
+        ($orig_name, $win_idx) = ($name, 0);
+    }
+
+    unless ($seen_seq->{$orig_name}) {
+        push @$seq_order, $orig_name;
+        $seen_seq->{$orig_name} = 1;
+    }
+
+    $seq_windows->{$orig_name}{$win_idx} = $seq;
+}
+
+sub cleanup_trf_files {
+    my ($working_dir) = @_;
+
+    my @patterns = ("$working_dir/*.html", "$working_dir/*.dat",
+                    "$working_dir/*.2.7.7.80.10.50.500.mask",
+                    "$working_dir/*_trf_part*.fa");
+
+    my $total = 0;
+    for my $pattern (@patterns) {
+        for my $file (glob($pattern)) {
+            if (-f $file) { unlink($file); $total++; }
+        }
+    }
+    $logger->info("Cleaned up $total TRF intermediate files") if $total > 0;
+}
+
+sub validate_fasta_format {
+    my ($file) = @_;
+
+    return 0 unless -s $file;
+
+    open(my $fh, '<', $file) or return 0;
+    my $first_line = <$fh>;
+    close($fh);
+
+    return 0 unless $first_line;
+    chomp($first_line);
+    return ($first_line =~ /^>/) ? 1 : 0;
+}
+
+sub convert_soft_to_hard_masking {
+    my ($file) = @_;
+
+    unless (validate_fasta_format($file)) {
+        $logger->error("Input file for hard masking is not valid FASTA: $file");
+        return 0;
+    }
+
+    my $temp_file = "$file.hard_mask_tmp";
+
+    open(my $in_fh, '<', $file) or die "Cannot open $file: $!";
+    open(my $out_fh, '>', $temp_file) or die "Cannot create $temp_file: $!";
+
+    while (my $line = <$in_fh>) {
+        if ($line =~ /^>/) {
+            print $out_fh $line;
+        } else {
+            chomp $line;
+            $line =~ s/[actgn]/N/g;
+            print $out_fh "$line\n";
+        }
+    }
+
+    close($in_fh);
+    close($out_fh);
+
+    run_cmd("mv " . shell_quote($temp_file) . " " . shell_quote($file));
+
+    unless (validate_fasta_format($file)) {
+        $logger->error("Hard masking conversion corrupted the file: $file");
+        return 0;
+    }
+
+    return 1;
+}
+
+sub refine_consensus {
+    $logger->info("Refining consensus sequences with Refiner_mdl pipeline...");
+
+    my $input = "$config{tmp_dir}/mdl_repeat.raw.fa";
+    my $legacy_input = "$config{tmp_dir}/repeats.fa";
+    my $refiner_output_dir = "$config{work_dir}/refiner_output";
+
+    make_path($config{work_dir}) unless -d $config{work_dir};
+    make_path($refiner_output_dir) unless -d $refiner_output_dir;
+
+    if (!-f $input && -f $legacy_input) {
+        $input = $legacy_input;
+    }
+    die "Input file missing: $input\n" unless -f $input;
+
+    # Determine which genome file to use for Refiner. In SAMPLED mode (set in
+    # run_pipeline) Refiner aligns against the sample; the full genome is passed
+    # separately via --genome-full for the final phase2b count.
+    my $genome_for_refiner = $config{refine_genome} || determine_genome_for_refiner();
+    $logger->info("Using genome file for Refiner: $genome_for_refiner");
+    my $genome_full_arg = ($config{genome_full})
+        ? "--genome-full " . shell_quote($config{genome_full}) : "";
+    $logger->info("SAMPLED mode: full genome for phase2b = $config{genome_full}")
+        if $config{genome_full};
+
+    my $refiner_script = "$FindBin::RealBin/Refiner_mdl/main.py";
+    die "Refiner_mdl script missing: $refiner_script\n" unless -f $refiner_script;
+    $logger->info("Using Refiner_mdl pipeline");
+
+    # Check for optional BED/stats files
+    my $bed_arg = "";
+    my $stats_arg = "";
+    my $bed_file = "$config{tmp_dir}/mdl_repeat.instances.bed";
+    my $stats_file = "$config{tmp_dir}/mdl_repeat.stats.tsv";
+    my $legacy_bed_file = "$config{tmp_dir}/repeats.bed";
+    my $legacy_stats_file = "$config{tmp_dir}/repeats.stats";
+    $bed_file = $legacy_bed_file if !-f $bed_file && -f $legacy_bed_file;
+    $stats_file = $legacy_stats_file if !-f $stats_file && -f $legacy_stats_file;
+    $bed_arg = "--bed " . shell_quote($bed_file) if -f $bed_file;
+    $stats_arg = "--stats " . shell_quote($stats_file) if -f $stats_file;
+
+    # Curation reference assets (env-overridable). Cellular protein DB = SwissProt with
+    # TE proteins removed (species-agnostic). Used only if present; steps skip otherwise.
+    my $REFS = "/scratch/shuoc/TE/Pan_TE_refs";
+    my $cellular_db = $ENV{PAN_TE_CELLULAR_DB} // ((-f "$REFS/sprot_cell.pin") ? "$REFS/sprot_cell" : "");
+    my $organelle_ref = $ENV{PAN_TE_ORGANELLE_REF} // "";
+    # barrnap resolved from PATH (conda provides it); PAN_TE_BARRNAP overrides if needed.
+    my $barrnap_exe = $ENV{PAN_TE_BARRNAP} // "barrnap";
+
+    my $cmd = join(" ",
+        "python3", shell_quote($refiner_script),
+        "--input", shell_quote($input),
+        "--genome", shell_quote($genome_for_refiner),
+        $genome_full_arg,
+        "--output", shell_quote($refiner_output_dir),
+        "--threads $config{threads}",
+        # Recruit real genomic copy numbers via rmblastn and apply the >=5-copy
+        # recurrence floor (mdl `copies` is an unreliable MDL estimate; see
+        # phase2_copy_recruit.py). genomic_copies drives the low-copy/hard-floor filter.
+        "--enable-copy-recruit",
+        "--hard-min-copies 5",
+        "--enable-rescue",
+        # Library curation (gene exclusion + non-TE separation). Cellular protein DB is
+        # a species-agnostic pipeline asset; organelle ref is species-specific (optional,
+        # rRNA/satellite still run without it). Each step skips cleanly if its tool/ref
+        # is absent. Override paths via env (PAN_TE_CELLULAR_DB / PAN_TE_ORGANELLE_REF).
+        ($cellular_db ? "--cellular-protein-db " . shell_quote($cellular_db) : ""),
+        "--enable-nonte",
+        ($organelle_ref ? "--organelle-ref " . shell_quote($organelle_ref) : ""),
+        ($barrnap_exe ? "--barrnap-exe " . shell_quote($barrnap_exe) : ""),
+        # Phase-1 rmblastn copy source + seed de-nesting (N7) + protein flank trim.
+        "--enable-rmblastn-copies",
+        "--enable-seed-chimera",
+        "--enable-flank-trim",
+        "--enable-structural-trim",
+        $bed_arg,
+        $stats_arg
+    );
+
+    run_cmd($cmd);
+
+    # Copy final consensus to expected location
+    my $final_consensus = "$refiner_output_dir/consensus_masking.fa";
+    my $output = "$config{work_dir}/consensus.fa";
+    my $legacy_output = "$config{work_dir}/consensi.fa";
+
+    if (-s $final_consensus) {
+        run_cmd("cp " . shell_quote($final_consensus) . " " . shell_quote($output));
+        run_cmd("cp " . shell_quote($final_consensus) . " " . shell_quote($legacy_output));
+        $logger->info("Final consensus copied to $output");
+    } else {
+        $logger->warn("Refiner output not found: $final_consensus");
+    }
+
+    $logger->info("Consensus refinement completed");
+}
+
+sub determine_genome_for_refiner {
+    # Priority order:
+    # 1. Full processed genome from pipeline Step 1
+    # 2. Original genome file as fallback
+
+    my $full_processed_genome = "$config{work_dir}/../genome/genome.fa";
+    if (-s $full_processed_genome) {
+        my $genome_size = -s $full_processed_genome;
+        $logger->info("Using full processed genome for Refiner: $full_processed_genome");
+        $logger->info("  Size: " . sprintf("%.1f MB", $genome_size/1e6));
+        return $full_processed_genome;
+    }
+
+    # Fallback to original genome
+    $logger->warn("Processed genome not found, falling back to original genome");
+    return $config{genome_file};
+}
+
+sub build_genome_sample {
+    # Draw a deterministic representative sample of the full genome for the large-genome
+    # path (see bin/sample_genome.py). Checkpointed + resumable; the same genome always
+    # yields the same sample (seed 42). Returns the sample FASTA path.
+    my ($full_genome) = @_;
+
+    my $sample     = "$config{tmp_dir}/genome_sample.fa";
+    my $sample_bed = "$config{tmp_dir}/genome_sample.bed";
+    my $checkpoint = "genome_sample";
+
+    if (check_checkpoint($checkpoint) && -s $sample && !$config{force_overwrite}) {
+        $logger->info("Found existing genome sample: $sample");
+        return $sample;
+    }
+
+    my $sampler = "$FindBin::RealBin/sample_genome.py";
+    die "Genome sampler missing: $sampler\n" unless -f $sampler;
+
+    # S = clamp(0.05 * G, 200 Mb, 1 Gb); contiguous 1 Mb windows; skip contigs < 100 kb.
+    my $cmd = join(" ",
+        "python3", shell_quote($sampler),
+        "--genome", shell_quote($full_genome),
+        "--out",    shell_quote($sample),
+        "--bed",    shell_quote($sample_bed),
+        "--chunk-len-bp",  1000000,
+        "--fraction",      0.05,
+        "--min-bp",        200000000,
+        "--max-bp",        1000000000,
+        "--min-contig-bp", 100000,
+        "--seed",          42,
+    );
+    $logger->info("Building genome sample for large-genome mode...");
+    run_cmd($cmd);
+
+    die "Genome sampling produced no output: $sample\n" unless -s $sample;
+    # Refiner_mdl Phase 1 extracts family copies from this sample via `samtools faidx`;
+    # without the .fai index EVERY shard worker crashes (No such file: *.fai) and falls
+    # back to raw seeds — Phase 1 silently no-ops and ships unrefined fragments. Index now.
+    run_cmd("samtools faidx " . shell_quote($sample));
+    create_checkpoint($checkpoint);
+    $logger->info(sprintf("Genome sample ready: %s (%.0f Mb)", $sample, (-s $sample)/1e6));
+    return $sample;
+}
+
+sub cleanup_tmp_directory {
+    $logger->info("Performing final cleanup of tmp directory: $config{tmp_dir}");
+
+    my @patterns = (
+        "$config{tmp_dir}/*.html",
+        "$config{tmp_dir}/*.dat",
+        "$config{tmp_dir}/*.2.7.7.80.10.50.500.*",
+        "$config{tmp_dir}/*_dust.fa",
+        "$config{tmp_dir}/*_trf_part*.fa",
+        "$config{tmp_dir}/genome_input.fa",
+    );
+
+    my $total = 0;
+    for my $pattern (@patterns) {
+        for my $file (glob($pattern)) {
+            if (-f $file) { unlink($file); $total++; }
+        }
+    }
+
+    $logger->info("Final cleanup completed: removed $total intermediate files");
+}
+
+sub format_size {
+    my ($bytes) = @_;
+    return "0B" unless $bytes;
+
+    my @units = qw(B KB MB GB TB);
+    my $unit_index = 0;
+
+    while ($bytes >= 1024 && $unit_index < @units - 1) {
+        $bytes /= 1024;
+        $unit_index++;
+    }
+
+    return sprintf("%.1f%s", $bytes, $units[$unit_index]);
+}
+
+sub genome_stamp {
+    # Identity stamp for the genome mdl-repeat ran on (basename|byte-size). Used to detect
+    # a coordinate-space change (full <-> sample) across resumes; see run_pipeline guard.
+    my ($path) = @_;
+    return '' unless $path;
+    my $size = (-s $path) || 0;
+    return basename($path) . "|" . $size;
+}
+
+sub write_genome_stamp {
+    my ($path) = @_;
+    my $stamp_file = "$config{tmp_dir}/mdl_genome.stamp";
+    open(my $fh, '>', $stamp_file) or return;
+    print $fh genome_stamp($path);
+    close($fh);
+}
+
+sub create_checkpoint {
+    my ($checkpoint_name, $checkpoint_file) = @_;
+
+    $checkpoint_file = $checkpoint_file || "$config{work_dir}/${checkpoint_name}.ok";
+
+    open(my $fh, '>', $checkpoint_file) or die "Cannot create checkpoint file $checkpoint_file: $!";
+    print $fh "Checkpoint created: " . localtime() . "\n";
+    print $fh "Process ID: $$\n";
+    print $fh "Working directory: " . getcwd() . "\n";
+    close($fh);
+
+    $logger->info("Checkpoint created: $checkpoint_file");
+}
+
+sub check_checkpoint {
+    my ($checkpoint_name, $checkpoint_file) = @_;
+
+    $checkpoint_file = $checkpoint_file || "$config{work_dir}/${checkpoint_name}.ok";
+
+    if (-f $checkpoint_file) {
+        $logger->info("Found existing checkpoint: $checkpoint_name");
+        return 1;
+    }
+
+    return 0;
+}
+
+sub run_cmd {
+    my $cmd = shift;
+    $logger->info("Executing command: $cmd");
+
+    my $output = `$cmd 2>&1`;
+    my $exit_code = $? >> 8;
+
+    if ($exit_code != 0) {
+        $logger->error("Command failed with exit code: $exit_code");
+        $logger->error("Command output:");
+        $logger->error($output);
+        die "Command execution failed\n";
+    }
+
+    $logger->debug("Command completed successfully");
+    return $output;
+}
+
+__END__
+
+=head1 NAME
+
+build_mdl - mdl-repeat Pipeline for Pan_TE
+
+=head1 SYNOPSIS
+
+  build_mdl --genome GENOME.fa --tmp-dir TMP_DIR --work-dir WORK_DIR [OPTIONS]
+
+=head1 DESCRIPTION
+
+This script runs mdl-repeat for de novo repeat discovery. It applies dust/TRF
+masking to the genome, then runs mdl-repeat (which handles large genomes
+internally), and passes the results to the Refiner_mdl pipeline for consensus
+building.
+
+=head1 REQUIRED ARGUMENTS
+
+  --genome FILE      Input genome in FASTA format
+  --tmp-dir DIR      Temporary directory for intermediate files
+                    Alias: --tmp
+  --work-dir DIR     Working directory for output files
+                    Alias: --workdir
+
+=head1 OPTIONS
+
+  --threads INT      Number of threads to use (default: 4)
+  --force, -f        Force overwrite of existing files
+  --help, -h         Show this help message
+  --version, -v      Show version information
+
+=head1 EXAMPLES
+
+  # Basic usage
+  build_mdl --genome genome.fa --tmp-dir /tmp/build_mdl --work-dir output
+
+  # With custom parameters
+  build_mdl --genome genome.fa --tmp-dir /tmp --work-dir output --threads 16 --force
+
+=head1 AUTHOR
+
+Pan_TE Development Team
+
+=head1 VERSION
+
+3.0.0
+
+=cut
