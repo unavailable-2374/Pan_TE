@@ -10,7 +10,7 @@ package:
 
 source:
   url: https://github.com/unavailable-2374/mdl-repeat/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 9ac04ee661e447e8f55292cd44a5bfc4af14e02ccc7e08f70cd8bb40d8ef48b9
+  sha256: 160f23e50961e71100adebba051498d17383873a392ae1be52e417f538e9966f
 
 build:
   number: 0
