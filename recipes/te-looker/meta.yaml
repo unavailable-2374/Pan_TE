@@ -22,6 +22,7 @@ requirements:
   build:
     - {{ compiler('rust') }}
     - {{ compiler('c') }}
+    - {{ stdlib('c') }}
     - make
   run:
     # Runtime tools the dtr pipeline shells out to (design tracks / consensus).
