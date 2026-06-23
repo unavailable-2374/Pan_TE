@@ -1,7 +1,7 @@
 {% set name = "mdl-repeat" %}
-{% set version = "1.0.0" %}
+{% set version = "1.0.1" %}
 
-# mdl-repeat is PUBLIC at github.com/unavailable-2374/mdl-repeat, GPL-3.0, tagged v1.0.0
+# mdl-repeat is PUBLIC at github.com/unavailable-2374/mdl-repeat, GPL-3.0, tagged v1.0.1
 # (rmblastn resolved from $RMBLASTN_BIN/PATH). Build verified from main. Ready to submit.
 
 package:
@@ -10,7 +10,7 @@ package:
 
 source:
   url: https://github.com/unavailable-2374/mdl-repeat/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 126310a7c90ea1f39fa6f6c5c5b3b0136e1fa7d44105a72f7789c361ad17813b
+  sha256: 9ac04ee661e447e8f55292cd44a5bfc4af14e02ccc7e08f70cd8bb40d8ef48b9
 
 build:
   number: 0
