@@ -19,7 +19,7 @@ from vcf_processor import VCFProcessor
 from paf_processor import PAFProcessor, count_fasta_sequences
 from gfa_processor import GfaProcessor
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 
 # Usage and help message
 USAGE = f'''Usage:
@@ -126,6 +126,36 @@ def _cmd_label(cmd: str) -> str:
     except ValueError:
         token = cmd.split()[0]
     return os.path.basename(token)
+
+def resolve_ltr_library_builder() -> str:
+    """Locate Look4LTRs' Python helper without requiring a submodule."""
+    candidates = []
+    override = os.environ.get('PAN_TE_LTR_LIBRARY_BUILDER')
+    if override:
+        candidates.append(override)
+
+    # Installed Pan_TE lives at $PREFIX/share/pan_te/Pan_TE.
+    package_prefix = Path(BIN_DIR).parent.parent
+    candidates.append(package_prefix / 'share' / 'Look4LTRs' / 'build_ltr_library.py')
+    conda_prefix = os.environ.get('CONDA_PREFIX')
+    if conda_prefix:
+        candidates.append(Path(conda_prefix) / 'share' / 'Look4LTRs' / 'build_ltr_library.py')
+
+    # Compatibility with older packages, then source-development fallback.
+    candidates.append(Path(BIN_DIR).parent / 'submodule' / 'Look4LTRs' /
+                      'build_ltr_library.py')
+    candidates.append(Path(BIN_DIR).parent.parent / 'submodule' / 'Look4LTRs' /
+                      'build_ltr_library.py')
+    for candidate in candidates:
+        candidate = Path(candidate).expanduser()
+        if candidate.is_file():
+            return str(candidate.resolve())
+
+    searched = '\n  - '.join(str(Path(candidate).expanduser()) for candidate in candidates)
+    raise FileNotFoundError(
+        'build_ltr_library.py was not found. Install the Conda look4ltrs package, '
+        'set PAN_TE_LTR_LIBRARY_BUILDER, or initialise the Look4LTRs development '
+        f'submodule. Searched:\n  - {searched}')
 
 def detect_compression_format(file_path: str) -> str:
     """
@@ -698,11 +728,7 @@ class PanTEPipeline:
         look4ltrs_dir = os.path.join(self.output_dir, "Look4LTRs")
         genome_file = os.path.join(self.output_dir, DIR_GENOME, 'genome.fa')
 
-        build_script = os.path.join(
-            BIN_DIR, '..', 'submodule', 'Look4LTRs', 'build_ltr_library.py')
-        if not os.path.exists(build_script):
-            raise FileNotFoundError(
-                f"build_ltr_library.py not found: {build_script}")
+        build_script = resolve_ltr_library_builder()
 
         rtr_files = []
         for root, _, files in os.walk(look4ltrs_dir):

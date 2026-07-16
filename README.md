@@ -16,17 +16,16 @@ classifies the result with RepeatClassifier + ClassifyTE.
 
 ## Installation
 
-### Option A — conda / bioconda
+### Option A - conda / bioconda
 
-> **Status (in progress):** the tool dependencies (`look4ltrs`, `mdl-repeat`, `te-looker`) are
-> submitted to bioconda and passing CI — [bioconda-recipes #66613](https://github.com/bioconda/bioconda-recipes/pull/66613),
-> awaiting maintainer review. The `pan_te` recipe follows once those merge. The command below
-> works once all four are merged into the bioconda channel:
+Once the published `pan_te` package is available from the configured channels, installation is
+self-contained: Conda supplies `look4ltrs`, `mdl-repeat`, `te-looker` and their runtime helper
+scripts. No Git submodules or local compilation are required.
 
     conda create -n pan_te -c conda-forge -c bioconda pan_te
     conda activate pan_te
 
-Until then, use Option B.
+For source development, use Option B.
 
 ### Option B — from source
 
@@ -34,13 +33,17 @@ Until then, use Option B.
     cd Pan_TE
     conda env create -f environment.yml        # creates the `pan_te` env (or: mamba env create)
     conda activate pan_te
-    ./build_tools.sh                            # builds look4ltrs, FastGA, mdl-repeat, dtr into the env
+    ./build_tools.sh                            # development fallback: builds custom tools locally
     echo 'export PATH=$PWD/bin:$PATH' >> ~/.bashrc
 
-`build_tools.sh` resolves each custom tool from its repo-local submodule, a `PAN_TE_*_SRC`
-environment override, or a clone. The te-looker source lives at
+For development only, `build_tools.sh` resolves each custom tool from a `PAN_TE_*_SRC`
+environment override, an optional repo-local submodule, or a clone. The te-looker source lives at
 <https://github.com/unavailable-2374/te-looker> — set `PAN_TE_TE_LOOKER_SRC=/path/to/te-looker`
 if it is not already checked out.
+
+The LTR consensus helper is resolved in this order: an explicit
+`PAN_TE_LTR_LIBRARY_BUILDER` path, the Conda `look4ltrs` package, then the legacy
+`submodule/Look4LTRs` development checkout.
 
 **Classification (optional)** runs in its own isolated environment because of pinned ML deps:
 

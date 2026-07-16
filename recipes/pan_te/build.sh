@@ -1,8 +1,9 @@
 #!/bin/bash
 set -ex
 
-# Two sources are unpacked side by side: $SRC_DIR/pan_te (main tree) and
-# $SRC_DIR/look4ltrs_src (only for build_ltr_library.py).
+# The Look4LTRs helper is supplied at runtime by the look4ltrs dependency
+# ($PREFIX/share/Look4LTRs/build_ltr_library.py); no third-party source tree is
+# vendored into the Pan_TE package.
 SRC="$SRC_DIR/pan_te"
 PKG="$PREFIX/share/pan_te"
 
@@ -23,15 +24,7 @@ for f in Pan_TE clean_seq_fast index LTR_detect build_mdl run_Classifier renameT
     [ -e "$PKG/$f" ] && chmod 0755 "$PKG/$f" || true
 done
 
-# --- 2. vendor build_ltr_library.py at the path Pan_TE resolves it from ---
-# Pan_TE uses BIN_DIR/../submodule/Look4LTRs/build_ltr_library.py, and BIN_DIR is the
-# real script dir ($PREFIX/share/pan_te), so the target is $PREFIX/share/submodule/...
-mkdir -p "$PREFIX/share/submodule/Look4LTRs"
-BLB="$(find "$SRC_DIR/look4ltrs_src" -name build_ltr_library.py -type f | head -1)"
-[ -n "$BLB" ] || { echo "build_ltr_library.py not found in look4ltrs source" >&2; exit 1; }
-install -m 0644 "$BLB" "$PREFIX/share/submodule/Look4LTRs/build_ltr_library.py"
-
-# --- 3. PATH wrapper. A plain symlink would break Pan_TE: it uses
+# --- 2. PATH wrapper. A plain symlink would break Pan_TE: it uses
 #        os.path.dirname(os.path.abspath(__file__)) (NOT realpath), so the symlink target
 #        dir would be wrong. A wrapper that execs the real script keeps __file__ correct. ---
 cat > "$PREFIX/bin/Pan_TE" <<'EOF'
@@ -41,5 +34,5 @@ exec "$DIR/share/pan_te/Pan_TE" "$@"
 EOF
 chmod 0755 "$PREFIX/bin/Pan_TE"
 
-# --- 4. post-install data fetcher ---
+# --- 3. post-install data fetcher ---
 install -m 0755 "$RECIPE_DIR/pan_te-setup-data" "$PREFIX/bin/pan_te-setup-data"

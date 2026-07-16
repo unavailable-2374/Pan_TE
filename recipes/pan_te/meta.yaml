@@ -1,10 +1,9 @@
 {% set name = "pan_te" %}
 {% set version = "1.0.0" %}
 
-# Submit AFTER look4ltrs, mdl-repeat, te-looker are merged into bioconda (pan_te depends on them).
-# Two sources: the Pan_TE release, and the Look4LTRs release (only to vendor build_ltr_library.py
-# at the in-tree path Pan_TE expects). Non-redistributable data (Dfam libraries, ClassifyTE
-# models) are NOT shipped here; users run `pan_te-setup-data` after install.
+# Pan_TE receives executables and Look4LTRs' library-builder helper through runtime
+# dependencies. Non-redistributable data (Dfam libraries, ClassifyTE models) are NOT
+# shipped here; users run `pan_te-setup-data` after install.
 
 package:
   name: {{ name }}
@@ -14,9 +13,6 @@ source:
   - url: https://github.com/unavailable-2374/Pan_TE/archive/refs/tags/v{{ version }}.tar.gz
     sha256: 1eac3abfc07423f5497c91c726dbc885ccb899151496a4864d4e6e93d2aa4300
     folder: pan_te
-  - url: https://github.com/unavailable-2374/Look4LTRs/archive/refs/tags/v1.0.0.tar.gz
-    sha256: 2c5bb2184229de680805aaf7cea06838c89091f00c6b37d6dea6c43ec71ed316
-    folder: look4ltrs_src
 
 build:
   number: 0
