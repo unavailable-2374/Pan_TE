@@ -1,5 +1,5 @@
 {% set name = "pan_te" %}
-{% set version = "1.0.0" %}
+{% set version = "1.0.1" %}
 
 # Pan_TE receives executables and Look4LTRs' library-builder helper through runtime
 # dependencies. Non-redistributable data (Dfam libraries, ClassifyTE models) are NOT
@@ -11,7 +11,7 @@ package:
 
 source:
   - url: https://github.com/unavailable-2374/Pan_TE/archive/refs/tags/v{{ version }}.tar.gz
-    sha256: 1eac3abfc07423f5497c91c726dbc885ccb899151496a4864d4e6e93d2aa4300
+    sha256: 4098139bd7aeab1b2afa13ed570e55b4609eb792ff293657152b908fefecde13
     folder: pan_te
 
 build:
