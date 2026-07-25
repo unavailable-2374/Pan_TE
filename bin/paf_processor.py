@@ -90,7 +90,8 @@ class PAFProcessor:
     def __init__(self, paf_file: str, paf_fasta: str, output_dir: str,
                  reference_genome: str = None, threads: int = 4,
                  mapping_file: str = None,
-                 assembly_fastas: List[str] = None):
+                 assembly_fastas: List[str] = None,
+                 reference_seqnames: Set[str] = None):
         self.paf_file = paf_file
         self.paf_fasta = paf_fasta
         self.output_dir = output_dir
@@ -98,6 +99,9 @@ class PAFProcessor:
         self.threads = threads
         self.mapping_file = mapping_file
         self.assembly_fastas = assembly_fastas or []  # Per-assembly FASTAs for base selection
+        # Pan_TE renames reference sequences during cleaning, so callers may
+        # provide names captured from the original FASTA/PAF namespace.
+        self.provided_ref_seqnames = set(reference_seqnames or [])
 
         # --- Core size parameters ---
         self.min_insertion_size = 100        # MITEs ~100bp, SINEs ~100-500bp
@@ -258,9 +262,17 @@ class PAFProcessor:
                     raise ValueError(
                         f"PAF coordinates exceed sequence length: "
                         f"q={qend}>{qlen} or t={tend}>{tlen}")
+                if min(qstart, qend, tstart, tend) < 0:
+                    raise ValueError(
+                        f"PAF coordinates must be non-negative: "
+                        f"q={qstart}-{qend}, t={tstart}-{tend}")
+                if fields[4] not in ('+', '-'):
+                    raise ValueError(f"Invalid PAF strand: {fields[4]!r}")
                 checked += 1
                 if checked >= 10:
                     break
+        if checked == 0:
+            raise ValueError("PAF file contains no alignment records")
         logger.info(f"PAF format validation passed ({checked} records checked)")
 
     def _validate_and_index(self):
@@ -274,7 +286,12 @@ class PAFProcessor:
         logger.info(f"Multi-assembly FASTA: {len(self.seq_lengths)} sequences")
 
         # Identify reference/base seqnames (used to skip redundant candidates)
-        if self.reference_genome:
+        if self.provided_ref_seqnames:
+            self.ref_seqnames = set(self.provided_ref_seqnames)
+            logger.info(
+                f"Enrichment mode: {len(self.ref_seqnames)} original reference "
+                "sequence names")
+        elif self.reference_genome:
             # Enrichment mode: skip candidates already in the provided genome
             ref_fai = self.reference_genome + '.fai'
             if not os.path.exists(ref_fai):
@@ -362,27 +379,65 @@ class PAFProcessor:
         """
         grouped = defaultdict(list)
         has_tp = False
+        has_cigar = False
         total = 0
         kept = 0
-        skipped_short_fields = 0
 
         with open(self.paf_file) as fh:
-            for line in fh:
-                if line.startswith('#'):
+            for line_number, line in enumerate(fh, 1):
+                if line.startswith('#') or not line.strip():
                     continue
                 fields = line.rstrip('\n').split('\t')
                 if len(fields) < 12:
-                    skipped_short_fields += 1
-                    continue
+                    raise ValueError(
+                        f"Malformed PAF line {line_number}: "
+                        f"{len(fields)} fields, expected at least 12")
                 total += 1
 
-                qname, qlen = fields[0], int(fields[1])
-                qstart, qend = int(fields[2]), int(fields[3])
-                strand = fields[4]
-                tname, tlen = fields[5], int(fields[6])
-                tstart, tend = int(fields[7]), int(fields[8])
-                matches, block_len = int(fields[9]), int(fields[10])
-                mapq = int(fields[11])
+                try:
+                    qname, qlen = fields[0], int(fields[1])
+                    qstart, qend = int(fields[2]), int(fields[3])
+                    strand = fields[4]
+                    tname, tlen = fields[5], int(fields[6])
+                    tstart, tend = int(fields[7]), int(fields[8])
+                    matches, block_len = int(fields[9]), int(fields[10])
+                    mapq = int(fields[11])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Malformed numeric value on PAF line "
+                        f"{line_number}: {exc}") from exc
+
+                if not qname or not tname:
+                    raise ValueError(
+                        f"Missing sequence name on PAF line {line_number}")
+                if strand not in ('+', '-'):
+                    raise ValueError(
+                        f"Invalid strand {strand!r} on PAF line {line_number}")
+                if (qlen <= 0 or tlen <= 0 or qstart < 0 or tstart < 0
+                        or qstart > qend or tstart > tend
+                        or qend > qlen or tend > tlen):
+                    raise ValueError(
+                        f"Invalid coordinates on PAF line {line_number}: "
+                        f"q={qstart}-{qend}/{qlen}, "
+                        f"t={tstart}-{tend}/{tlen}")
+                if matches < 0 or block_len < 0 or not 0 <= mapq <= 255:
+                    raise ValueError(
+                        f"Invalid alignment metrics on PAF line {line_number}")
+                if matches > block_len:
+                    raise ValueError(
+                        f"Matches exceed block length on PAF line {line_number}")
+                if self.seq_lengths:
+                    for seq_name, paf_length in ((qname, qlen), (tname, tlen)):
+                        fasta_length = self.seq_lengths.get(seq_name)
+                        if fasta_length is None:
+                            raise ValueError(
+                                f"PAF sequence {seq_name!r} on line {line_number} "
+                                "is absent from --paf-fasta")
+                        if fasta_length != paf_length:
+                            raise ValueError(
+                                f"Length mismatch for {seq_name!r} on PAF line "
+                                f"{line_number}: PAF={paf_length}, "
+                                f"FASTA={fasta_length}")
 
                 # Filter: self-alignment
                 if qname == tname:
@@ -402,6 +457,7 @@ class PAFProcessor:
                         has_tp = True  # global flag for aligner detection
                     elif f.startswith('cg:Z:'):
                         cigar = f[5:]
+                        has_cigar = True
 
                 # minimap2: per-record mapq filter (only if THIS record has tp: tag)
                 if record_has_tp and mapq < self.min_mapq:
@@ -427,9 +483,7 @@ class PAFProcessor:
                 grouped[(qname, tname)].append(rec)
                 kept += 1
 
-        aligner = 'minimap2' if has_tp else 'fastga'
-        if skipped_short_fields > 0:
-            logger.warning(f"Skipped {skipped_short_fields} malformed PAF lines (<12 fields)")
+        aligner = 'minimap2' if (has_tp or has_cigar) else 'fastga'
         logger.info(f"PAF: {total} total, {kept} after filter, "
                     f"{len(grouped)} sequence pairs")
         self._stats['paf_total_records'] = total
@@ -589,10 +643,9 @@ class PAFProcessor:
     def _extract_cigar_insertions(self, grouped: Dict) -> List[InsertionCandidate]:
         """Walk CIGAR strings for large I/D operations (minimap2 only).
 
-        PAF CIGAR convention: qstart/qend are always on the forward strand
-        regardless of alignment strand. CIGAR walks from qstart to qend,
-        consuming exactly (qend - qstart) query bases. No reverse-complement
-        coordinate transformation is needed.
+        PAF qstart/qend are coordinates on the original query strand, while
+        CIGAR is walked left-to-right on the target. Reverse alignments must
+        therefore consume query coordinates from qend towards qstart.
         """
         candidates = []
         for records in grouped.values():
@@ -608,24 +661,44 @@ class PAFProcessor:
                         f"{rec.qname}:{rec.qstart}-{rec.qend}")
                     continue
 
-                q_pos = rec.qstart
+                operations = list(_CIGAR_OP.finditer(rec.cigar))
+                reconstructed = ''.join(match.group(0) for match in operations)
+                query_consumed = sum(
+                    int(match.group(1)) for match in operations
+                    if match.group(2) in ('M', 'I', '=', 'X'))
+                target_consumed = sum(
+                    int(match.group(1)) for match in operations
+                    if match.group(2) in ('M', 'D', 'N', '=', 'X'))
+                if (not operations or reconstructed != rec.cigar
+                        or query_consumed != rec.qend - rec.qstart
+                        or target_consumed != rec.tend - rec.tstart):
+                    logger.warning(
+                        f"Skipping inconsistent CIGAR for {rec.qname}: "
+                        f"{rec.cigar!r}")
+                    continue
+
+                q_pos = rec.qstart if rec.strand == '+' else rec.qend
                 t_pos = rec.tstart
 
-                for m in _CIGAR_OP.finditer(rec.cigar):
+                for m in operations:
                     length = int(m.group(1))
                     op = m.group(2)
 
                     if op in ('M', '=', 'X'):
-                        q_pos += length
+                        q_pos += length if rec.strand == '+' else -length
                         t_pos += length
                     elif op == 'I':
                         if self.min_insertion_size <= length <= self.max_insertion_size:
                             seq_name = rec.qname
                             if seq_name not in self.ref_seqnames:
+                                if rec.strand == '+':
+                                    ins_start, ins_end = q_pos, q_pos + length
+                                else:
+                                    ins_start, ins_end = q_pos - length, q_pos
                                 candidates.append(InsertionCandidate(
-                                    seq_name=seq_name, start=q_pos,
-                                    end=q_pos + length, source='cigar'))
-                        q_pos += length
+                                    seq_name=seq_name, start=ins_start,
+                                    end=ins_end, source='cigar'))
+                        q_pos += length if rec.strand == '+' else -length
                     elif op == 'D':
                         if self.min_insertion_size <= length <= self.max_insertion_size:
                             seq_name = rec.tname
@@ -639,10 +712,11 @@ class PAFProcessor:
                     # P op: padding, no coordinate advance
 
                 # Consistency check
-                if q_pos != rec.qend:
+                expected_q_pos = rec.qend if rec.strand == '+' else rec.qstart
+                if q_pos != expected_q_pos:
                     logger.warning(
                         f"CIGAR walk mismatch for {rec.qname}: "
-                        f"expected q_pos={rec.qend}, got {q_pos}")
+                        f"expected q_pos={expected_q_pos}, got {q_pos}")
 
         logger.info(f"CIGAR insertions: {len(candidates)} candidates")
         self._stats['cigar_candidates'] = len(candidates)
@@ -674,7 +748,8 @@ class PAFProcessor:
             cur_sources: Set[str] = {cands[0].source}
 
             for c in cands[1:]:
-                if c.start <= cur_end:
+                if (c.start < cur_end
+                        and max(cur_end, c.end) - cur_start <= self.max_insertion_size):
                     cur_end = max(cur_end, c.end)
                     cur_sources.add(c.source)
                 else:

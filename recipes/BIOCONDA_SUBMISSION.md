@@ -104,8 +104,9 @@ Pan_TE --genome genome.fa --threads 80 --model-dir ~/Pan_TE_data/ClassifyTE
 ```
 
 ClassifyTE also needs its own Python-3.8 env (`environment-classifyte.yml`) because its
-pinned ML deps conflict with the main env; `run_Classifier` invokes it via
-`conda run -n ClassifyTE_env`.
+pinned ML deps conflict with the main env. `run_Classifier` locates `ClassifyTE_env` and
+executes its Python directly, so it remains isolated without nesting `conda run` inside
+the active Pan_TE environment. Set `CLASSIFYTE_ENV_PREFIX` for a nonstandard env path.
 
 ## Known constraints
 

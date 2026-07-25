@@ -28,6 +28,7 @@ fi
 
 CLASSIFYTE_DIR="$1"
 THREADS="${2:-$(nproc)}"
+CLASSIFYTE_ENV_NAME="${CLASSIFYTE_ENV_NAME:-ClassifyTE_env}"
 
 # Verify directory exists
 if [ ! -d "$CLASSIFYTE_DIR" ]; then
@@ -53,8 +54,58 @@ if [ ! -s "$TE_LIBRARY" ]; then
     error "Input TE library not found or empty: raw_te_library.fa"
 fi
 
+# Resolve the isolated ClassifyTE environment without activating it. Calling
+# `conda run` from an already-active main environment can execute that
+# environment's compiler deactivation hooks with the wrong CONDA_PREFIX (for
+# example, PGTA's gxx hook may look for a compiler under the Conda base prefix).
+# Executing the target interpreter directly avoids that nested-activation
+# failure while retaining ClassifyTE's pinned Python dependencies.
+resolve_classifyte_prefix() {
+    local conda_cmd=""
+    local conda_base=""
+    local candidate=""
+
+    if [ -n "${CLASSIFYTE_ENV_PREFIX:-}" ]; then
+        printf '%s\n' "$CLASSIFYTE_ENV_PREFIX"
+        return 0
+    fi
+
+    if [ -n "${CONDA_EXE:-}" ] && [ -x "$CONDA_EXE" ]; then
+        conda_cmd="$CONDA_EXE"
+    elif command -v conda >/dev/null 2>&1; then
+        conda_cmd="$(command -v conda)"
+    else
+        return 1
+    fi
+
+    conda_base="$("$conda_cmd" info --base 2>/dev/null)" || return 1
+    candidate="$conda_base/envs/$CLASSIFYTE_ENV_NAME"
+    if [ -x "$candidate/bin/python" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    "$conda_cmd" env list 2>/dev/null \
+        | awk -v env_name="$CLASSIFYTE_ENV_NAME" '$1 == env_name {print $NF; exit}'
+}
+
+CLASSIFYTE_PREFIX="$(resolve_classifyte_prefix)" \
+    || error "Unable to locate Conda environment: $CLASSIFYTE_ENV_NAME"
+if [ -z "$CLASSIFYTE_PREFIX" ]; then
+    error "Unable to locate Conda environment: $CLASSIFYTE_ENV_NAME. Set CLASSIFYTE_ENV_PREFIX if it is installed at a nonstandard path."
+fi
+CLASSIFYTE_PYTHON="$CLASSIFYTE_PREFIX/bin/python"
+if [ ! -x "$CLASSIFYTE_PYTHON" ]; then
+    error "ClassifyTE Python not found: $CLASSIFYTE_PYTHON. Create $CLASSIFYTE_ENV_NAME or set CLASSIFYTE_ENV_PREFIX."
+fi
+
+run_classifyte_python() {
+    PATH="$CLASSIFYTE_PREFIX/bin:$PATH" "$CLASSIFYTE_PYTHON" "$@"
+}
+
 # Create data directory
 log "Setting up environment"
+log "ClassifyTE environment: $CLASSIFYTE_PREFIX"
 mkdir -p data || error "Failed to create data directory"
 
 # Rename TEs
@@ -94,8 +145,8 @@ RC_PID=$!
 # Run parallel feature generation and evaluation
 log "Starting feature generation and evaluation"
 (
-    conda run -n ClassifyTE_env python "$CLASSIFYTE_DIR/generate_feature_file_parallel.py" -j $RC_THREADS -f re.fa -d sup_features -o sup.csv \
-    && conda run -n ClassifyTE_env python "$CLASSIFYTE_DIR/evaluate.py" -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb \
+    run_classifyte_python "$CLASSIFYTE_DIR/generate_feature_file_parallel.py" -j "$RC_THREADS" -f re.fa -d sup_features -o sup.csv \
+    && run_classifyte_python "$CLASSIFYTE_DIR/evaluate.py" -f sup.csv -n node.txt -d sup_features -m ClassifyTE_combined.pkl -a lcpnb \
     && touch "$CT_DONE"
 ) &
 CT_PID=$!

@@ -17,6 +17,7 @@ reference-free mode returns a combined pan_genome FASTA (reconstructed reference
 
 import os
 import sys
+import gc
 import json
 import logging
 import shutil
@@ -31,6 +32,12 @@ _refiner_dir = os.path.join(BIN_DIR, 'Refiner', 'utils')
 if _refiner_dir not in sys.path:
     sys.path.insert(0, _refiner_dir)
 from complexity_utils import calculate_shannon_entropy, calculate_dust_score
+from gfa_alleles import (AlleleCandidate, SQLiteAlleleStore,
+                         deduplicate_locus_alleles,
+                         extract_pggb_alleles_stream, parse_p_steps,
+                         write_manifest)
+from rgfa_gaf import (RgfaGafCallStore, extract_rgfa_gaf_alleles,
+                      load_rgfa_graph, populate_rgfa_gaf_locus_calls)
 
 _COMPLEMENT = str.maketrans('ACGTacgtRYSWKMBDHVNryswkmbdhvn',
                             'TGCAtgcaYRSWMKVHDBNyrswmkvhdbn')
@@ -60,32 +67,62 @@ class GfaProcessor:
     SR:i: rank > 0, and maximal linear chains of such segments are walked
     through the link topology. Chains in the TE size range are emitted.
 
-    For PGGB (smoothxg), a reference path is selected and all segments
-    NOT in that path are considered non-reference. Consecutive non-ref
-    segments along each non-ref path form chains; chains in the TE size
-    range are emitted.
+    For PGGB (smoothxg), the default allele mode pairs each alternate
+    chromosome with its reference chromosome and extracts locus-aware
+    alternate alleles between ordered, unique reference anchors.  Long
+    alleles are tiled with overlap and every occurrence remains traceable in
+    a manifest.  The legacy global non-reference-node mode remains available.
 
-    In both cases, extracted TE candidates undergo QC filtering (entropy,
-    DUST, N-content), CD-HIT-EST deduplication, and scaffold construction.
+    Candidates undergo sequence QC.  Allele mode collapses only exact
+    sequence duplicates from the same locus and preserves sample/copy support;
+    legacy mode retains the historical CD-HIT-EST behavior.
     """
 
     def __init__(self, gfa_file: str, output_dir: str,
                  reference_genome: str = None, threads: int = 4,
-                 gfa_ref: str = None):
+                 gfa_ref: str = None, gfa_mode: str = 'alleles',
+                 window_overlap: int = 1000, spacer_length: int = 0,
+                 keep_intermediates: bool = True,
+                 gfa_gaf: str = None, gfa_gaf_fasta: str = None,
+                 gfa_gaf_min_mapq: int = 20,
+                 gfa_gaf_min_identity: float = 0.90):
         """
         Args:
             gfa_file: Path to GFA file (rGFA or PGGB).
             output_dir: Working directory for intermediate and output files.
             reference_genome: If provided, enrichment mode; None means
                 reference-free mode.
-            threads: Thread count for cd-hit-est.
+            threads: Thread count for external tools.
             gfa_ref: Optional explicit reference path/sample name for PGGB.
+            gfa_mode: ``alleles`` (default) or historical ``legacy`` mode.
+            window_overlap: Overlap used when tiling alleles over 30 kb.
+            spacer_length: N spacer length; 0 emits one FASTA record per allele.
+            keep_intermediates: Preserve raw/unique/filtered FASTA and manifest.
         """
+        if gfa_mode not in {'alleles', 'legacy'}:
+            raise ValueError("gfa_mode must be 'alleles' or 'legacy'")
+        if window_overlap < 0 or window_overlap >= 30000:
+            raise ValueError('window_overlap must satisfy 0 <= overlap < 30000')
+        if spacer_length < 0:
+            raise ValueError('spacer_length must be non-negative')
+
         self.gfa_file = gfa_file
         self.output_dir = output_dir
         self.reference_genome = reference_genome
         self.threads = threads
         self.gfa_ref = gfa_ref
+        self.gfa_mode = gfa_mode
+        self.window_overlap = window_overlap
+        self.keep_intermediates = keep_intermediates
+        self.gfa_gaf = os.path.abspath(gfa_gaf) if gfa_gaf else None
+        self.gfa_gaf_fasta = (os.path.abspath(gfa_gaf_fasta)
+                              if gfa_gaf_fasta else None)
+        self.gfa_gaf_min_mapq = int(gfa_gaf_min_mapq)
+        self.gfa_gaf_min_identity = float(gfa_gaf_min_identity)
+        if self.gfa_gaf_min_mapq < 0:
+            raise ValueError('gfa_gaf_min_mapq must be non-negative')
+        if not 0 <= self.gfa_gaf_min_identity <= 1:
+            raise ValueError('gfa_gaf_min_identity must be between 0 and 1')
 
         # Size parameters
         self.min_insertion_size = 100
@@ -98,13 +135,20 @@ class GfaProcessor:
         self.max_n_percent = 0.20
         self.cdhit_identity = 0.8
 
-        # Scaffold parameters
-        self.n_spacer_length = 5000
+        # Candidate packing parameters.  Zero avoids artificial sequence and
+        # emits one independent FASTA record for every representative allele.
+        self.n_spacer_length = spacer_length
         self.max_scaffold_length = 50000000
 
         # Runtime state
         self.gfa_format: str = 'unknown'
         self._stats: Dict = defaultdict(int)
+        self._allele_occurrences: List[AlleleCandidate] = []
+        self._allele_representatives: List[AlleleCandidate] = []
+        self._allele_store = None
+        self._allele_mode_active = False
+        self._rgfa_call_store = None
+        self._rgfa_reference_samples = set()
 
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -118,12 +162,23 @@ class GfaProcessor:
             In enrichment mode: path to gfa_scaffolds.fa
             In reference-free mode: path to gfa_pan_genome.fa
         """
+        try:
+            return self._process()
+        except BaseException:
+            self._cleanup_open_allele_stores()
+            raise
+
+    def _process(self) -> str:
+        """Implementation of :meth:`process`, separated for failure cleanup."""
         self._log_config()
         self.gfa_format = self._detect_format()
         logger.info(f"GFA format detected: {self.gfa_format}")
 
         if self.gfa_format == 'rGFA':
-            candidates, ref_bp = self._process_rgfa()
+            if self.gfa_mode == 'legacy':
+                candidates, ref_bp = self._process_rgfa()
+            else:
+                candidates, ref_bp = self._process_rgfa_gaf()
         else:
             candidates, ref_bp = self._process_pggb()
 
@@ -135,6 +190,8 @@ class GfaProcessor:
             logger.warning("No TE insertion candidates found in GFA")
             with open(scaffold_path, 'w'):
                 pass
+            self._write_allele_manifest()
+            self._cleanup_candidate_intermediates()
             self._write_stats()
             if not self.reference_genome:
                 ref_fa = os.path.join(self.output_dir, 'gfa_reference.fa')
@@ -142,9 +199,25 @@ class GfaProcessor:
                     return ref_fa
             return scaffold_path
 
-        raw_fasta = self._write_raw_candidates(candidates)
-        filtered_fasta = self._qc_filter(raw_fasta)
-        deduped_fasta = self._cdhit_dedup(filtered_fasta)
+        if self._allele_mode_active:
+            # Aggregate before FASTA output: occurrence sequences that are
+            # identical at one locus never incur cohort-scale raw FASTA I/O.
+            if not self._allele_representatives:
+                self._allele_representatives = deduplicate_locus_alleles(
+                    self._allele_occurrences, self._stats)
+            unique_fasta = os.path.join(
+                self.output_dir, 'gfa_unique_locus_alleles.fa')
+            self._write_allele_candidates(
+                self._allele_representatives, unique_fasta)
+            filtered_fasta = self._qc_filter(unique_fasta)
+            deduped_fasta = filtered_fasta
+            self._mark_allele_qc(filtered_fasta)
+            self._stats['candidates_merged'] = len(
+                self._allele_representatives)
+        else:
+            raw_fasta = self._write_raw_candidates(candidates)
+            filtered_fasta = self._qc_filter(raw_fasta)
+            deduped_fasta = self._cdhit_dedup(filtered_fasta)
 
         n_seqs = count_fasta_sequences(deduped_fasta)
         self._stats['final_sequences'] = n_seqs
@@ -152,6 +225,8 @@ class GfaProcessor:
         if n_seqs == 0:
             with open(scaffold_path, 'w'):
                 pass
+            self._write_allele_manifest()
+            self._cleanup_candidate_intermediates()
             self._write_stats()
             if not self.reference_genome:
                 ref_fa = os.path.join(self.output_dir, 'gfa_reference.fa')
@@ -163,12 +238,9 @@ class GfaProcessor:
         logger.info(f"GFA enrichment complete: {n_seqs} TE insertions "
                     f"assembled into scaffolds")
 
-        # Cleanup intermediate files
-        for tmp_name in ['gfa_raw_insertions.fa', 'gfa_filtered_insertions.fa',
-                         'gfa_te_insertions.fa']:
-            tmp_path = os.path.join(self.output_dir, tmp_name)
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        # Keep provenance by default.  Large deployments may opt into cleanup
+        # after archiving the manifest and summary statistics.
+        self._cleanup_candidate_intermediates()
 
         # Reference-free mode: combine reconstructed reference + scaffolds
         if not self.reference_genome:
@@ -185,9 +257,11 @@ class GfaProcessor:
                 n_scaffold = count_fasta_sequences(scaffold_path)
                 logger.info(f"Pan-genome constructed: {n_ref} reference "
                             f"sequences + {n_scaffold} scaffolds")
+                self._write_allele_manifest()
                 self._write_stats()
                 return combined
 
+        self._write_allele_manifest()
         self._write_stats()
         return scaffold_path
 
@@ -225,6 +299,94 @@ class GfaProcessor:
 
         raise ValueError(
             "Cannot determine GFA format: no S lines or P lines found")
+
+    # ------------------------------------------------------------------
+    # rGFA + GAF backend
+    # ------------------------------------------------------------------
+    def _process_rgfa_gaf(self) -> Tuple[List[AlleleCandidate], int]:
+        """Recover rGFA sample paths from a validated primary GAF file.
+
+        rGFA S/L topology alone has no sample/locus semantics.  The default
+        alleles mode therefore requires GAF; callers may still request the
+        historical topology walker explicitly through ``--gfa-mode legacy``.
+        """
+        if not self.gfa_gaf:
+            raise ValueError(
+                'rGFA alleles mode requires --gfa-gaf; use --gfa-mode legacy '
+                'only for the historical topology walker')
+        if not os.path.isfile(self.gfa_gaf):
+            raise FileNotFoundError(f'GAF file not found: {self.gfa_gaf}')
+        if self.gfa_gaf_fasta and not os.path.isfile(self.gfa_gaf_fasta):
+            raise FileNotFoundError(
+                f'GAF query FASTA not found: {self.gfa_gaf_fasta}')
+
+        segments, _links, _coordinates, references, _source_intervals = load_rgfa_graph(self.gfa_file)
+        ref_bp = sum(segment.length for segment in segments.values()
+                     if segment.rank == 0)
+        self._stats['total_segments'] = len(segments)
+        self._stats['ref_segments'] = sum(
+            segment.rank == 0 for segment in segments.values())
+        self._stats['nonref_segments'] = sum(
+            segment.rank != 0 for segment in segments.values())
+        self._stats['rgfa_gaf'] = self.gfa_gaf
+        self._stats['rgfa_gaf_min_mapq'] = self.gfa_gaf_min_mapq
+        self._stats['rgfa_gaf_min_identity'] = self.gfa_gaf_min_identity
+        self._stats['sequence_source'] = 'graph_complete_nodes'
+        self._rgfa_reference_samples = {
+            segment.source_name.split('#', 1)[0] for segment in segments.values()
+            if segment.rank == 0
+        }
+        self._stats['rgfa_reference_samples'] = sorted(self._rgfa_reference_samples)
+
+        if not self.reference_genome:
+            ref_fa = os.path.join(self.output_dir, 'gfa_reference.fa')
+            with open(ref_fa, 'w') as output:
+                for contig in sorted(references):
+                    reference = references[contig]
+                    sequence = ''.join(segments[node_id].sequence
+                                       for node_id in reference.node_ids)
+                    output.write(f'>{contig}\n')
+                    for start in range(0, len(sequence), 80):
+                        output.write(sequence[start:start + 80] + '\n')
+
+        store_path = os.path.join(self.output_dir, '.gfa_alleles.sqlite.tmp')
+        calls_path = os.path.join(self.output_dir, '.rgfa_gaf_calls.sqlite.tmp')
+        self._allele_store = SQLiteAlleleStore(store_path)
+        self._rgfa_call_store = RgfaGafCallStore(calls_path)
+        self._allele_mode_active = True
+        extract_rgfa_gaf_alleles(
+            self.gfa_file, self.gfa_gaf,
+            min_size=self.min_insertion_size,
+            window_size=self.max_insertion_size,
+            window_overlap=self.window_overlap,
+            min_mapq=self.gfa_gaf_min_mapq,
+            min_identity=self.gfa_gaf_min_identity,
+            query_fasta=self.gfa_gaf_fasta,
+            candidate_sink=self._allele_store.add,
+            call_sink=self._rgfa_call_store.add,
+            sample_sink=self._rgfa_call_store.register_sample,
+            stats=self._stats,
+        )
+        self._allele_store.finalize()
+        self._allele_representatives = self._allele_store.representatives()
+        # A candidate's flanks need not be adjacent in another sample.  Scan
+        # GAF once more to call every representative locus only when the same
+        # complete quality record spans both outer anchors.
+        populate_rgfa_gaf_locus_calls(
+            self.gfa_file, self.gfa_gaf, self._allele_representatives,
+            self._rgfa_call_store.add,
+            min_size=self.min_insertion_size,
+            min_mapq=self.gfa_gaf_min_mapq,
+            min_identity=self.gfa_gaf_min_identity,
+            query_fasta=self.gfa_gaf_fasta,
+            sample_sink=self._rgfa_call_store.register_sample,
+            stats=self._stats,
+        )
+        self._stats['candidates_raw'] = self._allele_store.occurrence_count
+        self._stats['unique_locus_alleles'] = len(self._allele_representatives)
+        self._stats['exact_locus_duplicates_collapsed'] = (
+            self._allele_store.occurrence_count - len(self._allele_representatives))
+        return self._allele_representatives, ref_bp
 
     # ------------------------------------------------------------------
     # rGFA backend
@@ -439,132 +601,223 @@ class GfaProcessor:
     # PGGB backend
     # ------------------------------------------------------------------
     def _process_pggb(self) -> Tuple[List[Tuple[str, str]], int]:
-        """Process PGGB: path-based chain extraction.
-
-        Returns:
-            (candidates, ref_total_bp)
-        """
+        """Process PGGB paths with a streaming locus-aware backend."""
         logger.info("Parsing PGGB segments...")
-        seg_seqs = {}  # seg_id -> sequence
-
-        with open(self.gfa_file) as fh:
-            for line in fh:
-                if line.startswith('S\t'):
-                    parts = line.rstrip('\n').split('\t')
-                    seg_seqs[parts[1]] = parts[2]
-
+        seg_seqs = {}
+        with open(self.gfa_file) as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.startswith('S\t'):
+                    continue
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) < 3:
+                    raise ValueError(f"Malformed S line {line_number}")
+                seg_id = sys.intern(parts[1])
+                sequence = parts[2]
+                if not sequence or sequence == '*':
+                    raise ValueError(
+                        f"PGGB segment {seg_id!r} has no embedded sequence")
+                seg_seqs[seg_id] = sequence
         total_segs = len(seg_seqs)
         logger.info(f"PGGB: {total_segs} segments loaded")
 
-        # Parse P lines
-        logger.info("Parsing PGGB paths...")
-        paths: Dict[str, List[Tuple[str, str]]] = {}  # name -> [(seg_id, orient)]
-        with open(self.gfa_file) as fh:
-            for line in fh:
-                if line.startswith('P\t'):
-                    parts = line.rstrip('\n').split('\t')
-                    path_name = parts[1]
-                    steps = []
-                    for step in parts[2].split(','):
-                        seg_id = step[:-1]
-                        orient = step[-1]
-                        steps.append((seg_id, orient))
-                    paths[path_name] = steps
-
-        if not paths:
+        # First path pass retains names only.  Hundreds of cohort paths may
+        # contain billions of steps, so alternate steps are streamed later.
+        logger.info("Indexing PGGB path names...")
+        path_names = []
+        with open(self.gfa_file) as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.startswith('P\t'):
+                    continue
+                parts = line.rstrip('\n').split('\t', 2)
+                if len(parts) < 3:
+                    raise ValueError(f"Malformed P line {line_number}")
+                path_names.append(parts[1])
+        if not path_names:
             raise ValueError("PGGB GFA has no P lines")
+        if len(path_names) != len(set(path_names)):
+            raise ValueError("PGGB GFA contains duplicate P path names")
 
-        logger.info(f"PGGB: {len(paths)} paths")
-        samples = sorted(paths.keys())
-        self._stats['samples'] = samples
+        logger.info(f"PGGB: {len(path_names)} paths")
+        self._stats['samples'] = sorted(path_names)
+        self._stats['biological_samples'] = sorted({
+            self._pggb_path_group(name) for name in path_names})
+        path_catalog = {name: None for name in path_names}
+        ref_path_names = self._select_pggb_references(path_catalog)
+        ref_path_set = set(ref_path_names)
+        ref_sample = self._pggb_path_group(ref_path_names[0])
+        logger.info(f"PGGB reference sample: {ref_sample} "
+                    f"({len(ref_path_names)} paths)")
+        for name in ref_path_names:
+            logger.info(f"  reference path: {name}")
+        self._stats['ref_sample'] = ref_sample
+        self._stats['ref_paths'] = ref_path_names
 
-        # Select reference path
-        ref_path_name = self._select_pggb_reference(paths)
-        logger.info(f"PGGB reference path: {ref_path_name}")
-        self._stats['ref_sample'] = ref_path_name
+        # Second pass materializes only the selected backbone paths.
+        ref_paths = {}
+        legacy_paths = {} if self.gfa_mode == 'legacy' else None
+        with open(self.gfa_file) as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.startswith('P\t'):
+                    continue
+                parts = line.rstrip('\n').split('\t')
+                name = parts[1]
+                if name in ref_path_set or legacy_paths is not None:
+                    steps = parse_p_steps(parts)
+                    if name in ref_path_set:
+                        ref_paths[name] = steps
+                    if legacy_paths is not None:
+                        legacy_paths[name] = steps
+        missing_refs = [name for name in ref_path_names if name not in ref_paths]
+        if missing_refs:
+            raise ValueError(f"Missing selected reference paths: {missing_refs}")
 
-        ref_steps = paths[ref_path_name]
-        ref_seg_set: Set[str] = set()
-        for seg_id, _ in ref_steps:
-            ref_seg_set.add(seg_id)
-
-        n_ref = len(ref_seg_set)
-        n_nonref = total_segs - n_ref
+        ref_seg_set: Set[str] = {
+            seg_id for steps in ref_paths.values() for seg_id, _ in steps}
         self._stats['total_segments'] = total_segs
-        self._stats['ref_segments'] = n_ref
-        self._stats['nonref_segments'] = n_nonref
+        self._stats['ref_segments'] = len(ref_seg_set)
+        self._stats['nonref_segments'] = total_segs - len(ref_seg_set)
 
-        # Reconstruct reference if reference-free mode
-        ref_bp = 0
         if not self.reference_genome:
-            ref_bp = self._reconstruct_pggb_reference(
-                ref_path_name, ref_steps, seg_seqs)
+            ref_bp = self._reconstruct_pggb_references(
+                ref_path_names, ref_paths, seg_seqs)
         else:
-            ref_bp = sum(len(seg_seqs[sid]) for sid, _ in ref_steps
-                         if sid in seg_seqs)
+            ref_bp = sum(
+                len(seg_seqs[seg_id])
+                for steps in ref_paths.values() for seg_id, _ in steps)
 
-        # Extract candidates from non-ref paths
-        candidates = self._extract_pggb_chains(
-            paths, ref_path_name, ref_seg_set, seg_seqs)
-
+        if self.gfa_mode == 'alleles':
+            self._allele_mode_active = True
+            store_path = os.path.join(
+                self.output_dir, '.gfa_alleles.sqlite.tmp')
+            self._allele_store = SQLiteAlleleStore(store_path)
+            try:
+                extract_pggb_alleles_stream(
+                    gfa_file=self.gfa_file,
+                    ref_paths=ref_paths,
+                    sequences=seg_seqs,
+                    min_size=self.min_insertion_size,
+                    window_size=self.max_insertion_size,
+                    window_overlap=self.window_overlap,
+                    stats=self._stats,
+                    candidate_sink=self._allele_store.add,
+                )
+                self._allele_store.finalize()
+                # Representative sequences are now durable in SQLite.  Drop
+                # the embedded graph sequence dictionary before materializing
+                # them so graph and allele sequence payloads do not overlap.
+                seg_seqs.clear()
+                gc.collect()
+                self._allele_representatives = (
+                    self._allele_store.representatives())
+            except Exception:
+                self._allele_store.close(remove=False)
+                raise
+            candidates = self._allele_representatives
+            occurrence_count = self._allele_store.occurrence_count
+            representative_count = self._allele_store.representative_count
+            self._stats['candidates_raw'] = occurrence_count
+            self._stats['unique_locus_alleles'] = representative_count
+            self._stats['exact_locus_duplicates_collapsed'] = (
+                occurrence_count - representative_count)
+            logger.info(
+                f"PGGB locus-aware extraction: {occurrence_count} candidate "
+                f"occurrences, {representative_count} unique locus alleles "
+                f"from {len(path_names) - len(ref_path_names)} paths")
+        else:
+            candidates = self._extract_pggb_chains(
+                legacy_paths, ref_path_set, ref_seg_set, seg_seqs)
         return candidates, ref_bp
 
-    def _select_pggb_reference(self, paths: dict) -> str:
-        """Select the reference path for PGGB.
+    @staticmethod
+    def _pggb_path_group(path_name: str) -> str:
+        """Return the PGGB sample/haplotype prefix for a path name.
 
-        Priority: explicit --gfa-ref > T2T pattern match > first path.
+        PGGB/wfmash path names conventionally use sample#haplotype#contig.
+        Grouping on the first two fields keeps all chromosomes from one
+        haplotype together while retaining sensible behavior for simple names.
         """
+        parts = path_name.split('#')
+        if len(parts) >= 3:
+            return '#'.join(parts[:2])
+        return path_name
+
+    def _select_pggb_references(self, paths: dict) -> List[str]:
+        """Select every path from one PGGB reference sample/haplotype.
+
+        Priority for the anchor path is explicit ``--gfa-ref``, then a T2T
+        name, then the first path.  All paths sharing the anchor's
+        sample#haplotype prefix are returned in input order.
+        """
+        anchor = None
         if self.gfa_ref:
-            # Exact match first
             if self.gfa_ref in paths:
-                return self.gfa_ref
-            # Substring match
+                anchor = self.gfa_ref
+            else:
+                # Permit an exact sample/haplotype prefix such as Col-0_T2T#1.
+                for name in paths:
+                    if self._pggb_path_group(name) == self.gfa_ref:
+                        anchor = name
+                        break
+                if anchor is None:
+                    for name in paths:
+                        if self.gfa_ref in name:
+                            anchor = name
+                            break
+            if anchor is None:
+                raise ValueError(
+                    f"--gfa-ref '{self.gfa_ref}' not found in paths: "
+                    f"{list(paths.keys())}")
+        else:
             for name in paths:
-                if self.gfa_ref in name:
-                    return name
-            raise ValueError(
-                f"--gfa-ref '{self.gfa_ref}' not found in paths: "
-                f"{list(paths.keys())}")
+                if 't2t' in name.lower():
+                    anchor = name
+                    break
+            if anchor is None:
+                anchor = next(iter(paths))
 
-        # Auto-detect: prefer T2T
-        for name in paths:
-            if 'T2T' in name or 't2t' in name:
-                return name
+        group = self._pggb_path_group(anchor)
+        selected = [name for name in paths
+                    if self._pggb_path_group(name) == group]
+        return selected
 
-        # Fall back to first path
-        return next(iter(paths))
-
-    def _reconstruct_pggb_reference(self, path_name: str,
-                                     steps: List[Tuple[str, str]],
-                                     seg_seqs: dict) -> int:
-        """Reconstruct reference by walking the reference P line."""
+    def _reconstruct_pggb_references(
+            self, path_names: List[str], paths: dict,
+            seg_seqs: dict) -> int:
+        """Reconstruct all selected reference paths as separate FASTA records."""
         ref_fa = os.path.join(self.output_dir, 'gfa_reference.fa')
         line_width = 80
-
-        # Extract chromosome name from path name
-        parts = path_name.split('#')
-        chr_name = parts[-1] if '#' in path_name else path_name
-
-        # Build sequence
-        seq_parts = []
-        for seg_id, orient in steps:
-            seq = seg_seqs.get(seg_id, '')
-            if orient == '-':
-                seq = _reverse_complement(seq)
-            seq_parts.append(seq)
-        full_seq = ''.join(seq_parts)
-        total_bp = len(full_seq)
+        total_bp = 0
+        used_headers = set()
 
         with open(ref_fa, 'w') as out:
-            out.write(f'>{chr_name}\n')
-            for i in range(0, len(full_seq), line_width):
-                out.write(full_seq[i:i + line_width] + '\n')
+            for path_name in path_names:
+                parts = path_name.split('#')
+                header = parts[-1] if len(parts) >= 3 else path_name
+                if header in used_headers:
+                    header = path_name.replace('#', '_')
+                used_headers.add(header)
 
-        logger.info(f"Reconstructed PGGB reference: {chr_name}, "
-                    f"{total_bp / 1e6:.1f} Mb")
+                seq_parts = []
+                for seg_id, orient in paths[path_name]:
+                    seq = seg_seqs.get(seg_id, '')
+                    if orient == '-':
+                        seq = _reverse_complement(seq)
+                    seq_parts.append(seq)
+                full_seq = ''.join(seq_parts)
+                total_bp += len(full_seq)
+
+                out.write(f'>{header}\n')
+                for i in range(0, len(full_seq), line_width):
+                    out.write(full_seq[i:i + line_width] + '\n')
+                logger.info(f"Reconstructed PGGB reference: {header}, "
+                            f"{len(full_seq) / 1e6:.1f} Mb")
+
+        logger.info(f"Reconstructed {len(path_names)} PGGB reference paths, "
+                    f"{total_bp / 1e6:.1f} Mb total")
         return total_bp
 
-    def _extract_pggb_chains(self, paths: dict, ref_path_name: str,
+    def _extract_pggb_chains(self, paths: dict,
+                              ref_path_names: Set[str],
                               ref_seg_set: set, seg_seqs: dict
                               ) -> List[Tuple[str, str]]:
         """Walk non-ref paths, extracting chains of non-ref segments.
@@ -577,7 +830,7 @@ class GfaProcessor:
         candidate_idx = 0
 
         for path_name, steps in paths.items():
-            if path_name == ref_path_name:
+            if path_name in ref_path_names:
                 continue
 
             chain_segs = []  # [(seg_id, orient)]
@@ -617,8 +870,9 @@ class GfaProcessor:
                           f"path={path_name} source=pggb_chain")
                 candidates.append((header, seq))
 
+        nonref_path_count = len(paths) - len(ref_path_names)
         logger.info(f"PGGB chain extraction: {candidate_idx} candidates "
-                    f"from {len(paths) - 1} non-ref paths")
+                    f"from {nonref_path_count} non-ref paths")
         self._stats['candidates_raw'] = candidate_idx
         self._stats['candidates_merged'] = candidate_idx  # no merge step for GFA
         return candidates
@@ -633,6 +887,77 @@ class GfaProcessor:
                 seq = _reverse_complement(seq)
             parts.append(seq)
         return ''.join(parts)
+
+    def _cleanup_candidate_intermediates(self) -> None:
+        if self.keep_intermediates:
+            return
+        for tmp_name in [
+                'gfa_raw_insertions.fa', 'gfa_unique_locus_alleles.fa',
+                'gfa_filtered_insertions.fa', 'gfa_te_insertions.fa']:
+            tmp_path = os.path.join(self.output_dir, tmp_name)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _write_allele_candidates(
+            self, records: List[AlleleCandidate], output_path: str) -> str:
+        """Write representative allele candidates with support metadata."""
+        with open(output_path, 'w') as out:
+            for record in records:
+                out.write(record.fasta_header() + '\n')
+                sequence = record.sequence
+                for start in range(0, len(sequence), 80):
+                    out.write(sequence[start:start + 80] + '\n')
+        logger.info(
+            f"Wrote {len(records)} unique locus-aware allele candidates")
+        return output_path
+
+    def _mark_allele_qc(self, filtered_fasta: str) -> None:
+        """Propagate representative QC status to every allele occurrence."""
+        passed = set()
+        with open(filtered_fasta) as handle:
+            for line in handle:
+                if line.startswith('>'):
+                    passed.add(line[1:].split()[0])
+        if self._allele_store is not None:
+            self._allele_store.set_qc(passed)
+            return
+        for occurrence in self._allele_occurrences:
+            occurrence.qc_status = (
+                'passed' if occurrence.representative_id in passed
+                else 'filtered')
+
+    def _write_allele_manifest(self) -> None:
+        """Write occurrence provenance for locus-aware PGGB or rGFA+GAF alleles."""
+        if not self._allele_mode_active:
+            return
+        manifest = os.path.join(self.output_dir, 'gfa_allele_manifest.tsv')
+        if self._allele_store is not None:
+            self._allele_store.write_manifest(manifest)
+            self._allele_store.close(remove=True)
+            self._allele_store = None
+        else:
+            write_manifest(manifest, self._allele_occurrences)
+        self._stats['allele_manifest'] = manifest
+        if self._rgfa_call_store is not None:
+            presence = os.path.join(self.output_dir, 'gfa_rgfa_locus_presence.tsv')
+            samples = self._rgfa_call_store.write_presence_matrix(
+                presence, (record.locus_key for record in self._allele_representatives),
+                reference_samples=self._rgfa_reference_samples)
+            self._rgfa_call_store.close(remove=True)
+            self._rgfa_call_store = None
+            self._stats['rgfa_locus_presence'] = presence
+            self._stats['rgfa_gaf_samples'] = samples
+
+    def _cleanup_open_allele_stores(self) -> None:
+        """Close/remove temporary stores after any failed GFA run."""
+        for attribute in ('_allele_store', '_rgfa_call_store'):
+            store = getattr(self, attribute, None)
+            if store is None:
+                continue
+            try:
+                store.close(remove=True)
+            finally:
+                setattr(self, attribute, None)
 
     # ------------------------------------------------------------------
     # Candidate output
@@ -754,7 +1079,23 @@ class GfaProcessor:
     # Scaffold construction
     # ------------------------------------------------------------------
     def _build_synthetic_scaffolds(self, fasta_path: str, output_path: str):
-        """Concatenate TE insertions with N-spacers into synthetic scaffolds."""
+        """Pack candidates, or emit independent records when spacer length is 0."""
+        if self.n_spacer_length == 0:
+            shutil.copyfile(fasta_path, output_path)
+            count = count_fasta_sequences(output_path)
+            total_bp = 0
+            with open(output_path) as handle:
+                for line in handle:
+                    if not line.startswith('>'):
+                        total_bp += len(line.strip())
+            self._stats['scaffold_count'] = count
+            self._stats['scaffold_total_bp'] = total_bp
+            self._stats['artificial_spacer_bp'] = 0
+            logger.info(
+                f"Wrote {count} independent candidate contigs, "
+                f"{total_bp / 1e6:.1f} Mb total")
+            return
+
         spacer = 'N' * self.n_spacer_length
         line_width = 80
 
@@ -807,6 +1148,8 @@ class GfaProcessor:
         total_bp = sum(len(seq) for seq, _ in scaffolds)
         self._stats['scaffold_count'] = len(scaffolds)
         self._stats['scaffold_total_bp'] = total_bp
+        self._stats['artificial_spacer_bp'] = max(
+            0, (len(sequences) - len(scaffolds)) * self.n_spacer_length)
         logger.info(f"Built {len(scaffolds)} synthetic scaffold(s), "
                     f"total {total_bp / 1e6:.1f} Mb")
 
@@ -819,7 +1162,13 @@ class GfaProcessor:
             f"GFA Processor v1.0 | min_ins={self.min_insertion_size} "
             f"max_ins={self.max_insertion_size} "
             f"entropy={self.entropy_threshold_long}/{self.entropy_threshold_short} "
-            f"dust={self.dust_threshold} gfa_ref={self.gfa_ref}")
+            f"dust={self.dust_threshold} gfa_ref={self.gfa_ref} "
+            f"gfa_mode={self.gfa_mode} overlap={self.window_overlap} "
+            f"gaf={self.gfa_gaf} gaf_fasta={self.gfa_gaf_fasta} "
+            f"gaf_min_mapq={self.gfa_gaf_min_mapq} "
+            f"gaf_min_identity={self.gfa_gaf_min_identity} "
+            f"spacer={self.n_spacer_length} keep_intermediates="
+            f"{self.keep_intermediates}")
 
     def _write_stats(self):
         """Write processing statistics to JSON."""
@@ -842,6 +1191,15 @@ def main():
     parser.add_argument('--ref', help='Reference genome FASTA (enrichment mode)')
     parser.add_argument('--gfa-ref',
                         help='Explicit reference path name for PGGB')
+    parser.add_argument('--gfa-mode', choices=('alleles', 'legacy'),
+                        default='alleles')
+    parser.add_argument('--window-overlap', type=int, default=1000)
+    parser.add_argument('--gfa-gaf', help='Primary GAF used to recover rGFA sample paths')
+    parser.add_argument('--gfa-gaf-fasta', help='Query FASTA used to validate GAF names and lengths')
+    parser.add_argument('--gfa-gaf-min-mapq', type=int, default=20)
+    parser.add_argument('--gfa-gaf-min-identity', type=float, default=0.90)
+    parser.add_argument('--spacer-length', type=int, default=0)
+    parser.add_argument('--clean-intermediates', action='store_true')
     parser.add_argument('--outdir', required=True, help='Output directory')
     parser.add_argument('--threads', type=int, default=4)
     args = parser.parse_args()
@@ -854,7 +1212,15 @@ def main():
         output_dir=args.outdir,
         reference_genome=args.ref,
         threads=args.threads,
-        gfa_ref=args.gfa_ref
+        gfa_ref=args.gfa_ref,
+        gfa_mode=args.gfa_mode,
+        window_overlap=args.window_overlap,
+        spacer_length=args.spacer_length,
+        keep_intermediates=not args.clean_intermediates,
+        gfa_gaf=args.gfa_gaf,
+        gfa_gaf_fasta=args.gfa_gaf_fasta,
+        gfa_gaf_min_mapq=args.gfa_gaf_min_mapq,
+        gfa_gaf_min_identity=args.gfa_gaf_min_identity
     )
     result = proc.process()
     print(f"Output: {result}")

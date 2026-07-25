@@ -9,6 +9,7 @@ use File::Path qw(make_path remove_tree);
 use Cwd qw(abs_path);
 use POSIX qw(strftime);
 use File::Spec;
+use IO::Uncompress::Gunzip qw($GunzipError);
 
 # Constants
 use constant {
@@ -42,15 +43,15 @@ exit(0);
 
 sub init_environment {
     parse_arguments();
-    validate_environment();
     setup_directories();
+    validate_environment();
     setup_logging();
     $config{out_dir} = abs_path($config{out_dir});
     $config{vcf_file} = abs_path($config{vcf_file});
 }
 
 sub process_data {
-    my $base_name = basename($config{vcf_file}, ".vcf");
+    my $base_name = vcf_basename($config{vcf_file});
     my $output_file = File::Spec->catfile($config{out_dir}, "$base_name.fa");
 
     log_message("Starting parallel processing with $config{threads} workers");
@@ -58,6 +59,14 @@ sub process_data {
     # Step 1: Count data lines (single pass)
     my $total_lines = count_data_lines($config{vcf_file});
     log_message("VCF has $total_lines data lines");
+
+    if ($total_lines == 0) {
+        open my $empty_fh, '>', $output_file;
+        close $empty_fh;
+        log_message("VCF has no data records; wrote empty output");
+        print STDERR "PROGRESS:100\n";
+        return;
+    }
 
     # Step 2: Calculate line ranges for each worker
     my $num_workers = $config{threads};
@@ -93,12 +102,15 @@ sub process_data {
     }
 
     # Step 4: Wait for all workers
+    my @failed_workers;
     for my $pid (@pids) {
         waitpid($pid, 0);
         if ($? != 0) {
-            warn "Worker process $pid exited with status $?\n";
+            push @failed_workers, "$pid:$?";
         }
     }
+    die "Worker process failure(s): " . join(", ", @failed_workers) . "\n"
+        if @failed_workers;
 
     # Step 5: Merge outputs
     merge_outputs(\@output_files, $output_file);
@@ -116,9 +128,9 @@ sub count_data_lines {
     my $file = shift;
     my $count = 0;
 
-    open my $fh, '<', $file;
+    my $fh = open_vcf($file);
     while (<$fh>) {
-        $count++ unless /^#/;
+        $count++ unless /^#/ || /^\s*$/;
     }
     close $fh;
 
@@ -188,14 +200,13 @@ sub setup_logging {
 
 sub process_line_range {
     my ($vcf_file, $output_file, $start_line, $end_line, $worker_id) = @_;
-    my $base_name = basename($vcf_file, ".vcf");
-    my $temp_file = File::Spec->catfile($config{out_dir}, "tmp_${base_name}_allele_${worker_id}.fa");
+    my $source_id = sanitize_id(vcf_basename($vcf_file));
 
     # Initialize worker output file
     open my $out_fh, '>', $output_file;
 
     # Open VCF and skip to our assigned range
-    open my $in_fh, '<', $vcf_file;
+    my $in_fh = open_vcf($vcf_file);
 
     my $current_line = 0;  # Data line counter (excluding headers)
     my $processed = 0;
@@ -203,6 +214,7 @@ sub process_line_range {
     while (my $line = <$in_fh>) {
         # Skip headers
         next if $line =~ /^#/;
+        next if $line =~ /^\s*$/;
 
         # Skip lines before our range
         if ($current_line < $start_line) {
@@ -217,91 +229,109 @@ sub process_line_range {
         my @fields = split(/\t/, $line);
         $current_line++;
 
-        next unless @fields >= 5;
+        die "Malformed VCF data line $current_line"
+            . ": expected at least 8 columns\n"
+            unless @fields >= 8;
 
-        my $alt_allele = $fields[4];
+        my ($chrom, $pos, $ref, $alt_field, $info_field) =
+            @fields[0, 1, 3, 4, 7];
         $processed++;
+        die "Malformed VCF data line $current_line: invalid CHROM/POS/REF/ALT\n"
+            unless length($chrom) && $pos =~ /^\d+$/ && $pos > 0
+                && length($ref) && length($alt_field);
 
         # Report progress every 1000 entries
         if ($processed % 1000 == 0) {
             print STDERR "Worker $worker_id: processed $processed entries\n";
         }
 
-        next unless length($alt_allele) > MIN_SEQ_LENGTH;
+        my %info = parse_info($info_field);
+        my @alleles = split(/,/, $alt_field, -1);
+        for my $allele_index (0 .. $#alleles) {
+            my $sequence = extract_alt_sequence(
+                $ref, $alleles[$allele_index], \%info, $allele_index);
+            next unless defined $sequence;
+            next unless length($sequence) >= MIN_SEQ_LENGTH;
 
-        if ($alt_allele =~ /,/) {
-            # Multi-allelic: write to temp, refine, append to output
-            process_multiple_alleles_worker($alt_allele, $out_fh, $temp_file);
-        } else {
-            print_sequence($out_fh, "SV", $alt_allele);
+            my $sequence_id = join('_', 'SV', $source_id,
+                                   sanitize_id($chrom), sanitize_id($pos),
+                                   'R' . $current_line,
+                                   'A' . ($allele_index + 1));
+            print_sequence($out_fh, $sequence_id, $sequence);
         }
     }
 
     close $in_fh;
     close $out_fh;
 
-    # Cleanup temp file if exists
-    unlink $temp_file if -e $temp_file;
-
     print STDERR "Worker $worker_id: completed $processed entries (lines $start_line-$end_line)\n";
 }
 
-sub process_multiple_alleles_worker {
-    my ($alt_allele, $out_fh, $temp_file) = @_;
-    my @alleles = split(/,/, $alt_allele);
-    my $long_alleles = 0;
-
-    open my $tmp_fh, '>', $temp_file;
-
-    for my $i (0 .. $#alleles) {
-        if (length($alleles[$i]) > MIN_SEQ_LENGTH) {
-            print_sequence($tmp_fh, $i, $alleles[$i]);
-            $long_alleles++;
-        }
+sub parse_info {
+    my $info_field = shift // '';
+    my %info;
+    for my $entry (split(/;/, $info_field)) {
+        my ($key, $value) = split(/=/, $entry, 2);
+        next unless defined $key && length $key;
+        $info{$key} = defined $value ? $value : 1;
     }
-
-    close $tmp_fh;
-
-    if ($long_alleles > 1) {
-        refine_alleles_worker($temp_file, $out_fh);
-    } elsif ($long_alleles == 1) {
-        # Append single allele to output
-        open my $in_fh, '<', $temp_file;
-        while (<$in_fh>) {
-            print $out_fh $_;
-        }
-        close $in_fh;
-    }
-
-    unlink $temp_file;
+    return %info;
 }
 
-sub refine_alleles_worker {
-    my ($temp_file, $out_fh) = @_;
+sub extract_alt_sequence {
+    my ($ref, $allele, $info, $allele_index) = @_;
+    return undef unless defined $allele && length $allele;
+    $ref = uc($ref // '');
+    $allele = uc($allele);
 
-    my $refiner_output = "${temp_file}.out";
-
-    my $cmd = join(" ",
-        "Refiner_for_Graph",
-        $temp_file,
-        $refiner_output,
-        "--distance-threshold", "0.8",
-        "-t", "1",
-        "-v"
-    );
-
-    system($cmd) == 0
-        or die "Feature Extraction Failure: $?\n";
-
-    # Append refiner output to worker output
-    if (-e $refiner_output) {
-        open my $in_fh, '<', $refiner_output;
-        while (<$in_fh>) {
-            print $out_fh $_;
+    if ($allele =~ /^<[^>]+>$/) {
+        for my $key (qw(SVINSSEQ INSSEQ SEQ CONSENSUS)) {
+            next unless exists $info->{$key};
+            my @values = split(/,/, $info->{$key}, -1);
+            my $value = $values[$allele_index] // $values[0];
+            my $normalized = normalize_sequence($value);
+            return $normalized if defined $normalized;
         }
-        close $in_fh;
-        unlink $refiner_output;
+        return undef;
     }
+
+    # Remove remote breakend locus syntax, retaining only local sequence.
+    if ($allele =~ /[\[\]]/) {
+        $allele =~ s/[\[\]][^\[\]]+:\d+[\[\]]//g;
+    }
+    $allele =~ s/^\.//;
+    $allele =~ s/\.$//;
+
+    my $normalized = normalize_sequence($allele);
+    return undef unless defined $normalized;
+
+    # Explicit VCF alleles include shared reference padding.
+    while (length($ref) && length($normalized)
+           && substr($ref, 0, 1) eq substr($normalized, 0, 1)) {
+        substr($ref, 0, 1, '');
+        substr($normalized, 0, 1, '');
+    }
+    while (length($ref) && length($normalized)
+           && substr($ref, -1, 1) eq substr($normalized, -1, 1)) {
+        chop $ref;
+        chop $normalized;
+    }
+    return length($normalized) ? $normalized : undef;
+}
+
+sub normalize_sequence {
+    my $sequence = shift;
+    return undef unless defined $sequence;
+    $sequence = uc($sequence);
+    return undef if $sequence eq '' || $sequence eq '.';
+    return undef unless $sequence =~ /^[ACGTRYSWKMBDHVN]+$/;
+    return $sequence;
+}
+
+sub sanitize_id {
+    my $value = shift // 'NA';
+    $value =~ s/[^A-Za-z0-9_.-]+/_/g;
+    return length($value) ? $value : 'NA';
 }
 
 ###############################################################################
@@ -328,6 +358,24 @@ sub merge_outputs {
 ###############################################################################
 # Utility Functions
 ###############################################################################
+
+sub vcf_basename {
+    my $file = shift;
+    my $name = basename($file);
+    $name =~ s/\.vcf(?:\.gz)?$//i;
+    return $name;
+}
+
+sub open_vcf {
+    my $file = shift;
+    if ($file =~ /\.gz$/i) {
+        my $fh = IO::Uncompress::Gunzip->new($file)
+            or die "Cannot open gzip VCF '$file': $GunzipError\n";
+        return $fh;
+    }
+    open my $fh, '<', $file;
+    return $fh;
+}
 
 sub print_sequence {
     my ($fh, $id, $sequence) = @_;

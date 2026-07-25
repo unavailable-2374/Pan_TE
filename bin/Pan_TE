@@ -3,6 +3,7 @@
 import os
 import sys
 import logging
+import json
 import argparse
 import subprocess
 import shutil
@@ -18,6 +19,7 @@ from typing import Dict, Optional
 from vcf_processor import VCFProcessor
 from paf_processor import PAFProcessor, count_fasta_sequences
 from gfa_processor import GfaProcessor
+from gfa_annotator import GfaAnnotator
 
 VERSION = '1.0.1'
 
@@ -53,6 +55,16 @@ Parameters:
     --paf-mapping <string>   Optional: chromosome mapping TSV (seqname, assembly_id, chr_id).
     --gfa <string>           GFA file from pangenome graph (minigraph-cactus rGFA or PGGB smoothxg).
     --gfa-ref <string>       Reference path/sample name in GFA (auto-detected if omitted).
+    --gfa-mode <string>      Alleles mode (PGGB paths or rGFA+GAF); legacy enables old topology walking.
+    --gfa-gaf <string>       Primary GAF for rGFA sample-path recovery.
+    --gfa-gaf-fasta <string> Query FASTA used to validate GAF query names and lengths.
+    --gfa-window-overlap <int>
+                             Overlap for long allele windows, default: 1000 bp.
+    --gfa-spacer-length <int>
+                             N spacer between packed candidates; default: 0 (separate records).
+    --gfa-clean-intermediates
+                             Remove candidate FASTA intermediates after manifest generation.
+    --anno                   Annotate GFA nodes with RepeatMasker and output sample presence (requires --gfa).
     --out-dir <string>       Default: current directory. The work directory.
     --te-looker-bin <string> Path to te-looker dtr binary. Default: TE_LOOKER_BIN or PATH.
     --te-looker-extra-args <string>
@@ -85,6 +97,7 @@ DIR_TE_LOOKER = 'te-looker'
 DIR_TE_LOOKER_LEGACY = 'RepGraph'
 DIR_COMBINE = 'combine'
 DIR_COMBINE_LEGACY = 'Combine'
+DIR_ANNO = 'anno'
 
 FILE_CONSENSUS = 'consensus.fa'
 FILE_CONSENSUS_LEGACY = 'consensi.fa'
@@ -191,6 +204,33 @@ def is_fasta_file(file_path: str) -> bool:
     # Check for FASTA extensions
     return file_path_lower.endswith(('.fa', '.fasta', '.fna', '.fas'))
 
+
+def open_text_auto(file_path: str):
+    """Open plain, gzip, or bzip2 text input by filename suffix."""
+    compression_format = detect_compression_format(file_path)
+    if compression_format == 'gzip':
+        return gzip.open(file_path, 'rt')
+    if compression_format == 'bzip2':
+        return bz2.open(file_path, 'rt')
+    return open(file_path, 'rt')
+
+
+def read_fasta_seqnames(file_path: str):
+    """Return FASTA primary sequence identifiers, rejecting bad headers."""
+    names = []
+    with open_text_auto(file_path) as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.startswith('>'):
+                continue
+            name = line[1:].strip().split(None, 1)[0]
+            if not name:
+                raise ValueError(
+                    f"Empty FASTA identifier in {file_path} at line {line_number}")
+            names.append(name)
+    if not names:
+        raise ValueError(f"No FASTA sequences found in {file_path}")
+    return names
+
 def decompress_file(input_file: str, output_file: str = None) -> str:
     """
     Decompress a file if it's compressed, otherwise return original path.
@@ -268,6 +308,36 @@ def parse_arguments():
     parser.add_argument('--gfa-ref',
                        type=str,
                        help='Reference path/sample name in GFA (auto-detected if omitted)')
+    parser.add_argument('--gfa-mode',
+                       choices=('alleles', 'legacy'),
+                       default='alleles',
+                       help='PGGB candidate extraction mode')
+    parser.add_argument('--gfa-gaf',
+                       type=str,
+                       help='Primary GAF used to recover rGFA sample paths')
+    parser.add_argument('--gfa-gaf-fasta',
+                       type=str,
+                       help='Query FASTA used to validate GAF names and lengths')
+    parser.add_argument('--gfa-gaf-min-mapq',
+                       type=int, default=20,
+                       help='Minimum MAPQ for rGFA GAF candidate and presence calls')
+    parser.add_argument('--gfa-gaf-min-identity',
+                       type=float, default=0.90,
+                       help='Minimum matches/block-length identity for rGFA GAF calls')
+    parser.add_argument('--gfa-window-overlap',
+                       type=int,
+                       default=1000,
+                       help='Overlap for alternate-allele windows over 30 kb')
+    parser.add_argument('--gfa-spacer-length',
+                       type=int,
+                       default=0,
+                       help='N spacer length; 0 emits independent FASTA records')
+    parser.add_argument('--gfa-clean-intermediates',
+                       action='store_true',
+                       help='Remove candidate FASTA intermediates after processing')
+    parser.add_argument('--anno',
+                       action='store_true',
+                       help='Annotate GFA nodes with RepeatMasker and sample presence')
     parser.add_argument('--out-dir', '--out',
                        dest='out_dir',
                        type=str,
@@ -299,6 +369,9 @@ def parse_arguments():
     
     args = parser.parse_args()
 
+    if args.threads < 1:
+        parser.error('--threads must be a positive integer')
+
     # Validate: at least --genome, --paf, or --gfa required
     if not args.genome and not args.paf and not args.gfa:
         parser.error('At least one of --genome, --paf, or --gfa must be provided')
@@ -323,6 +396,8 @@ def parse_arguments():
         for fasta_file in args.paf_fasta:
             if not os.path.exists(fasta_file):
                 parser.error(f'PAF FASTA not found: {fasta_file}')
+            if not is_fasta_file(fasta_file):
+                parser.error(f'PAF FASTA has an unsupported extension: {fasta_file}')
         if args.paf_mapping and not os.path.exists(args.paf_mapping):
             parser.error(f'PAF mapping file not found: {args.paf_mapping}')
 
@@ -332,6 +407,33 @@ def parse_arguments():
             parser.error(f'GFA file not found: {args.gfa}')
     if args.gfa_ref and not args.gfa:
         parser.error('--gfa-ref requires --gfa')
+    if args.gfa_gaf and not args.gfa:
+        parser.error('--gfa-gaf requires --gfa')
+    if args.gfa_gaf_fasta and not args.gfa_gaf:
+        parser.error('--gfa-gaf-fasta requires --gfa-gaf')
+    if args.gfa_gaf and not os.path.isfile(args.gfa_gaf):
+        parser.error(f'GAF file not found: {args.gfa_gaf}')
+    if args.gfa_gaf_fasta:
+        if not os.path.isfile(args.gfa_gaf_fasta):
+            parser.error(f'GAF query FASTA not found: {args.gfa_gaf_fasta}')
+        if not is_fasta_file(args.gfa_gaf_fasta):
+            parser.error('--gfa-gaf-fasta must be a FASTA file')
+    if args.gfa_gaf_min_mapq < 0:
+        parser.error('--gfa-gaf-min-mapq must be non-negative')
+    if not 0 <= args.gfa_gaf_min_identity <= 1:
+        parser.error('--gfa-gaf-min-identity must be between 0 and 1')
+    if args.gfa_window_overlap < 0 or args.gfa_window_overlap >= 30000:
+        parser.error('--gfa-window-overlap must satisfy 0 <= overlap < 30000')
+    if args.gfa_spacer_length < 0:
+        parser.error('--gfa-spacer-length must be non-negative')
+    if args.anno and not args.gfa:
+        parser.error('--anno requires --gfa')
+
+    if args.vcf_dir:
+        if not args.genome:
+            parser.error('--vcf-dir requires --genome')
+        if not os.path.isdir(args.vcf_dir):
+            parser.error(f'VCF directory not found: {args.vcf_dir}')
 
     return args
 
@@ -346,6 +448,14 @@ class PanTEPipeline:
                  paf_file: Optional[str] = None, paf_fasta=None,
                  paf_mapping: Optional[str] = None,
                  gfa_file: Optional[str] = None, gfa_ref: Optional[str] = None,
+                 gfa_mode: str = 'alleles', gfa_window_overlap: int = 1000,
+                 gfa_spacer_length: int = 0,
+                 gfa_keep_intermediates: bool = True,
+                 gfa_gaf: Optional[str] = None,
+                 gfa_gaf_fasta: Optional[str] = None,
+                 gfa_gaf_min_mapq: int = 20,
+                 gfa_gaf_min_identity: float = 0.90,
+                 anno: bool = False,
                  te_looker_bin: Optional[str] = None,
                  te_looker_extra_args: str = ''):
         """Initialize the pipeline with configuration parameters."""
@@ -358,6 +468,16 @@ class PanTEPipeline:
         self.paf_mapping = os.path.abspath(paf_mapping) if paf_mapping else None
         self.gfa_file = os.path.abspath(gfa_file) if gfa_file else None
         self.gfa_ref = gfa_ref
+        self.gfa_mode = gfa_mode
+        self.gfa_window_overlap = gfa_window_overlap
+        self.gfa_spacer_length = gfa_spacer_length
+        self.gfa_keep_intermediates = gfa_keep_intermediates
+        self.gfa_gaf = os.path.abspath(gfa_gaf) if gfa_gaf else None
+        self.gfa_gaf_fasta = (os.path.abspath(gfa_gaf_fasta)
+                              if gfa_gaf_fasta else None)
+        self.gfa_gaf_min_mapq = int(gfa_gaf_min_mapq)
+        self.gfa_gaf_min_identity = float(gfa_gaf_min_identity)
+        self.anno_enabled = bool(anno)
         self.output_dir = os.path.abspath(output_dir)
         self.threads = threads
         self.model_dir = os.path.abspath(model_dir) if model_dir else None
@@ -387,7 +507,8 @@ class PanTEPipeline:
             'ltr': 'LTR.ok',
             'mdl_repeat': 'mdl-repeat.ok',
             'te_looker': 'te-looker.ok',
-            'combine': 'combine.ok'
+            'combine': 'combine.ok',
+            'anno': 'anno.ok'
         }
         self.legacy_steps = {
             'mdl_repeat': 'mdl_repeat.ok',
@@ -399,7 +520,8 @@ class PanTEPipeline:
             'ltr': self.process_ltr,
             'mdl_repeat': self.process_mdl_repeat,
             'te_looker': self.process_te_looker,
-            'combine': self.combine_results
+            'combine': self.combine_results,
+            'anno': self.annotate_gfa
         }
         # Create output directory structure
         self.setup_directories()
@@ -446,26 +568,113 @@ class PanTEPipeline:
         If a single file is provided, indexes and returns it directly.
         If multiple files, concatenates into a combined FASTA, indexes, and returns.
         """
-        if len(self.paf_fasta_files) == 1:
-            fasta = self.paf_fasta_files[0]
+        seen = set()
+        for fasta in self.paf_fasta_files:
+            for name in read_fasta_seqnames(fasta):
+                if name in seen:
+                    raise ValueError(
+                        f"Duplicate PAF FASTA sequence identifier {name!r}. "
+                        "Sequence names must be unique across all assemblies.")
+                seen.add(name)
+
+        prepared_fastas = []
+        for index, fasta in enumerate(self.paf_fasta_files, 1):
+            if detect_compression_format(fasta) == 'uncompressed':
+                prepared_fastas.append(fasta)
+                continue
+            prepared = os.path.join(work_dir, f'paf_assembly_{index}.fa')
+            decompress_file(fasta, prepared)
+            prepared_fastas.append(prepared)
+        self.prepared_paf_fasta_files = prepared_fastas
+
+        if len(prepared_fastas) == 1:
+            fasta = prepared_fastas[0]
             if not os.path.exists(fasta + '.fai'):
                 self.run_cmd(f"samtools faidx {q(fasta)}")
             return fasta
 
         combined = os.path.join(work_dir, 'multi_assembly.fa')
-        logger.info(f"Combining {len(self.paf_fasta_files)} assembly FASTA files...")
-        with open(combined, 'wb') as out:
-            for fasta in self.paf_fasta_files:
-                with open(fasta, 'rb') as inp:
+        logger.info(f"Combining {len(prepared_fastas)} assembly FASTA files...")
+        with open(combined, 'wt') as out:
+            for fasta in prepared_fastas:
+                with open(fasta, 'rt') as inp:
                     shutil.copyfileobj(inp, out)
-                out.write(b'\n')
+                out.write('\n')
         self.run_cmd(f"samtools faidx {q(combined)}")
         return combined
 
     def setup_directories(self):
         """Create the necessary directory structure."""
-        for sub in [DIR_GENOME, DIR_MDL_REPEAT, DIR_TE_LOOKER, DIR_COMBINE]:
+        for sub in [DIR_GENOME, DIR_MDL_REPEAT, DIR_TE_LOOKER, DIR_COMBINE, DIR_ANNO]:
             os.makedirs(os.path.join(self.output_dir, sub), exist_ok=True)
+
+    def _gfa_fingerprint(self) -> dict:
+        """Return input/config identity for safe GFA checkpoint reuse."""
+        if not self.gfa_file:
+            return {}
+        gfa_stat = os.stat(self.gfa_file)
+        fingerprint = {
+            'algorithm': 'gfa_locus_alleles_v3_rgfa_gaf',
+            'gfa': {
+                'path': self.gfa_file,
+                'size': gfa_stat.st_size,
+                'mtime_ns': gfa_stat.st_mtime_ns,
+            },
+            'gfa_ref': self.gfa_ref,
+            'gfa_mode': self.gfa_mode,
+            'gfa_window_overlap': self.gfa_window_overlap,
+            'gfa_spacer_length': self.gfa_spacer_length,
+            'gfa_gaf_min_mapq': self.gfa_gaf_min_mapq,
+            'gfa_gaf_min_identity': self.gfa_gaf_min_identity,
+        }
+        if self.gfa_gaf:
+            gaf_stat = os.stat(self.gfa_gaf)
+            fingerprint['gfa_gaf'] = {
+                'path': self.gfa_gaf, 'size': gaf_stat.st_size,
+                'mtime_ns': gaf_stat.st_mtime_ns,
+            }
+        if self.gfa_gaf_fasta:
+            gaf_fasta_stat = os.stat(self.gfa_gaf_fasta)
+            fingerprint['gfa_gaf_fasta'] = {
+                'path': self.gfa_gaf_fasta, 'size': gaf_fasta_stat.st_size,
+                'mtime_ns': gaf_fasta_stat.st_mtime_ns,
+            }
+        if self.original_genome_file:
+            genome_stat = os.stat(self.original_genome_file)
+            fingerprint['reference_genome'] = {
+                'path': self.original_genome_file,
+                'size': genome_stat.st_size,
+                'mtime_ns': genome_stat.st_mtime_ns,
+            }
+        return fingerprint
+
+    def _gfa_fingerprint_path(self) -> str:
+        return os.path.join(
+            self.output_dir, DIR_GENOME, 'gfa_enrichment',
+            'gfa_run_fingerprint.json')
+
+    def _write_gfa_fingerprint(self) -> None:
+        if not self.gfa_file:
+            return
+        path = self._gfa_fingerprint_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as handle:
+            json.dump(self._gfa_fingerprint(), handle, indent=2, sort_keys=True)
+
+    def _validate_gfa_fingerprint(self) -> None:
+        path = self._gfa_fingerprint_path()
+        if not os.path.isfile(path):
+            raise RuntimeError(
+                'genome.ok exists but has no GFA input/config fingerprint; '
+                'use a new --out-dir or remove stale checkpoints explicitly')
+        with open(path) as handle:
+            previous = json.load(handle)
+        current = self._gfa_fingerprint()
+        if previous != current:
+            raise RuntimeError(
+                'genome.ok was produced from a different GFA or GFA '
+                'configuration; use a new --out-dir or remove stale '
+                'genome/downstream checkpoints explicitly')
 
     def create_checkpoint(self, step: str):
         """Create a checkpoint file for a completed step."""
@@ -518,6 +727,8 @@ class PanTEPipeline:
     def process_genome(self):
         """Step 1: Process genome and VCF files if provided."""
         if self.check_checkpoint('genome'):
+            if self.gfa_file:
+                self._validate_gfa_fingerprint()
             self.genome_file = self.processed_genome
             return
 
@@ -571,7 +782,9 @@ class PanTEPipeline:
                         output_dir=paf_work,
                         reference_genome=processed_genome,
                         threads=self.threads,
-                        mapping_file=self.paf_mapping
+                        mapping_file=self.paf_mapping,
+                        reference_seqnames=set(read_fasta_seqnames(
+                            self.original_genome_file))
                     )
                     scaffold_path = paf_proc.process()
                     n_scaffolds = count_fasta_sequences(scaffold_path)
@@ -593,42 +806,54 @@ class PanTEPipeline:
                     else:
                         logger.info("PAF enrichment: no candidates passed filters")
                 except Exception as e:
-                    logger.warning(f"PAF enrichment failed (non-fatal): {e}")
+                    logger.error(f"PAF enrichment failed: {e}")
+                    raise
 
-            # GFA enrichment: append non-reference TE insertions to genome
+            # GFA enrichment: append graph-derived locus alleles.  Failures
+            # are fatal by default; silently continuing would produce a library
+            # that appears complete while omitting the pangenome contribution.
             if self.gfa_file:
                 logger.info("GFA enrichment starting...")
                 gfa_work = os.path.join(genome_dir, 'gfa_enrichment')
                 os.makedirs(gfa_work, exist_ok=True)
-                try:
-                    gfa_proc = GfaProcessor(
-                        gfa_file=self.gfa_file,
-                        output_dir=gfa_work,
-                        reference_genome=processed_genome,
-                        threads=self.threads,
-                        gfa_ref=self.gfa_ref
-                    )
-                    scaffold_path = gfa_proc.process()
-                    n_scaffolds = count_fasta_sequences(scaffold_path)
-                    if n_scaffolds > 0:
-                        with open(processed_genome, 'rb') as check:
-                            check.seek(0, 2)
-                            if check.tell() > 0:
-                                check.seek(-1, 2)
-                                if check.read(1) != b'\n':
-                                    with open(processed_genome, 'ab') as fix:
-                                        fix.write(b'\n')
-                        with open(processed_genome, 'ab') as out:
-                            with open(scaffold_path, 'rb') as inp:
-                                shutil.copyfileobj(inp, out)
-                        self.run_cmd(f"samtools faidx {q(processed_genome)}")
-                        self.run_cmd(f"{q(os.path.join(BIN_DIR, 'index'))} {q(processed_genome)}")
-                        logger.info(f"GFA enrichment: {n_scaffolds} scaffold(s) "
-                                    f"appended to genome")
-                    else:
-                        logger.info("GFA enrichment: no candidates passed filters")
-                except Exception as e:
-                    logger.warning(f"GFA enrichment failed (non-fatal): {e}")
+                gfa_proc = GfaProcessor(
+                    gfa_file=self.gfa_file,
+                    output_dir=gfa_work,
+                    reference_genome=processed_genome,
+                    threads=self.threads,
+                    gfa_ref=self.gfa_ref,
+                    gfa_mode=self.gfa_mode,
+                    window_overlap=self.gfa_window_overlap,
+                    spacer_length=self.gfa_spacer_length,
+                    keep_intermediates=self.gfa_keep_intermediates,
+                    gfa_gaf=self.gfa_gaf,
+                    gfa_gaf_fasta=self.gfa_gaf_fasta,
+                    gfa_gaf_min_mapq=self.gfa_gaf_min_mapq,
+                    gfa_gaf_min_identity=self.gfa_gaf_min_identity
+                )
+                scaffold_path = gfa_proc.process()
+                n_scaffolds = count_fasta_sequences(scaffold_path)
+                if n_scaffolds > 0:
+                    with open(processed_genome, 'rb') as check:
+                        check.seek(0, 2)
+                        if check.tell() > 0:
+                            check.seek(-1, 2)
+                            if check.read(1) != b'\n':
+                                with open(processed_genome, 'ab') as fix:
+                                    fix.write(b'\n')
+                    with open(processed_genome, 'ab') as out:
+                        with open(scaffold_path, 'rb') as inp:
+                            shutil.copyfileobj(inp, out)
+                    self.run_cmd(f"samtools faidx {q(processed_genome)}")
+                    self.run_cmd(
+                        f"{q(os.path.join(BIN_DIR, 'index'))} "
+                        f"{q(processed_genome)}")
+                    logger.info(
+                        f"GFA enrichment: {n_scaffolds} candidate record(s) "
+                        f"appended to genome")
+                else:
+                    logger.info("GFA enrichment: no candidates passed filters")
+
 
         elif self.paf_file:
             # Reference-free PAF mode: construct genome from assemblies
@@ -644,7 +869,7 @@ class PanTEPipeline:
                 reference_genome=None,
                 threads=self.threads,
                 mapping_file=self.paf_mapping,
-                assembly_fastas=self.paf_fasta_files
+                assembly_fastas=self.prepared_paf_fasta_files
             )
             pan_genome_path = paf_proc.process()
 
@@ -670,7 +895,15 @@ class PanTEPipeline:
                 output_dir=gfa_work,
                 reference_genome=None,
                 threads=self.threads,
-                gfa_ref=self.gfa_ref
+                gfa_ref=self.gfa_ref,
+                gfa_mode=self.gfa_mode,
+                window_overlap=self.gfa_window_overlap,
+                spacer_length=self.gfa_spacer_length,
+                keep_intermediates=self.gfa_keep_intermediates,
+            gfa_gaf=self.gfa_gaf,
+            gfa_gaf_fasta=self.gfa_gaf_fasta,
+            gfa_gaf_min_mapq=self.gfa_gaf_min_mapq,
+            gfa_gaf_min_identity=self.gfa_gaf_min_identity
             )
             pan_genome_path = gfa_proc.process()
 
@@ -689,6 +922,7 @@ class PanTEPipeline:
             raise RuntimeError("No genome source: provide --genome, --paf, or --gfa")
 
         self.genome_file = processed_genome
+        self._write_gfa_fingerprint()
         self.create_checkpoint('genome')
         logger.info("Genome ready")
 
@@ -1305,6 +1539,40 @@ class PanTEPipeline:
         self.create_checkpoint('combine')
         logger.info("Combine done")
 
+    def annotate_gfa(self):
+        """Annotate GFA nodes after the final Pan_TE library is available."""
+        if self.check_checkpoint('anno'):
+            return
+
+        combine_dir = self.stage_dir(DIR_COMBINE, DIR_COMBINE_LEGACY)
+        library_candidates = [
+            os.path.join(combine_dir, 'TEs.fa'),
+            os.path.join(combine_dir, FILE_TE_LIBRARY),
+            os.path.join(combine_dir, FILE_TE_LIBRARY_LEGACY),
+        ]
+        te_library = next(
+            (path for path in library_candidates
+             if os.path.isfile(path) and os.path.getsize(path) > 0),
+            None)
+        if not te_library:
+            raise FileNotFoundError(
+                "No final TE library found for --anno; run the combine stage first")
+
+        anno_dir = os.path.join(self.output_dir, DIR_ANNO)
+        annotator = GfaAnnotator(
+            gfa_file=self.gfa_file,
+            output_dir=anno_dir,
+            te_library=te_library,
+            threads=self.threads,
+            gfa_gaf=self.gfa_gaf,
+            gfa_gaf_fasta=self.gfa_gaf_fasta,
+            gfa_gaf_min_mapq=self.gfa_gaf_min_mapq,
+            gfa_gaf_min_identity=self.gfa_gaf_min_identity,
+        )
+        result = annotator.annotate()
+        self.create_checkpoint('anno')
+        logger.info(f"GFA node annotation written to {result}")
+
     def run(self):
         """Run complete pipeline."""
         try:
@@ -1316,6 +1584,8 @@ class PanTEPipeline:
                     logger.warning("Genome checkpoint exists but processed genome missing, re-running")
                     self.process_genome()
                 else:
+                    if self.gfa_file:
+                        self._validate_gfa_fingerprint()
                     self.genome_file = self.processed_genome
 
             logger.info("Parallel detection: LTR + mdl-repeat")
@@ -1335,6 +1605,9 @@ class PanTEPipeline:
 
             if not self.check_checkpoint('combine'):
                 self.combine_results()
+
+            if self.anno_enabled:
+                self.annotate_gfa()
 
         except Exception as e:
             logger.error(f"Pipeline failed: {e}")
@@ -1358,6 +1631,15 @@ def main():
             paf_mapping=args.paf_mapping,
             gfa_file=args.gfa,
             gfa_ref=args.gfa_ref,
+            gfa_mode=args.gfa_mode,
+            gfa_window_overlap=args.gfa_window_overlap,
+            gfa_spacer_length=args.gfa_spacer_length,
+            gfa_keep_intermediates=not args.gfa_clean_intermediates,
+            gfa_gaf=args.gfa_gaf,
+            gfa_gaf_fasta=args.gfa_gaf_fasta,
+            gfa_gaf_min_mapq=args.gfa_gaf_min_mapq,
+            gfa_gaf_min_identity=args.gfa_gaf_min_identity,
+            anno=args.anno,
             te_looker_bin=args.te_looker_bin,
             te_looker_extra_args=args.te_looker_extra_args
         )

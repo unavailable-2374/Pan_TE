@@ -23,48 +23,53 @@ def calculate_lowcomplexity_fraction(sequence: str, window: int = 64,
             lc += 1
     return lc / n if n else 0.0
 
-def calculate_dust_score(sequence: str, window: int = 64, threshold: int = 7) -> float:
+def calculate_dust_score(sequence: str, window: int = 64,
+                         threshold: int = 7) -> float:
+    """Return the legacy DUST score using an O(sequence length) scan.
+
+    The previous implementation rebuilt all triplet counts for every
+    overlapping window.  This rolling form is numerically equivalent: adding a
+    triplet with current count ``c`` increases c*(c-1)/2 by ``c``; removing a
+    triplet with count ``c`` decreases it by ``c-1``.
     """
-    计算序列的DUST复杂度分数
-    返回值范围：0（高复杂度）到1（低复杂度）
-    """
-    if not sequence or len(sequence) < window:
+    if not sequence or len(sequence) < window or window < 4:
         return 0.0
-    
+
     sequence = sequence.upper()
-    total_score = 0
-    num_windows = 0
-    
-    # 滑动窗口计算
-    for i in range(len(sequence) - window + 1):
-        window_seq = sequence[i:i + window]
-        
-        # 计算三联体频率
-        triplets = Counter()
-        for j in range(len(window_seq) - 2):
-            triplet = window_seq[j:j + 3]
-            if 'N' not in triplet:  # 忽略含N的三联体
-                triplets[triplet] += 1
-        
-        # 计算窗口得分
-        window_score = 0
-        for count in triplets.values():
-            if count > 1:
-                window_score += count * (count - 1) / 2
-        
-        # 标准化得分
-        max_score = (window - 2) * (window - 3) / 2
-        if max_score > 0:
-            normalized_score = window_score / max_score
-            total_score += normalized_score
-            num_windows += 1
-    
-    # 返回平均DUST分数
-    if num_windows > 0:
-        avg_score = total_score / num_windows
-        return min(avg_score * threshold, 1.0)
-    
-    return 0.0
+    triplets = Counter()
+    for start in range(window - 2):
+        triplet = sequence[start:start + 3]
+        if 'N' not in triplet:
+            triplets[triplet] += 1
+
+    window_score = sum(
+        count * (count - 1) / 2
+        for count in triplets.values() if count > 1)
+    total_score = window_score
+    num_windows = len(sequence) - window + 1
+
+    for window_start in range(1, num_windows):
+        outgoing = sequence[window_start - 1:window_start + 2]
+        if 'N' not in outgoing:
+            count = triplets[outgoing]
+            window_score -= count - 1
+            if count == 1:
+                del triplets[outgoing]
+            else:
+                triplets[outgoing] = count - 1
+
+        incoming_start = window_start + window - 3
+        incoming = sequence[incoming_start:incoming_start + 3]
+        if 'N' not in incoming:
+            count = triplets[incoming]
+            window_score += count
+            triplets[incoming] = count + 1
+
+        total_score += window_score
+
+    max_score = (window - 2) * (window - 3) / 2
+    average_score = total_score / num_windows
+    return min(average_score / max_score * threshold, 1.0)
 
 def calculate_shannon_entropy(sequence: str, k: int = 1) -> float:
     """

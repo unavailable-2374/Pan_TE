@@ -1,6 +1,7 @@
 # ClassifyTE's isolated environment. Its pinned ML deps (scikit-learn 0.23.1 / numpy
-# 1.19.1 / Python 3.8) conflict with the main pan_te env, so run_Classifier invokes
-# ClassifyTE via `conda run -n ClassifyTE_env`. Create with:
+# 1.19.1 / Python 3.8) conflict with the main pan_te env. run_Classifier resolves
+# this environment and invokes its Python directly, avoiding nested Conda activation
+# hooks when Pan_TE is already running inside another environment. Create with:
 #     conda env create -f environment-classifyte.yml
 #
 # Versions mirror the upstream ClassifyTE repo's own environment.yml (verified against a
