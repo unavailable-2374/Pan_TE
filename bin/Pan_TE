@@ -21,7 +21,7 @@ from paf_processor import PAFProcessor, count_fasta_sequences
 from gfa_processor import GfaProcessor
 from gfa_annotator import GfaAnnotator
 
-VERSION = '1.0.1'
+VERSION = '1.1.0'
 
 # Usage and help message
 USAGE = f'''Usage:
