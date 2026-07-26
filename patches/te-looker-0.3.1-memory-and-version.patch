@@ -1,0 +1,79 @@
+diff --git a/core/Cargo.toml b/core/Cargo.toml
+index 9b7a413..1f8d85f 100644
+--- a/core/Cargo.toml
++++ b/core/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "te-core"
+-version = "0.3.0"
++version = "0.3.1"
+ edition = "2021"
+ description = "de novo repeat detection — performance core (Rust). P1 io+index+seed, P2 A1 extend-to-consensus, P2b spoa refine, P3 rayon parallel + minimizer scaling."
+ 
+diff --git a/core/src/bin/dtr.rs b/core/src/bin/dtr.rs
+index c7e1401..3b7d0c9 100644
+--- a/core/src/bin/dtr.rs
++++ b/core/src/bin/dtr.rs
+@@ -53,8 +53,18 @@ fn run(cmd: &mut Command, what: &str) {
+ 
+ fn main() {
+     let args: Vec<String> = env::args().collect();
++    // Version probe. Pan_TE reads this to tell which behaviours this binary actually has
++    // (from 0.3.1 the seed harvest holds one k-mer buffer rather than two), because the
++    // installed dtr normally comes from bioconda and can lag the pipeline that drives it.
++    if args.len() >= 2 && (args[1] == "--version" || args[1] == "-V") {
++        println!("dtr {}", env!("CARGO_PKG_VERSION"));
++        return;
++    }
+     if args.len() < 2 || args[1] != "run" {
+-        eprintln!("usage: dtr run --genome <fa> --out <dir> [--threads N] [--min-count C] [--window-stride N] [...]");
++        eprintln!("usage: dtr run --genome <fa> --out <dir> [--threads N] [--min-count C] [--w N] [...]");
++        eprintln!("       dtr --version");
++        eprintln!("  --w N   minimizer window for the seed harvest; 1 (default) emits every");
++        eprintln!("          k-mer, N>1 emits ~2/(N+1) of them and cuts memory accordingly.");
+         exit(2);
+     }
+     let genome = flag_val(&args, "--genome").unwrap_or_else(|| {
+@@ -74,7 +84,11 @@ fn main() {
+         eprintln!("[dtr] note: HMM Track-1 seeding (--dfam-hmm) not yet implemented; running de novo discovery only");
+     }
+     if let Some(s) = flag_val(&args, "--window-stride") {
+-        eprintln!("[dtr] note: --window-stride {s} accepted (graph-mode knob); using minimizer w={w} for scaling instead");
++        // Deliberately NOT aliased onto --w: stride is a window-graph vertex spacing and
++        // w is a minimizer window, so mapping one onto the other would silently subsample
++        // k-mers by a factor the caller never asked for. Say plainly that it does nothing,
++        // rather than implying the run was scaled by it.
++        eprintln!("[dtr] warning: --window-stride {s} is IGNORED -- the window-graph mode is not implemented in this build. Seed-harvest scaling is controlled only by --w (currently {w}).");
+     }
+ 
+     fs::create_dir_all(&out).ok();
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+index a52b66c..10e32d4 100644
+--- a/core/src/lib.rs
++++ b/core/src/lib.rs
+@@ -163,12 +163,23 @@ pub fn harvest(
+     };
+     let hi = 2 * (k - 1);
+     // parallel per-record scan, then concatenate (O(N)) and parallel sort
+-    let chunks: Vec<Vec<u128>> = recs
++    let mut chunks: Vec<Vec<u128>> = recs
+         .par_iter()
+         .enumerate()
+         .map(|(ri, rec)| scan_record(rec, ri, k, w, mask, hi))
+         .collect();
+-    let mut packed: Vec<u128> = chunks.concat();
++    // Move the per-record buffers into one preallocated Vec, releasing each as it is
++    // consumed. `chunks.concat()` would allocate the full result while `chunks` is still
++    // live and so hold TWO complete copies: on a 3.1 Gb genome at w=1 that is ~50 GB
++    // twice over, which is what turned a large-genome run into an OOM/abort. Draining
++    // caps the overshoot at one record's buffer instead.
++    let total_len: usize = chunks.iter().map(|c| c.len()).sum();
++    let mut packed: Vec<u128> = Vec::with_capacity(total_len);
++    for chunk in chunks.drain(..) {
++        packed.extend_from_slice(&chunk);
++        // `chunk` is dropped here, returning its allocation before the next append.
++    }
++    drop(chunks);
+     let total = packed.len() as u64;
+     packed.par_sort_unstable();
+ 

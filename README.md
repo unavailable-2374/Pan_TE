@@ -109,6 +109,8 @@ at <https://www.dfam.org/releases/>.)
 | `--anno` | After building the TE library, run sensitive RepeatMasker (`-s`) on GFA P/W path contexts and write node-level TE coverage plus per-sample presence. rGFA without P/W uses `--gfa-gaf`: node columns are conservative `1/NA`, while locus calls are `0/1/NA`. Default simple/low-complexity hits absent from `combine/TEs.fa` are excluded. Requires `--gfa`. |
 | `--vcf-dir <dir>` | Directory of `.vcf`/`.vcf.gz` structural variants to fold into `--genome`. Explicit ALT insertions and symbolic insertions with `SVINSSEQ`, `INSSEQ`, `SEQ`, or `CONSENSUS` are supported. |
 | `--te-looker-bin <path>` / `--te-looker-extra-args "<args>"` | Override the `dtr` binary / pass extra args to `dtr run`. |
+| `--te-looker-w <int>` | te-discover minimizer window, default 1 (exact: every k-mer). Values >1 emit only ~`2/(w+1)` of k-mer occurrences, cutting memory roughly proportionally — but they **change the seed set**, so this is opt-in only and `--min-count` is re-derived to match. |
+| `--check-env` | Run the environment preflight (tools, Perl/Python modules, data assets, memory) and exit without running the pipeline. |
 | `--out-dir <dir>` | Work directory (default: current directory). |
 | `--threads <int>` | Threads (default 4; multiples of 4 recommended). |
 | `-M <int>` | Memory limit in MB (default 0 = unlimited). |
@@ -150,6 +152,27 @@ cohort path steps and duplicate allele sequences. Identical sequences at differe
 remain separate, while copies of the same allele at one locus contribute sample and
 occurrence support. Rearrangements use a maximum collinear occurrence chain, and missing
 contigs, missing segment sequence, or unsupported non-zero P overlaps stop the run.
+
+## Environment preflight
+
+Every run verifies its environment before doing any work, and `--check-env` runs that check
+on its own:
+
+    Pan_TE --check-env --genome genome.fasta
+
+It resolves every external tool the requested run will invoke, the Perl and Python modules the
+stages import, the ClassifyTE assets when `--model-dir` is given, and whether the te-looker
+step can fit in the memory this job actually has. Problems are reported together, each naming
+its fix, and nothing is created until the checks pass.
+
+The memory check takes the smallest ceiling it can find — `/proc/meminfo`, cgroup v1/v2 limits,
+`SLURM_MEM_PER_NODE` / `SLURM_MEM_PER_CPU`, and `-M` — because a scheduler allocation is
+usually far below the node's physical RAM. te-discover holds one 16-byte entry per genomic
+position at the default `w=1`, so a 3.1 Gb genome needs roughly 56 GB (about 110 GB against
+te-looker ≤ 0.3.0, which held two copies of that buffer). If that does not fit, Pan_TE stops
+and tells you the requirement, the detected ceiling and its source, rather than quietly
+subsampling: `w` is never chosen from available memory, because the resulting library would
+then depend on which machine happened to run it.
 
 ## Notes
 

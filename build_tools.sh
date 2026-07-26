@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Build the 4 custom (non-bioconda) Pan_TE tools from source into the active conda env's
-# bin/, completing the conda closed loop: environment.yml provides all deps + compilers
-# (cmake / rust / c-compiler / make), this script compiles the bespoke binaries.
+# Build the 4 custom (non-bioconda) Pan_TE tools from source into the *already active*
+# Conda environment's bin/. This script never creates, updates, or installs Conda packages.
 #
-#   conda activate pan_te
+#   conda activate pan_te      # or whichever env environment.yml created
 #   ./build_tools.sh
 #
 # Each tool's source is resolved as: repo-local submodule/<tool>  ->  $PAN_TE_<TOOL>_SRC
@@ -19,7 +18,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUBMOD="$HERE/submodule"
-PREFIX="${CONDA_PREFIX:?activate the pan_te env first (CONDA_PREFIX unset)}"
+PREFIX="${CONDA_PREFIX:?activate the target Conda environment first (CONDA_PREFIX unset)}"
 BIN="$PREFIX/bin"
 JOBS="${JOBS:-$(nproc)}"
 mkdir -p "$BIN"
@@ -40,11 +39,27 @@ resolve_src() {
     echo "$SUBMOD/$sub"
 }
 
-need() { command -v "$1" >/dev/null 2>&1 || die "build tool '$1' not on PATH (is the pan_te env active with compilers installed?)"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "build tool '$1' not on PATH (is the target Conda environment active, with cmake/rust/compilers installed?)"; }
 need cmake; need make; need cargo; need cc
+
+# Prefer the complete Conda GCC toolchain. Some hosts expose a system c++
+# ahead of Conda on PATH; explicitly exporting the paired toolchain keeps
+# Look4LTRs' CMake build reproducible and avoids a compiler mismatch.
+CONDA_CC="$(find "$PREFIX/bin" -maxdepth 1 -type f -name '*-conda-linux-gnu-gcc' -print -quit)"
+CONDA_CXX="$(find "$PREFIX/bin" -maxdepth 1 -type f -name '*-conda-linux-gnu-g++' -print -quit)"
+if [ -n "$CONDA_CC" ] && [ -n "$CONDA_CXX" ]; then
+    export CC="$CONDA_CC"
+    export CXX="$CONDA_CXX"
+    log "using Conda compiler toolchain: $CC / $CXX"
+fi
 
 # ── look4ltrs (CMake) ───────────────────────────────────────────────────────
 L4="$(resolve_src look4ltrs Look4LTRs PAN_TE_LOOK4LTRS_SRC https://github.com/unavailable-2374/Look4LTRs.git)"
+# Old Look4LTRs CMake files omit the transitive dependencies of static libraries.
+# Apply the bundled source-only compatibility patch once; this is independent of Conda.
+if grep -Fqx 'target_link_libraries(look4ltrs main ltr repeats exception utility nonltr)' "$L4/CMakeLists.txt"; then
+    patch -d "$L4" -p1 < "$HERE/patches/look4ltrs-static-linking.patch" >/dev/null
+fi
 log "look4ltrs: cmake build in $L4"
 ( cd "$L4" && cmake -S . -B build_pante -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build_pante --target look4ltrs -j "$JOBS" )
 LB="$(find "$L4" -name look4ltrs -type f -perm -u+x | head -1)"

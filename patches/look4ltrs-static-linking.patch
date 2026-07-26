@@ -1,0 +1,36 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -92,7 +92,7 @@ add_library(ltr STATIC
+ ${CMAKE_SOURCE_DIR}/src/ltr/ModulePipeline.cpp
+ ${CMAKE_SOURCE_DIR}/src/ltr/DeepNesting.cpp
+ )
+-target_link_libraries(ltr main)
++target_link_libraries(ltr PUBLIC main)
+ 
+ set(MSL_SOURCE
+ ${CMAKE_SOURCE_DIR}/src/msl/MslToMatrix.cpp
+@@ -139,7 +139,7 @@ add_library(utility STATIC
+ ${CMAKE_SOURCE_DIR}/src/utility/Location.cpp
+ ${CMAKE_SOURCE_DIR}/src/utility/Util.cpp	
+ )
+-target_link_libraries(utility exception)
++target_link_libraries(utility PUBLIC exception)
+ 
+ set(RED_HEADER_FILES  
+ ${CMAKE_SOURCE_DIR}/src/utility/ILocation.h
+@@ -167,6 +167,8 @@ add_library(repeats STATIC
+ ${CMAKE_SOURCE_DIR}/src/red/Red.cpp
+ )
++target_link_libraries(nonltr PUBLIC utility exception)
++target_link_libraries(repeats PUBLIC utility nonltr)
+ 
+ add_executable(red ${CMAKE_SOURCE_DIR}/src/RepeatsDetector.cpp ${RED_HEADER_FILES})
+ target_link_libraries(red exception utility nonltr)
+@@ -208,7 +210,7 @@ target_link_libraries(ltrdetector main ltr)
+ 
+ add_executable(look4ltrs ${CMAKE_SOURCE_DIR}/src/ltr/look4ltrs.cpp ${HEADER_FILES} ${LTR_HEADER_FILES})
+-target_link_libraries(look4ltrs main ltr repeats exception utility nonltr)
++target_link_libraries(look4ltrs PRIVATE ltr repeats)
+ 
+ add_executable(generateTrainingData ${CMAKE_SOURCE_DIR}/src/ltr/generateTrainingData.cpp ${HEADER_FILES} ${LTR_HEADER_FILES})
+ target_link_libraries(generateTrainingData main ltr repeats exception utility nonltr)
