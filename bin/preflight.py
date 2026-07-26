@@ -181,6 +181,44 @@ def _check_python(report: Report, pending: set) -> None:
                         f"Install: {package}")
 
 
+def _resolve_classifyte_prefix() -> Optional[str]:
+    """Mirror resolve_classifyte_prefix() in bin/run_Classifier.
+
+    Kept deliberately identical to the shell version -- a preflight that resolves the
+    environment differently from the runtime is worse than none, because it would pass
+    on a setup that then dies at the very last step of a multi-hour run.
+    """
+    explicit = os.environ.get('CLASSIFYTE_ENV_PREFIX')
+    if explicit:
+        return explicit
+
+    name = os.environ.get('CLASSIFYTE_ENV_NAME', 'ClassifyTE_env')
+    conda = os.environ.get('CONDA_EXE') or shutil.which('conda')
+    if not conda or not os.access(conda, os.X_OK):
+        return None
+    try:
+        base = subprocess.run([conda, 'info', '--base'], capture_output=True,
+                              encoding='utf-8', timeout=120)
+        if base.returncode == 0 and base.stdout.strip():
+            candidate = os.path.join(base.stdout.strip(), 'envs', name)
+            if os.access(os.path.join(candidate, 'bin', 'python'), os.X_OK):
+                return candidate
+        listing = subprocess.run([conda, 'env', 'list'], capture_output=True,
+                                 encoding='utf-8', timeout=120)
+        for line in (listing.stdout or '').splitlines():
+            parts = line.split()
+            if parts and parts[0] == name:
+                return parts[-1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+# What run_Classifier symlinks in and executes; missing any of these is fatal there.
+CLASSIFYTE_REQUIRED_DIRS = ('features', 'nodes', 'models')
+CLASSIFYTE_REQUIRED_SCRIPTS = ('generate_feature_file_parallel.py', 'evaluate.py')
+
+
 def _check_classifier(pipeline, report: Report, pending: set) -> None:
     if not getattr(pipeline, 'model_dir', None):
         return
@@ -188,21 +226,49 @@ def _check_classifier(pipeline, report: Report, pending: set) -> None:
         return
     _check_tools(CLASSIFIER_TOOLS, report, required=True, pending=pending)
 
+    # The isolated ClassifyTE_env. This is the last thing the pipeline touches, so an
+    # absent environment used to surface only after every other stage had completed.
+    prefix = _resolve_classifyte_prefix()
+    env_name = os.environ.get('CLASSIFYTE_ENV_NAME', 'ClassifyTE_env')
+    if not prefix:
+        report.fail(
+            f"Conda environment {env_name!r} not found -- run_Classifier (the final step) "
+            f"needs it. Create it with "
+            f"`conda env create -f environment-classifyte.yml`, or set "
+            f"CLASSIFYTE_ENV_PREFIX to its prefix if it lives at a nonstandard path.")
+    elif not os.access(os.path.join(prefix, 'bin', 'python'), os.X_OK):
+        report.fail(
+            f"ClassifyTE environment resolved to {prefix!r} but {prefix}/bin/python is "
+            f"not executable. Recreate it with "
+            f"`conda env create -f environment-classifyte.yml`, or fix "
+            f"CLASSIFYTE_ENV_PREFIX.")
+
     model_dir = pipeline.model_dir
     if not os.path.isdir(model_dir):
         report.fail(f"--model-dir {model_dir!r} is not a directory. Fetch the ClassifyTE "
-                    f"assets with recipes/pan_te/pan_te-setup-data --classifyte-dir <dir>")
+                    f"assets with `pan_te-setup-data --classifyte-dir <dir>`")
         return
-    missing = [sub for sub in ('models', 'data') if not os.path.isdir(os.path.join(model_dir, sub))]
-    if missing:
-        report.warn(f"--model-dir {model_dir!r} is missing {', '.join(missing)}/ -- "
-                    f"ClassifyTE may fail. Re-run pan_te-setup-data --classifyte-dir")
 
-    prefix = os.environ.get('CLASSIFYTE_ENV_PREFIX')
-    if prefix and not os.path.isfile(os.path.join(prefix, 'bin', 'python')):
-        report.fail(f"CLASSIFYTE_ENV_PREFIX={prefix!r} has no bin/python. Point it at the "
-                    f"ClassifyTE_env prefix, or create it: "
-                    f"conda env create -f environment-classifyte.yml")
+    # run_Classifier auto-corrects one level up when features/ or models/ is missing,
+    # so accept whichever of the two layouts actually holds the assets.
+    effective = model_dir
+    if not all(os.path.isdir(os.path.join(model_dir, d)) for d in ('features', 'models')):
+        parent = os.path.dirname(model_dir.rstrip(os.sep))
+        if all(os.path.isdir(os.path.join(parent, d)) for d in ('features', 'models')):
+            effective = parent
+
+    missing = [d for d in CLASSIFYTE_REQUIRED_DIRS
+               if not os.path.exists(os.path.join(effective, d))]
+    if missing:
+        report.fail(f"--model-dir {effective!r} is missing {', '.join(missing)}/ -- "
+                    f"run_Classifier symlinks these and fails without them. Re-fetch with "
+                    f"`pan_te-setup-data --classifyte-dir <dir>`")
+    missing_scripts = [s for s in CLASSIFYTE_REQUIRED_SCRIPTS
+                       if not os.path.isfile(os.path.join(effective, s))]
+    if missing_scripts:
+        report.fail(f"--model-dir {effective!r} is missing {', '.join(missing_scripts)} -- "
+                    f"this must be a ClassifyTE source checkout, not just its models. "
+                    f"Re-fetch with `pan_te-setup-data --classifyte-dir <dir>`")
 
 
 def _estimate_genome_bp(pipeline) -> Tuple[int, str]:
