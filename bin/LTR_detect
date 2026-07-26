@@ -124,9 +124,45 @@ def sample_genome_chunks(fasta_file, num_chunks, target_size_gb, output_dir):
     return chunk_files
 
 
-LOOK4LTRS = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    '..', 'submodule', 'Look4LTRs', 'bin', 'look4ltrs')
+_LOOK4LTRS_CACHE = None
+
+
+def resolve_look4ltrs() -> str:
+    """Locate the look4ltrs binary without requiring a submodule.
+
+    Mirrors resolve_ltr_library_builder() / resolve_te_looker_bin() in Pan_TE: an
+    explicit override wins, then whatever the active environment provides (the Conda
+    look4ltrs package puts it on PATH), and only then the source-development submodule.
+    Hardcoding the submodule path made every Conda install fail with a bare ENOENT.
+    """
+    global _LOOK4LTRS_CACHE
+    if _LOOK4LTRS_CACHE:
+        return _LOOK4LTRS_CACHE
+
+    bin_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    override = os.environ.get('PAN_TE_LOOK4LTRS_BIN')
+    if override:
+        candidates.append(override)
+    on_path = shutil.which('look4ltrs')
+    if on_path:
+        candidates.append(on_path)
+    # Source-development fallbacks (repo checkout, then installed-package layout).
+    candidates.append(os.path.join(bin_dir, '..', 'submodule', 'Look4LTRs', 'bin', 'look4ltrs'))
+    candidates.append(os.path.join(bin_dir, '..', '..', 'submodule', 'Look4LTRs', 'bin', 'look4ltrs'))
+
+    for candidate in candidates:
+        candidate = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            _LOOK4LTRS_CACHE = candidate
+            return candidate
+
+    searched = '\n  - '.join(
+        os.path.abspath(os.path.expanduser(c)) for c in candidates)
+    raise FileNotFoundError(
+        'look4ltrs binary was not found. Install the Conda look4ltrs package, set '
+        'PAN_TE_LOOK4LTRS_BIN, or initialise the Look4LTRs development submodule. '
+        f'Searched:\n  - {searched}')
 
 
 def run_look4ltrs_single(genome_file, threads, output_dir):
@@ -144,7 +180,7 @@ def run_look4ltrs_single(genome_file, threads, output_dir):
     shutil.copy2(genome_file, input_genome_path)
 
     look4ltrs_cmd = [
-        LOOK4LTRS,
+        resolve_look4ltrs(),
         "-f", input_dir,
         "-o", output_dir,
         "-pa", str(threads)

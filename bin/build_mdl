@@ -9,6 +9,23 @@ use lib $FindBin::RealBin;
 # from the active conda env's perl. An optional PAN_TE_PERL5LIB lets a non-conda install
 # point at extra module dirs without editing this file.
 use lib (split /:/, ($ENV{PAN_TE_PERL5LIB} // ''));
+# RepeatMasker / RepeatModeler ship their Perl modules (RepModelConfig.pm,
+# RepeatMaskerConfig.pm, ...) under a share/ directory that is NOT on perl's default
+# @INC. Resolve them from the active Conda env first (those match the installed tools)
+# and from this repo's vendored share/ as a fallback, so a clean checkout works without
+# the operator having to export PERL5LIB by hand. Appended, not prepended, so an
+# explicit PAN_TE_PERL5LIB always wins.
+BEGIN {
+    my @extra;
+    if (my $prefix = $ENV{CONDA_PREFIX}) {
+        push @extra, "$prefix/share/RepeatModeler", "$prefix/share/RepeatMasker";
+        # some conda builds version the directory: share/RepeatModeler-2.0.4
+        push @extra, glob("$prefix/share/RepeatModeler-*"),
+                     glob("$prefix/share/RepeatMasker-*");
+    }
+    push @extra, "$FindBin::RealBin/../share";
+    push @INC, grep { defined $_ && length $_ && -d $_ } @extra;
+}
 
 use File::Path qw(make_path);
 use File::Spec;
@@ -76,12 +93,22 @@ sub get_and_validate_args {
         exit(0);
     }
 
-    # Try to locate rmblast directory through multiple methods
+    # Try to locate rmblast directory through multiple methods. RepModelConfig is
+    # RepeatModeler's config module and is strictly optional here -- locate_rmblastn()
+    # below covers the case where it is absent. It must therefore be pulled in with
+    # `require` (runtime, trappable by the surrounding eval) and NOT `use`, which runs
+    # at BEGIN and so aborts the entire script before the eval can catch anything.
     $config{rmblast_dir} = $ENV{RMBLAST_DIR};
     unless ($config{rmblast_dir}) {
         eval {
-            use RepModelConfig;
+            no warnings 'once';   # $RepModelConfig::configuration is set by the module
+            require RepModelConfig;
             $config{rmblast_dir} = $RepModelConfig::configuration->{'RMBLAST_DIR'}->{'value'};
+            1;
+        } or do {
+            my $why = $@ || 'unknown error';
+            $why =~ s/\n.*//s;
+            $logger->info("RepModelConfig unavailable ($why); resolving rmblastn from PATH instead");
         };
     }
 
@@ -119,6 +146,18 @@ sub get_and_validate_args {
 sub locate_rmblastn {
     $logger->info("Attempting to locate rmblastn...");
 
+    # PATH first: in a Conda install rmblastn lives in the active env's bin/, which
+    # `whereis` does not consult (it only searches a compiled-in list of standard
+    # directories). Pure-Perl scan so this needs no extra module.
+    for my $dir (split /:/, ($ENV{PATH} // '')) {
+        next unless length $dir;
+        my $path = "$dir/rmblastn";
+        if (-f $path && -x $path) {
+            $logger->info("Found rmblastn on PATH: $path");
+            return $dir;
+        }
+    }
+
     # Try whereis command
     my $whereis_out = `whereis rmblastn`;
     if ($whereis_out =~ /rmblastn:\s+(\S+)/) {
@@ -129,8 +168,9 @@ sub locate_rmblastn {
         }
     }
 
-    # Try find command in common locations
-    for my $base_dir ("/usr/local", "/usr", $ENV{HOME}, "/opt") {
+    # Last resort: sweep a few standard prefixes. $HOME is deliberately NOT searched --
+    # on a cluster it is a large network filesystem and the sweep can hang for minutes.
+    for my $base_dir ("/usr/local", "/usr", "/opt") {
         my $cmd = "find $base_dir -name rmblastn -type f 2>/dev/null";
         my $find_out = `$cmd`;
         if ($find_out) {
