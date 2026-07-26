@@ -21,7 +21,7 @@ from paf_processor import PAFProcessor, count_fasta_sequences
 from gfa_processor import GfaProcessor
 from gfa_annotator import GfaAnnotator
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 
 # Usage and help message
 USAGE = f'''Usage:
@@ -69,6 +69,11 @@ Parameters:
     --te-looker-bin <string> Path to te-looker dtr binary. Default: TE_LOOKER_BIN or PATH.
     --te-looker-extra-args <string>
                              Extra arguments passed verbatim to "dtr run".
+    --te-looker-w <int>      Default: 1 (exact: every k-mer). >1 subsamples k-mers to
+                             ~2/(w+1) of their occurrences, cutting te-discover memory
+                             roughly proportionally. This CHANGES the seed set, so it is
+                             opt-in only; --min-count is re-derived to match.
+    --check-env              Verify tools, Perl/Python modules and memory, then exit.
     -M <int>                 Memory limit (in MB), default: 0 (unlimited).
     --threads <int>          Default: 4. Number of threads, preferably in multiples of 4.
     --fragment-size <int>    Default: 40000. Length for fragment.
@@ -125,6 +130,100 @@ TE_LOOKER_MERGE_IDENTITY = 0.80           # cd-hit-est identity for cross-seed m
 # thousands of TE families, but a count above genome_Mb * this factor signals the gate
 # did not collapse the discovery inflation and the library should not be trusted.
 TE_LOOKER_SANITY_FAMILIES_PER_MB = 15
+
+# --- te-discover memory model -------------------------------------------------------
+# te_core::harvest() packs one u128 (16 bytes) per emitted k-mer occurrence. At w=1 that
+# is one entry per genomic position (exact mode, reproduces jellyfish); at w>1 only
+# (w,k)-minimizers are emitted, whose expected density is 2/(w+1). te-looker <=0.3.0
+# additionally holds two full copies at once (`chunks` stays live across
+# `chunks.concat()` in core/src/lib.rs), which is what turns a 3.1 Gb genome into a
+# ~100 GB peak. The genome itself is resident throughout as one byte per base.
+TE_LOOKER_BYTES_PER_ENTRY = 16
+TE_LOOKER_SAFETY_FACTOR = 1.15   # seed occurrence lists + allocator slack
+# te-looker releases at or above this version release `chunks` before sorting.
+TE_LOOKER_SINGLE_COPY_VERSION = (0, 3, 1)
+# --window-stride belongs to the window-graph mode, which no released dtr implements.
+# It is NOT an alias for --w: stride is a graph-vertex spacing, w is a minimizer window,
+# and quietly mapping one onto the other would subsample k-mers by a factor nobody asked
+# for. Pan_TE therefore withholds the flag until a dtr that genuinely implements it ships.
+TE_LOOKER_STRIDE_VERSION = (0, 4, 0)
+
+
+def minimizer_density(w: int) -> float:
+    """Expected fraction of k-mer occurrences retained by a (w,k)-minimizer scheme."""
+    return 1.0 if w <= 1 else 2.0 / (w + 1)
+
+
+def estimate_te_looker_peak_bytes(genome_bp: int, w: int, double_copy: bool) -> int:
+    """Estimated peak RSS of the te-discover seed-harvest stage."""
+    entries = genome_bp * minimizer_density(w)
+    packed = entries * TE_LOOKER_BYTES_PER_ENTRY * (2 if double_copy else 1)
+    return int((packed + genome_bp) * TE_LOOKER_SAFETY_FACTOR)
+
+
+def _read_int_file(path: str) -> Optional[int]:
+    try:
+        with open(path) as fh:
+            value = fh.read().strip()
+        return None if value in ('', 'max') else int(value)
+    except (OSError, ValueError):
+        return None
+
+
+def detect_memory_limit(explicit_mb: int = 0) -> Optional[Dict[str, int]]:
+    """Smallest memory ceiling this process is actually subject to, with its source.
+
+    A cluster job is usually capped far below the node's physical RAM, so reading
+    /proc/meminfo alone would happily green-light a run the scheduler then kills.
+    Every discoverable ceiling is collected and the minimum wins. Returns None when
+    nothing at all could be determined (rather than guessing).
+    """
+    limits: Dict[str, int] = {}
+
+    if explicit_mb and explicit_mb > 0:
+        limits['-M'] = explicit_mb * 1024 ** 2
+
+    try:
+        with open('/proc/meminfo') as fh:
+            for line in fh:
+                if line.startswith('MemAvailable:'):
+                    limits['/proc/meminfo MemAvailable'] = int(line.split()[1]) * 1024
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+
+    # cgroup v2, then v1. v1 reports a sentinel near 2^63 when unlimited.
+    v2 = _read_int_file('/sys/fs/cgroup/memory.max')
+    if v2:
+        limits['cgroup v2 memory.max'] = v2
+    v1 = _read_int_file('/sys/fs/cgroup/memory/memory.limit_in_bytes')
+    if v1 and v1 < 2 ** 62:
+        limits['cgroup v1 memory.limit_in_bytes'] = v1
+
+    # SLURM allocations. --mem lands in SLURM_MEM_PER_NODE, --mem-per-cpu needs scaling.
+    try:
+        per_node = os.environ.get('SLURM_MEM_PER_NODE')
+        if per_node:
+            limits['SLURM_MEM_PER_NODE'] = int(per_node) * 1024 ** 2
+        per_cpu = os.environ.get('SLURM_MEM_PER_CPU')
+        cpus = os.environ.get('SLURM_CPUS_ON_NODE') or os.environ.get('SLURM_JOB_CPUS_PER_NODE')
+        if per_cpu and cpus:
+            limits['SLURM_MEM_PER_CPU'] = int(per_cpu) * int(cpus.split('(')[0]) * 1024 ** 2
+    except (ValueError, TypeError):
+        pass
+
+    if not limits:
+        return None
+    source = min(limits, key=lambda k: limits[k])
+    return {'bytes': limits[source], 'source': source, 'all': limits}
+
+
+def human_bytes(n: float) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if abs(n) < 1024 or unit == 'TB':
+            return f"{n:.1f} {unit}" if unit != 'B' else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 
 def q(path) -> str:
@@ -350,6 +449,17 @@ def parse_arguments():
                        type=str,
                        default='',
                        help='Extra arguments passed verbatim to dtr run')
+    parser.add_argument('--te-looker-w',
+                       type=int,
+                       default=1,
+                       help='te-discover minimizer window (default 1 = exact, every '
+                            'k-mer). Values >1 subsample k-mers to ~2/(w+1) of their '
+                            'occurrences, cutting memory roughly proportionally, and '
+                            'CHANGE the seed set; --min-count is re-derived to match.')
+    parser.add_argument('--check-env',
+                       action='store_true',
+                       help='Run the environment preflight and exit without running the '
+                            'pipeline')
     parser.add_argument('-M',
                        type=int,
                        default=0,
@@ -457,7 +567,9 @@ class PanTEPipeline:
                  gfa_gaf_min_identity: float = 0.90,
                  anno: bool = False,
                  te_looker_bin: Optional[str] = None,
-                 te_looker_extra_args: str = ''):
+                 te_looker_extra_args: str = '',
+                 te_looker_w: int = 1,
+                 memory_limit_mb: int = 0):
         """Initialize the pipeline with configuration parameters."""
         self.original_genome_file = os.path.abspath(genome_file) if genome_file else None
         self.genome_file = None  # Will be set after decompression if needed
@@ -483,6 +595,9 @@ class PanTEPipeline:
         self.model_dir = os.path.abspath(model_dir) if model_dir else None
         self.te_looker_bin = os.path.abspath(te_looker_bin) if te_looker_bin else None
         self.te_looker_extra_args = te_looker_extra_args or ''
+        self.te_looker_w = max(1, int(te_looker_w or 1))
+        self.memory_limit_mb = int(memory_limit_mb or 0)
+        self._dtr_caps: Optional[Dict] = None
         self.processed_genome = os.path.join(self.output_dir, DIR_GENOME, 'genome.fa')
 
         # Set genome_file initially to original file path for validation
@@ -523,8 +638,10 @@ class PanTEPipeline:
             'combine': self.combine_results,
             'anno': self.annotate_gfa
         }
-        # Create output directory structure
-        self.setup_directories()
+        # NOTE: the output directory structure is deliberately NOT created here. It is
+        # created by run(), so that constructing a pipeline (as --check-env and the
+        # preflight do) leaves the filesystem untouched when the environment turns out
+        # to be unusable.
 
     def stage_dir(self, canonical: str, legacy: Optional[str] = None) -> str:
         """Return the canonical stage directory, falling back to an existing legacy one."""
@@ -1206,9 +1323,116 @@ class PanTEPipeline:
             'or provide --te-looker-bin.'
         )
 
+    def probe_dtr_capabilities(self, dtr_bin: str, env: Dict[str, str]) -> Dict:
+        """Determine what the installed dtr actually honours.
+
+        te-looker <=0.3.0 has no --version (anything but `run` prints usage and exits 2)
+        and *discards* --window-stride while silently defaulting the real scaling knob
+        --w to 1; 0.3.1 adds --version and releases the duplicate k-mer buffer. Probing
+        rather than assuming keeps Pan_TE correct against both, which matters because
+        the binary normally comes from bioconda and lags this repo.
+        """
+        if self._dtr_caps is not None:
+            return self._dtr_caps
+
+        version = None
+        try:
+            proc = subprocess.run([dtr_bin, '--version'], capture_output=True,
+                                  encoding='utf-8', env=env, timeout=30)
+            if proc.returncode == 0:
+                match = re.search(r'(\d+)\.(\d+)\.(\d+)', (proc.stdout or '') + (proc.stderr or ''))
+                if match:
+                    version = tuple(int(g) for g in match.groups())
+        except (OSError, subprocess.SubprocessError):
+            version = None
+
+        double_copy = version is None or version < TE_LOOKER_SINGLE_COPY_VERSION
+        self._dtr_caps = {
+            'version': version,
+            # --w is read by every dtr generation; unknown flags are ignored by the
+            # legacy parser, so passing it explicitly is safe either way.
+            'supports_w': True,
+            'stride_effective': version is not None and version >= TE_LOOKER_STRIDE_VERSION,
+            'double_copy': double_copy,
+        }
+        label = '.'.join(str(v) for v in version) if version else 'pre-0.3.1 (no --version)'
+        logger.info(f"dtr capability probe: version {label}, "
+                    f"seed-harvest holds {'two copies' if double_copy else 'one copy'}")
+        return self._dtr_caps
+
+    def check_te_looker_memory(self, genome_bp: int, w: int, double_copy: bool) -> None:
+        """Abort before the multi-hour dtr step if it cannot fit in available memory.
+
+        Insufficient memory is a solvable blocker (a larger node, a bigger --mem), so
+        Pan_TE refuses to quietly subsample its way around it: silently changing w would
+        make the resulting library depend on which machine happened to run it. The user
+        is told exactly what is needed and given the explicit opt-in instead.
+        """
+        if genome_bp <= 0:
+            logger.warning("Genome size unknown; skipping te-looker memory feasibility check")
+            return
+
+        required = estimate_te_looker_peak_bytes(genome_bp, w, double_copy)
+        limit = detect_memory_limit(self.memory_limit_mb)
+        mode = f"w={w} (exact k-mer)" if w <= 1 else f"w={w} (minimizer, ~{minimizer_density(w):.3f} density)"
+        logger.info(f"te-looker memory estimate: genome {genome_bp/1e9:.2f} Gb, {mode} "
+                    f"→ peak ~{human_bytes(required)}")
+
+        if limit is None:
+            logger.warning("Could not determine any memory limit (no /proc/meminfo, cgroup "
+                           "or SLURM allocation); proceeding without a feasibility check")
+            return
+
+        logger.info(f"Detected memory ceiling: {human_bytes(limit['bytes'])} "
+                    f"(from {limit['source']})")
+        if required <= limit['bytes']:
+            return
+
+        suggested = w
+        while suggested < 64 and estimate_te_looker_peak_bytes(
+                genome_bp, suggested, double_copy) > limit['bytes']:
+            suggested += 1
+        derived = self.derive_min_count(genome_bp, suggested)
+        detail = '\n'.join(f"    {src}: {human_bytes(val)}"
+                           for src, val in sorted(limit['all'].items(),
+                                                  key=lambda kv: kv[1]))
+        raise MemoryError(
+            "te-looker (dtr) cannot run in the memory available to this job.\n"
+            f"  genome              {genome_bp/1e9:.2f} Gb\n"
+            f"  mode                {mode}\n"
+            f"  estimated peak      {human_bytes(required)}\n"
+            f"  available           {human_bytes(limit['bytes'])}  (from {limit['source']})\n"
+            f"{detail}\n"
+            "Fix (pick one):\n"
+            f"  1) give the job more memory (>= {human_bytes(required)}), e.g. a larger\n"
+            "     node or a higher --mem / -M value;\n"
+            f"  2) opt into k-mer subsampling, which CHANGES the seed set:\n"
+            f"       --te-looker-w {suggested}   "
+            f"(estimated peak {human_bytes(estimate_te_looker_peak_bytes(genome_bp, suggested, double_copy))}, "
+            f"--min-count becomes {derived})\n"
+            "Aborting before any long-running step."
+        )
+
+    def derive_min_count(self, genome_bp: int, w: int) -> int:
+        """--min-count for a given w.
+
+        choose_te_looker_min_count is calibrated for w=1 (every occurrence counted).
+        Under minimizer subsampling only ~2/(w+1) of a family's occurrences are emitted,
+        so an unscaled floor would reject every real family and silently return nothing.
+        """
+        base = self.choose_te_looker_min_count(genome_bp)
+        if w <= 1:
+            return base
+        return max(TE_LOOKER_MIN_COPIES, int(round(base * minimizer_density(w))))
+
     def te_looker_env(self, dtr_bin: str) -> Dict[str, str]:
         """Build an environment with local tool paths needed by dtr."""
         env = os.environ.copy()
+        # Rust gives spawned threads a 2 MiB stack by default (only the main thread gets
+        # ulimit -s), and te-looker does not set an explicit rayon stack_size. Raising it
+        # here is free and removes a whole class of "stack overflow" aborts in the
+        # parallel seed harvest on large genomes.
+        env.setdefault('RUST_MIN_STACK', str(64 * 1024 * 1024))
         path_parts = [os.path.dirname(dtr_bin)]
         for var in ('FASTGA_BIN', 'ABPOA_BIN', 'TE_LOOKER_TOOL_PATH'):
             value = env.get(var)
@@ -1325,8 +1549,16 @@ class PanTEPipeline:
             mdl_fa = self.find_mdl_repeat_for_dfam()
             if mdl_fa:
                 dfam_hmm = os.path.join(te_stage_dir, 'mdl_repeat_seed.hmm')
-                logger.info(f"Building Track 1 HMM seed from mdl-repeat consensus: {mdl_fa}")
-                ok = self.build_dfam_hmm_from_consensus(mdl_fa, dfam_hmm, te_stage_dir)
+                # Resubmitting a job that died inside dtr must not pay for this again:
+                # the seed depends only on the (already checkpointed) mdl-repeat output,
+                # so an existing non-empty bundle newer than its input is reused as-is.
+                if (os.path.exists(dfam_hmm) and os.path.getsize(dfam_hmm) > 0
+                        and os.path.getmtime(dfam_hmm) >= os.path.getmtime(mdl_fa)):
+                    logger.info(f"Track 1 HMM seed reused from previous run: {dfam_hmm}")
+                    ok = True
+                else:
+                    logger.info(f"Building Track 1 HMM seed from mdl-repeat consensus: {mdl_fa}")
+                    ok = self.build_dfam_hmm_from_consensus(mdl_fa, dfam_hmm, te_stage_dir)
                 if ok:
                     logger.info(f"Track 1 HMM seed ready: {dfam_hmm}")
                     # dtr ignores --dfam-hmm unless --enable-known-hmm-discovery
@@ -1348,33 +1580,68 @@ class PanTEPipeline:
                     "Track 1 will run without a seed library"
                 )
 
+        genome_bp = self.get_genome_size_bp()
+        caps = self.probe_dtr_capabilities(dtr_bin, self.te_looker_env(dtr_bin))
+
+        # --w is the real memory/throughput lever (te_core::harvest emits every k-mer at
+        # w=1, minimizers at ~2/(w+1) density above it). Pan_TE previously auto-scaled
+        # --window-stride instead, which dtr accepts and then discards -- the run looked
+        # scaled but was not. w stays at 1 unless the user explicitly opts in, because
+        # subsampling changes the seed set and must never depend on the host's RAM.
+        w = self.te_looker_w
+        if '--w' in extra_tokens:
+            try:
+                w = max(1, int(extra_tokens[extra_tokens.index('--w') + 1]))
+            except (IndexError, ValueError):
+                pass
+        elif w > 1:
+            cmd_parts.extend(['--w', str(w)])
+
+        if w > 1:
+            logger.warning(
+                f"te-discover minimizer subsampling ENABLED (--te-looker-w {w}): only "
+                f"~{minimizer_density(w):.3f} of k-mer occurrences are emitted. This "
+                f"changes the seed set relative to the default exact mode (w=1)."
+            )
+
+        if need_discovery:
+            self.check_te_looker_memory(genome_bp, w, caps['double_copy'])
+
         # Auto-scale --min-count (seed occurrence floor) to genome size. dtr's
         # built-in default (20) over-seeds large genomes and inflates the family
         # count; this raises the floor with genome size (e.g. ~200 at maize scale).
+        # Under w>1 the floor is re-derived, since counts are subsampled with the k-mers.
         if '--min-count' not in extra_tokens:
-            genome_bp = self.get_genome_size_bp()
-            min_count = self.choose_te_looker_min_count(genome_bp)
+            min_count = self.derive_min_count(genome_bp, w)
+            note = '' if w <= 1 else f" (re-derived for w={w} from {self.choose_te_looker_min_count(genome_bp)})"
             logger.info(
-                f"Genome size {genome_bp/1e9:.2f} Gb → --min-count {min_count} (auto)"
+                f"Genome size {genome_bp/1e9:.2f} Gb → --min-count {min_count} (auto){note}"
             )
             cmd_parts.extend(['--min-count', str(min_count)])
 
-        # Auto-adapt --window-stride to genome size (Stage 2 graph memory
-        # scales as |V| ≈ genome / stride; see design_v2/SCALABILITY_STRATEGY.md).
-        if '--window-stride' not in extra_tokens:
-            genome_bp = self.get_genome_size_bp()
+        # --window-stride is only forwarded to a dtr that actually implements it; older
+        # builds print a note and ignore it, which is how the inert knob went unnoticed.
+        if caps['stride_effective'] and '--window-stride' not in extra_tokens:
             stride = self.choose_te_looker_window_stride(genome_bp)
             logger.info(
-                f"Genome size {genome_bp/1e9:.2f} Gb → "
-                f"--window-stride {stride} (auto)"
+                f"Genome size {genome_bp/1e9:.2f} Gb → --window-stride {stride} (auto)"
             )
             cmd_parts.extend(['--window-stride', str(stride)])
 
         if need_discovery:
             if self.te_looker_extra_args:
                 cmd_parts.append(self.te_looker_extra_args)
-            self.run_cmd(' '.join(cmd_parts), te_stage_dir,
-                         env=self.te_looker_env(dtr_bin))
+            result = self.run_cmd(' '.join(cmd_parts), te_stage_dir,
+                                  env=self.te_looker_env(dtr_bin))
+            # run_cmd only shows stderr when a command fails, so dtr's notices about
+            # flags it accepted-but-ignored were invisible on success. Promote them:
+            # an ignored knob must never again look like a working one.
+            for line in (result.stderr or '').splitlines():
+                stripped = line.strip()
+                if stripped.startswith('[dtr]') and (
+                        'note:' in stripped or 'not yet implemented' in stripped
+                        or 'warning' in stripped.lower()):
+                    logger.warning(f"dtr: {stripped[len('[dtr]'):].strip()}")
             if not os.path.exists(te_looker_families):
                 raise FileNotFoundError(
                     f"TE-looker completed but required output is missing: {te_looker_families}"
@@ -1576,6 +1843,10 @@ class PanTEPipeline:
     def run(self):
         """Run complete pipeline."""
         try:
+            # Create output directory structure (deferred from __init__ so a failed
+            # preflight leaves no partial work directory behind).
+            self.setup_directories()
+
             if not self.check_checkpoint('genome'):
                 self.process_genome()
             else:
@@ -1641,12 +1912,23 @@ def main():
             gfa_gaf_min_identity=args.gfa_gaf_min_identity,
             anno=args.anno,
             te_looker_bin=args.te_looker_bin,
-            te_looker_extra_args=args.te_looker_extra_args
+            te_looker_extra_args=args.te_looker_extra_args,
+            te_looker_w=args.te_looker_w,
+            memory_limit_mb=args.M
         )
 
         if args.M > 0:
             import resource
             resource.setrlimit(resource.RLIMIT_AS, (args.M * 1024 * 1024, -1))
+
+        # Verify the environment before any long-running step. Every dependency the
+        # requested run will need is checked in one pass, so a missing tool or an
+        # under-provisioned node fails in seconds with an actionable message instead of
+        # aborting hours in.
+        import preflight
+        ok = preflight.run_preflight(pipeline, check_only=args.check_env)
+        if args.check_env:
+            sys.exit(0 if ok else 1)
 
         pipeline.run()
         logger.info("Pipeline completed successfully")
