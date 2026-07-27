@@ -181,37 +181,74 @@ def _check_python(report: Report, pending: set) -> None:
                         f"Install: {package}")
 
 
-def _resolve_classifyte_prefix() -> Optional[str]:
-    """Mirror resolve_classifyte_prefix() in bin/run_Classifier.
+def _resolve_classifyte_prefix() -> Tuple[Optional[str], List[str]]:
+    """Mirror resolve_classifyte_prefix() in bin/run_Classifier, returning (prefix, tried).
 
     Kept deliberately identical to the shell version -- a preflight that resolves the
     environment differently from the runtime is worse than none, because it would pass
-    on a setup that then dies at the very last step of a multi-hour run.
+    on a setup that then dies at the very last step of a multi-hour run. Note the
+    ordering: everything that does NOT need the `conda` command comes first, because a
+    batch job often has the main env on PATH without conda initialised.
     """
+    tried: List[str] = []
     explicit = os.environ.get('CLASSIFYTE_ENV_PREFIX')
     if explicit:
-        return explicit
+        return explicit, tried
 
     name = os.environ.get('CLASSIFYTE_ENV_NAME', 'ClassifyTE_env')
-    conda = os.environ.get('CONDA_EXE') or shutil.which('conda')
-    if not conda or not os.access(conda, os.X_OK):
-        return None
+
+    def _ok(prefix: str) -> bool:
+        return os.access(os.path.join(prefix, 'bin', 'python'), os.X_OK)
+
+    # 1. Sibling of the active environment -- no conda invocation needed.
+    active = os.environ.get('CONDA_PREFIX')
+    if active:
+        candidate = os.path.join(os.path.dirname(active.rstrip(os.sep)), name)
+        tried.append(f"{candidate} (sibling of $CONDA_PREFIX)")
+        if _ok(candidate):
+            return candidate, tried
+
+    # 2. Configured env directories (clusters often relocate these off $HOME).
+    for var in ('CONDA_ENVS_PATH', 'CONDA_ENVS_DIRS'):
+        for directory in (os.environ.get(var) or '').split(os.pathsep):
+            if not directory:
+                continue
+            candidate = os.path.join(directory, name)
+            tried.append(f"{candidate} (from ${var})")
+            if _ok(candidate):
+                return candidate, tried
+
+    # 3. Base derived from $CONDA_EXE's location, without running it.
+    conda_exe = os.environ.get('CONDA_EXE')
+    if conda_exe:
+        candidate = os.path.join(os.path.dirname(os.path.dirname(conda_exe)), 'envs', name)
+        tried.append(f"{candidate} (derived from $CONDA_EXE)")
+        if _ok(candidate):
+            return candidate, tried
+
+    # 4. Only now ask conda, which may not exist in a batch shell at all.
+    conda = conda_exe if (conda_exe and os.access(conda_exe, os.X_OK)) else shutil.which('conda')
+    if not conda:
+        tried.append("(conda command unavailable -- CONDA_EXE unset and 'conda' not on PATH)")
+        return None, tried
     try:
         base = subprocess.run([conda, 'info', '--base'], capture_output=True,
                               encoding='utf-8', timeout=120)
         if base.returncode == 0 and base.stdout.strip():
             candidate = os.path.join(base.stdout.strip(), 'envs', name)
-            if os.access(os.path.join(candidate, 'bin', 'python'), os.X_OK):
-                return candidate
+            tried.append(f"{candidate} (conda info --base)")
+            if _ok(candidate):
+                return candidate, tried
+        tried.append(f"conda env list (searched for an env named {name})")
         listing = subprocess.run([conda, 'env', 'list'], capture_output=True,
                                  encoding='utf-8', timeout=120)
         for line in (listing.stdout or '').splitlines():
             parts = line.split()
             if parts and parts[0] == name:
-                return parts[-1]
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return None
+                return parts[-1], tried
+    except (OSError, subprocess.SubprocessError) as exc:
+        tried.append(f"(conda invocation failed: {exc})")
+    return None, tried
 
 
 # What run_Classifier symlinks in and executes; missing any of these is fatal there.
@@ -228,14 +265,16 @@ def _check_classifier(pipeline, report: Report, pending: set) -> None:
 
     # The isolated ClassifyTE_env. This is the last thing the pipeline touches, so an
     # absent environment used to surface only after every other stage had completed.
-    prefix = _resolve_classifyte_prefix()
+    prefix, tried = _resolve_classifyte_prefix()
     env_name = os.environ.get('CLASSIFYTE_ENV_NAME', 'ClassifyTE_env')
     if not prefix:
+        searched = ''.join(f"\n        - {t}" for t in tried)
         report.fail(
             f"Conda environment {env_name!r} not found -- run_Classifier (the final step) "
-            f"needs it. Create it with "
-            f"`conda env create -f environment-classifyte.yml`, or set "
-            f"CLASSIFYTE_ENV_PREFIX to its prefix if it lives at a nonstandard path.")
+            f"needs it. Searched:{searched}\n"
+            f"    Create it with `conda env create -f environment-classifyte.yml`, or set "
+            f"CLASSIFYTE_ENV_PREFIX to its absolute prefix (the directory containing "
+            f"bin/python).")
     elif not os.access(os.path.join(prefix, 'bin', 'python'), os.X_OK):
         report.fail(
             f"ClassifyTE environment resolved to {prefix!r} but {prefix}/bin/python is "

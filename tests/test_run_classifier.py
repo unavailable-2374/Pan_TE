@@ -141,9 +141,16 @@ class RunClassifierEnvironmentTests(unittest.TestCase):
             )
             env = os.environ.copy()
             env.pop("CLASSIFYTE_ENV_PREFIX", None)
+            # The resolver also looks beside the active environment and in the
+            # configured env directories, so "no environment available" only holds if
+            # those are controlled too -- otherwise this test silently resolves the
+            # host's real ClassifyTE_env and stops testing anything.
+            env.pop("CONDA_ENVS_PATH", None)
+            env.pop("CONDA_ENVS_DIRS", None)
             env.update({
                 "PATH": f"{fake_bin}:{env['PATH']}",
                 "CONDA_EXE": str(fake_bin / "conda"),
+                "CONDA_PREFIX": str(tmp_path / "envs" / "main"),
             })
             result = subprocess.run(
                 [str(RUN_CLASSIFIER), str(classifyte), "2"],
@@ -156,6 +163,83 @@ class RunClassifierEnvironmentTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Unable to locate Conda environment", result.stderr)
+            # The error must say where it looked; a bare "not found" gave operators
+            # nothing to act on when the environment existed but was not being found.
+            self.assertIn("Searched:", result.stderr)
+
+    def test_resolves_sibling_environment_without_conda_available(self):
+        """A batch job often has the main env on PATH but no usable `conda`.
+
+        The environment then activates fine in an interactive login shell yet looked
+        "missing" to run_Classifier, which used to reach it only via conda. It must be
+        found beside the active environment, with no conda invocation at all.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            work = tmp_path / "work"
+            classifyte = tmp_path / "ClassifyTE"
+            envs = tmp_path / "envs"
+            env_prefix = envs / "ClassifyTE_env"
+            fake_bin = tmp_path / "bin"
+            trace = tmp_path / "python.trace"
+
+            work.mkdir()
+            fake_bin.mkdir()
+            (envs / "main" / "bin").mkdir(parents=True)
+            (env_prefix / "bin").mkdir(parents=True)
+            for dirname in ("features", "models", "nodes"):
+                (classifyte / dirname).mkdir(parents=True)
+            (work / "raw_te_library.fa").write_text(">original\nACGT\n")
+
+            self.make_executable(
+                env_prefix / "bin" / "python",
+                """
+                #!/usr/bin/env bash
+                printf '%s\n' "$*" >> "$PYTHON_TRACE"
+                case "$1" in
+                    *generate_feature_file_parallel.py)
+                        mkdir -p data
+                        printf 'feature\n' > data/sup.csv
+                        ;;
+                    *evaluate.py)
+                        mkdir -p output
+                        printf 'prediction\n' > output/predicted_out_sup_features.csv
+                        ;;
+                esac
+                """,
+            )
+            for name, body in (
+                ("renameTE", '#!/usr/bin/env bash\ncp "$2" "$3"\n'),
+                ("RepeatClassifier", '#!/usr/bin/env bash\ntouch "$2.classified"\n'),
+                ("process_for_classify.py", '#!/usr/bin/env bash\nprintf \'result\\n\' > "$2"\n'),
+                ("Combine_for_Two", '#!/usr/bin/env bash\nprintf \'>TE#I\\ngypsy#Unknown#\\n\' > TEs.fa\n'),
+            ):
+                self.make_executable(fake_bin / name, body)
+
+            env = os.environ.copy()
+            for leaked in ("CLASSIFYTE_ENV_PREFIX", "CONDA_EXE",
+                           "CONDA_ENVS_PATH", "CONDA_ENVS_DIRS"):
+                env.pop(leaked, None)
+            # No conda on PATH at all -- exactly the batch-job shell.
+            env.update({
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "CONDA_PREFIX": str(envs / "main"),
+                "PYTHON_TRACE": str(trace),
+            })
+            result = subprocess.run(
+                [str(RUN_CLASSIFIER), str(classifyte), "2"],
+                cwd=work,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"ClassifyTE environment: {env_prefix}", result.stdout)
+            calls = trace.read_text().splitlines()
+            self.assertEqual(len(calls), 2)
+            self.assertIn("generate_feature_file_parallel.py", calls[0])
 
 
 if __name__ == "__main__":

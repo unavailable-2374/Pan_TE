@@ -60,39 +60,96 @@ fi
 # example, PGTA's gxx hook may look for a compiler under the Conda base prefix).
 # Executing the target interpreter directly avoids that nested-activation
 # failure while retaining ClassifyTE's pinned Python dependencies.
+# Order matters: everything that does NOT need the `conda` command comes first. A batch
+# job typically has the main environment on PATH without conda being initialised, so
+# CONDA_EXE is unset and `conda` is not on PATH -- an environment that activates fine in
+# an interactive login shell then looks "missing" here. CLASSIFYTE_SEARCHED accumulates
+# what was tried so the error can say where it looked.
+CLASSIFYTE_SEARCHED=""
+_note_candidate() { CLASSIFYTE_SEARCHED="${CLASSIFYTE_SEARCHED}
+    - $1"; }
+
 resolve_classifyte_prefix() {
     local conda_cmd=""
     local conda_base=""
     local candidate=""
+    local d=""
+    local old_ifs=""
 
     if [ -n "${CLASSIFYTE_ENV_PREFIX:-}" ]; then
-        printf '%s\n' "$CLASSIFYTE_ENV_PREFIX"
+        CLASSIFYTE_PREFIX="$CLASSIFYTE_ENV_PREFIX"
         return 0
     fi
 
+    # 1. Sibling of the active environment ($CONDA_PREFIX/../<name>). This is where
+    #    `conda env create -f environment-classifyte.yml` puts it in a normal install,
+    #    and it needs no conda invocation at all.
+    if [ -n "${CONDA_PREFIX:-}" ]; then
+        candidate="$(dirname "$CONDA_PREFIX")/$CLASSIFYTE_ENV_NAME"
+        _note_candidate "$candidate (sibling of \$CONDA_PREFIX)"
+        if [ -x "$candidate/bin/python" ]; then
+            CLASSIFYTE_PREFIX="$candidate"
+            return 0
+        fi
+    fi
+
+    # 2. Explicitly configured env directories (clusters often relocate these off $HOME).
+    old_ifs="$IFS"
+    IFS=':'
+    for d in ${CONDA_ENVS_PATH:-} ${CONDA_ENVS_DIRS:-}; do
+        [ -n "$d" ] || continue
+        candidate="$d/$CLASSIFYTE_ENV_NAME"
+        IFS="$old_ifs"
+        _note_candidate "$candidate (from \$CONDA_ENVS_PATH/\$CONDA_ENVS_DIRS)"
+        if [ -x "$candidate/bin/python" ]; then
+            CLASSIFYTE_PREFIX="$candidate"
+            return 0
+        fi
+        IFS=':'
+    done
+    IFS="$old_ifs"
+
+    # 3. Derive the base from $CONDA_EXE's location, without running it.
+    if [ -n "${CONDA_EXE:-}" ]; then
+        candidate="$(dirname "$(dirname "$CONDA_EXE")")/envs/$CLASSIFYTE_ENV_NAME"
+        _note_candidate "$candidate (derived from \$CONDA_EXE)"
+        if [ -x "$candidate/bin/python" ]; then
+            CLASSIFYTE_PREFIX="$candidate"
+            return 0
+        fi
+    fi
+
+    # 4. Only now fall back to asking conda, which may not exist in a batch shell.
     if [ -n "${CONDA_EXE:-}" ] && [ -x "$CONDA_EXE" ]; then
         conda_cmd="$CONDA_EXE"
     elif command -v conda >/dev/null 2>&1; then
         conda_cmd="$(command -v conda)"
     else
+        _note_candidate "(conda command unavailable in this shell -- CONDA_EXE unset and 'conda' not on PATH)"
         return 1
     fi
 
-    conda_base="$("$conda_cmd" info --base 2>/dev/null)" || return 1
-    candidate="$conda_base/envs/$CLASSIFYTE_ENV_NAME"
-    if [ -x "$candidate/bin/python" ]; then
-        printf '%s\n' "$candidate"
-        return 0
+    conda_base="$("$conda_cmd" info --base 2>/dev/null)" || conda_base=""
+    if [ -n "$conda_base" ]; then
+        candidate="$conda_base/envs/$CLASSIFYTE_ENV_NAME"
+        _note_candidate "$candidate (conda info --base)"
+        if [ -x "$candidate/bin/python" ]; then
+            CLASSIFYTE_PREFIX="$candidate"
+            return 0
+        fi
     fi
 
-    "$conda_cmd" env list 2>/dev/null \
-        | awk -v env_name="$CLASSIFYTE_ENV_NAME" '$1 == env_name {print $NF; exit}'
+    _note_candidate "conda env list (searched for an env named $CLASSIFYTE_ENV_NAME)"
+    CLASSIFYTE_PREFIX="$("$conda_cmd" env list 2>/dev/null \
+        | awk -v env_name="$CLASSIFYTE_ENV_NAME" '$1 == env_name {print $NF; exit}')"
+    [ -n "$CLASSIFYTE_PREFIX" ]
 }
 
-CLASSIFYTE_PREFIX="$(resolve_classifyte_prefix)" \
-    || error "Unable to locate Conda environment: $CLASSIFYTE_ENV_NAME"
+CLASSIFYTE_PREFIX=""
+resolve_classifyte_prefix || true
 if [ -z "$CLASSIFYTE_PREFIX" ]; then
-    error "Unable to locate Conda environment: $CLASSIFYTE_ENV_NAME. Set CLASSIFYTE_ENV_PREFIX if it is installed at a nonstandard path."
+    error "Unable to locate Conda environment: $CLASSIFYTE_ENV_NAME. Searched:${CLASSIFYTE_SEARCHED}
+Create it with 'conda env create -f environment-classifyte.yml', or set CLASSIFYTE_ENV_PREFIX to its absolute prefix (the directory containing bin/python)."
 fi
 CLASSIFYTE_PYTHON="$CLASSIFYTE_PREFIX/bin/python"
 if [ ! -x "$CLASSIFYTE_PYTHON" ]; then
