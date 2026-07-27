@@ -13,6 +13,7 @@ import bz2
 import tempfile
 import shlex
 import re
+import hashlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
@@ -69,6 +70,8 @@ Parameters:
     --te-looker-bin <string> Path to te-looker dtr binary. Default: TE_LOOKER_BIN or PATH.
     --te-looker-extra-args <string>
                              Extra arguments passed verbatim to "dtr run".
+    --te-looker-final-gated Request dtr's verified internal stitch/gate/merge path.
+                             Fails before discovery if the binary does not advertise it.
     --te-looker-w <int>      Default: 1 (exact: every k-mer). >1 subsamples k-mers to
                              ~2/(w+1) of their occurrences, cutting te-discover memory
                              roughly proportionally. This CHANGES the seed set, so it is
@@ -112,17 +115,15 @@ FILE_COMBINED_LIBRARY_LEGACY = 'raw_TEs_combined.fa'
 FILE_TE_LIBRARY_LEGACY = 'raw_TEs.fa'
 
 # --- TE-looker discovery post-processing -------------------------------------
-# The bundled `dtr` is a discovery-only core (te-discover A1 + te-refine spoa): it
-# emits one rough per-seed consensus per repetitive 16-mer with NO cross-seed family
-# merge and NO copy/TE gate. On a large, repeat-rich genome (e.g. maize, 2.4 Gb /
-# ~85% repeat) this inflates families.fasta to tens of thousands of redundant, offset
-# fragments (observed: 58,711 families / 97 MB), which then dominate the combined
-# library. The cross-seed merge + gating stages described in the TE-looker design spec
-# live only as prototypes and were never built into `dtr`. Until a gating `dtr` exists,
-# Pan_TE merges + gates the discovery output itself before Combine. A gated `dtr` build
-# is expected to write provenance.json; when present, its families.fasta is trusted
-# as-is and this post-processing is skipped.
-TE_LOOKER_PROVENANCE = 'provenance.json'  # marker of a gated (full) dtr run
+# A base dtr run emits de novo seed-derived consensi; when supplied, its Track 1
+# nhmmer recruitment adds HMM-supported members before refinement. Either source can
+# still contain offset fragments, so only a dtr --final-gated run that writes the explicit
+# TE_LOOKER_GATED_CONTRACT bypasses Pan_TE's bounded host-side stitch/gate/merge fallback.
+# A bare provenance.json is never sufficient: this prevents partial/corrupt state from
+# silently bypassing the only anti-inflation boundary.
+TE_LOOKER_PROVENANCE = 'provenance.json'
+TE_LOOKER_GATED_CONTRACT = 'te-looker-gated-v1'
+TE_LOOKER_HANDOFF_PROVENANCE = 'pan_te_handoff.json'
 TE_LOOKER_MIN_COPIES = 5                  # drop families with fewer recruited members
 TE_LOOKER_MIN_LEN = 100                   # drop consensi shorter than this (bp)
 TE_LOOKER_MERGE_IDENTITY = 0.80           # cd-hit-est identity for cross-seed merge
@@ -449,6 +450,10 @@ def parse_arguments():
                        type=str,
                        default='',
                        help='Extra arguments passed verbatim to dtr run')
+    parser.add_argument('--te-looker-final-gated',
+                       action='store_true',
+                       help='Require dtr internal stitch/gate/merge and its explicit '
+                            'te-looker-gated-v1 output contract')
     parser.add_argument('--te-looker-w',
                        type=int,
                        default=1,
@@ -568,6 +573,7 @@ class PanTEPipeline:
                  anno: bool = False,
                  te_looker_bin: Optional[str] = None,
                  te_looker_extra_args: str = '',
+                 te_looker_final_gated: bool = False,
                  te_looker_w: int = 1,
                  memory_limit_mb: int = 0):
         """Initialize the pipeline with configuration parameters."""
@@ -595,6 +601,7 @@ class PanTEPipeline:
         self.model_dir = os.path.abspath(model_dir) if model_dir else None
         self.te_looker_bin = os.path.abspath(te_looker_bin) if te_looker_bin else None
         self.te_looker_extra_args = te_looker_extra_args or ''
+        self.te_looker_final_gated = bool(te_looker_final_gated)
         self.te_looker_w = max(1, int(te_looker_w or 1))
         self.memory_limit_mb = int(memory_limit_mb or 0)
         self._dtr_caps: Optional[Dict] = None
@@ -1353,11 +1360,24 @@ class PanTEPipeline:
             # legacy parser, so passing it explicitly is safe either way.
             'supports_w': True,
             'stride_effective': version is not None and version >= TE_LOOKER_STRIDE_VERSION,
+            'final_gated': False,
             'double_copy': double_copy,
         }
+        # This feature has no safe version-only threshold because local dtr builds may
+        # carry the same package version with different staged subcommands. Probe the
+        # command's explicit help contract instead of guessing.
+        try:
+            help_proc = subprocess.run([dtr_bin, 'run', '--help'], capture_output=True,
+                                       encoding='utf-8', env=env, timeout=30)
+            help_text = (help_proc.stdout or '') + (help_proc.stderr or '')
+            self._dtr_caps['final_gated'] = (help_proc.returncode == 0
+                                              and '--final-gated' in help_text)
+        except (OSError, subprocess.SubprocessError):
+            pass
         label = '.'.join(str(v) for v in version) if version else 'pre-0.3.1 (no --version)'
         logger.info(f"dtr capability probe: version {label}, "
-                    f"seed-harvest holds {'two copies' if double_copy else 'one copy'}")
+                    f"seed-harvest holds {'two copies' if double_copy else 'one copy'}, "
+                    f"final-gated={'yes' if self._dtr_caps['final_gated'] else 'no'}")
         return self._dtr_caps
 
     def check_te_looker_memory(self, genome_bp: int, w: int, double_copy: bool) -> None:
@@ -1443,30 +1463,73 @@ class PanTEPipeline:
             env['PATH'] = os.pathsep.join(existing + [env.get('PATH', '')])
         return env
 
-    def _gate_and_merge_te_looker(self, families_fasta: str, work_dir: str) -> str:
-        """Merge + gate discovery-grade TE-looker output before Combine.
+    @staticmethod
+    def _fasta_summary(path: str) -> Dict[str, object]:
+        """Return content-addressed FASTA statistics for provenance."""
+        digest = hashlib.sha256()
+        count = bases = 0
+        with open(path, 'rb') as handle:
+            for raw in handle:
+                digest.update(raw)
+                if raw.startswith(b'>'):
+                    count += 1
+                else:
+                    bases += len(raw.strip())
+        return {'path': os.path.abspath(path), 'families': count,
+                'bases': bases, 'sha256': digest.hexdigest()}
 
-        The bundled `dtr` emits rough per-seed consensi with no cross-seed merge and
-        no copy/length gate. This (1) drops families below the copy/length floor and
-        (2) collapses cross-seed fragment redundancy with cd-hit-est, bringing the
-        library into the size range expected of a TE consensus set. Returns the path
-        to the gated+merged library (an empty file if nothing survives the gate).
-        """
+    @staticmethod
+    def _load_json_object(path: str) -> Optional[dict]:
+        try:
+            with open(path) as handle:
+                value = json.load(handle)
+            return value if isinstance(value, dict) else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _is_gated_dtr_output(self, provenance_path: str) -> bool:
+        """Trust dtr only when it declares the explicit final-output contract."""
+        payload = self._load_json_object(provenance_path)
+        if payload is None:
+            if os.path.exists(provenance_path):
+                logger.warning("Ignoring unreadable dtr provenance: %s", provenance_path)
+            return False
+        valid = (payload.get('contract') == TE_LOOKER_GATED_CONTRACT
+                 and payload.get('mode') == 'gated'
+                 and payload.get('final_library') == 'families.fasta')
+        if not valid:
+            logger.warning("dtr provenance does not declare %s; applying Pan_TE discovery gate",
+                           TE_LOOKER_GATED_CONTRACT)
+        return valid
+
+    @staticmethod
+    def _write_te_looker_handoff(path: str, payload: Dict[str, object]) -> None:
+        """Atomically write Pan_TE's stable TE-looker handoff provenance."""
+        temp_path = path + '.tmp'
+        with open(temp_path, 'w') as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+        os.replace(temp_path, path)
+
+    def _gate_and_merge_te_looker(self, families_fasta: str, work_dir: str):
+        """Gate discovery dtr families and return (library_path, audit)."""
         gated = os.path.join(work_dir, 'discovery_gated.fa')
         merged = os.path.join(work_dir, 'discovery_merged.fa')
-
-        # (1) copy/length gate — read members= from header, seq length from sequence
-        kept = dropped = 0
+        kept = dropped = missing_members = 0
         header = None
         seq_parts: list = []
 
         def _flush(fout):
-            nonlocal kept, dropped
+            nonlocal kept, dropped, missing_members
             if header is None:
                 return
             seq = ''.join(seq_parts)
-            m = re.search(r'members=(\d+)', header)
-            members = int(m.group(1)) if m else TE_LOOKER_MIN_COPIES
+            match = re.search(r'members=(\d+)', header)
+            if match is None:
+                members = TE_LOOKER_MIN_COPIES
+                missing_members += 1
+            else:
+                members = int(match.group(1))
             if members >= TE_LOOKER_MIN_COPIES and len(seq) >= TE_LOOKER_MIN_LEN:
                 fout.write(header + '\n')
                 for i in range(0, len(seq), 80):
@@ -1479,30 +1542,35 @@ class PanTEPipeline:
             for line in fin:
                 if line.startswith('>'):
                     _flush(fout)
-                    header = line.rstrip('\n')
-                    seq_parts = []
+                    header, seq_parts = line.rstrip('\n'), []
                 else:
                     seq_parts.append(line.strip())
             _flush(fout)
-        logger.info(
-            f"TE-looker gate (members>={TE_LOOKER_MIN_COPIES}, "
-            f"len>={TE_LOOKER_MIN_LEN}bp): kept {kept}, dropped {dropped}"
-        )
+        logger.info("TE-looker gate (members>=%d, len>=%dbp): kept %d, dropped %d",
+                    TE_LOOKER_MIN_COPIES, TE_LOOKER_MIN_LEN, kept, dropped)
+        audit = {
+            'mode': 'discovery_host_gate',
+            'input': self._fasta_summary(families_fasta),
+            'copy_length_gate': {
+                'min_members': TE_LOOKER_MIN_COPIES,
+                'min_length_bp': TE_LOOKER_MIN_LEN,
+                'kept': kept, 'dropped': dropped,
+                'headers_missing_members_assumed_minimum': missing_members,
+            },
+            'merge': {'tool': 'cd-hit-est', 'identity': TE_LOOKER_MERGE_IDENTITY,
+                      'shorter_coverage': 0.6, 'both_strands': True},
+        }
         if kept == 0:
             logger.warning("TE-looker gate left no families; merged library is empty")
             Path(merged).touch()
-            return merged
-
-        # (2) cross-seed merge — cd-hit-est collapses the offset-fragment redundancy
-        # that the per-seed A1 discovery leaves behind (the 0.9 dedup in Combine is too
-        # tight to merge partial/offset consensi of the same element).
-        self.run_cmd(
-            f"cd-hit-est -i {q(gated)} -o {q(merged)} "
-            f"-c {TE_LOOKER_MERGE_IDENTITY} -aS 0.6 -n 5 -r 1 -g 1 -d 0 "
-            f"-M 0 -T {self.threads}",
-            work_dir
-        )
-        return merged
+        else:
+            self.run_cmd(
+                f"cd-hit-est -i {q(gated)} -o {q(merged)} "
+                f"-c {TE_LOOKER_MERGE_IDENTITY} -aS 0.6 -n 5 -r 1 -g 1 -d 0 "
+                f"-M 0 -T {self.threads}", work_dir)
+        audit['gated'] = self._fasta_summary(gated)
+        audit['output'] = self._fasta_summary(merged)
+        return merged, audit
 
     def process_te_looker(self):
         """Step 4: Process TE-looker."""
@@ -1524,12 +1592,27 @@ class PanTEPipeline:
         te_looker_families = os.path.join(te_run_dir, 'families.fasta')
         need_discovery = not (os.path.exists(te_looker_families)
                               and os.path.getsize(te_looker_families) > 0)
+        if self.te_looker_final_gated and not need_discovery:
+            existing_contract = self._is_gated_dtr_output(
+                os.path.join(te_run_dir, TE_LOOKER_PROVENANCE))
+            if not existing_contract:
+                need_discovery = True
+                logger.info("TE-looker final-gated requested; existing discovery output "
+                            "has no final contract, so dtr will regenerate it")
         if not need_discovery:
             logger.info(f"TE-looker resume: reusing existing {te_looker_families}; "
                         f"skipping dtr discovery, re-applying gate only")
 
         dtr_bin = self.resolve_te_looker_bin()
+        dtr_env = self.te_looker_env(dtr_bin)
+        caps = self.probe_dtr_capabilities(dtr_bin, dtr_env)
         extra_tokens = shlex.split(self.te_looker_extra_args)
+        final_requested = self.te_looker_final_gated or '--final-gated' in extra_tokens
+        if final_requested and not caps['final_gated']:
+            raise RuntimeError(
+                'The selected dtr does not advertise --final-gated; rebuild the staged '
+                'te-looker dtr or omit --te-looker-final-gated to use the host fallback.'
+            )
         cmd_parts = [
             q(dtr_bin),
             'run',
@@ -1537,6 +1620,8 @@ class PanTEPipeline:
             '--out', q(te_run_dir),
             '--threads', str(self.threads),
         ]
+        if final_requested and '--final-gated' not in extra_tokens:
+            cmd_parts.append('--final-gated')
 
         # Auto-feed mdl-repeat consensus → Track 1 nhmmer HMM library.
         # This replaces the older --track2-library seeding: HMM profile search
@@ -1581,7 +1666,6 @@ class PanTEPipeline:
                 )
 
         genome_bp = self.get_genome_size_bp()
-        caps = self.probe_dtr_capabilities(dtr_bin, self.te_looker_env(dtr_bin))
 
         # --w is the real memory/throughput lever (te_core::harvest emits every k-mer at
         # w=1, minimizers at ~2/(w+1) density above it). Pan_TE previously auto-scaled
@@ -1631,8 +1715,7 @@ class PanTEPipeline:
         if need_discovery:
             if self.te_looker_extra_args:
                 cmd_parts.append(self.te_looker_extra_args)
-            result = self.run_cmd(' '.join(cmd_parts), te_stage_dir,
-                                  env=self.te_looker_env(dtr_bin))
+            result = self.run_cmd(' '.join(cmd_parts), te_stage_dir, env=dtr_env)
             # run_cmd only shows stderr when a command fails, so dtr's notices about
             # flags it accepted-but-ignored were invisible on success. Promote them:
             # an ignored knob must never again look like a working one.
@@ -1647,58 +1730,75 @@ class PanTEPipeline:
                     f"TE-looker completed but required output is missing: {te_looker_families}"
                 )
 
-        # Fragment-chain stitching (discovery-grade only). The discovery dtr emits one real
-        # element as several co-linear fragment families; stitch them into full-length
-        # consensi BEFORE the gate so the library is full-length, not many short pieces.
-        # Uses disc.members.bed + reuses Refiner_mdl's extract+MSA. Non-fatal on failure.
+        # A bare provenance.json does not prove that a future dtr performed its
+        # advertised final gates.  The explicit contract is the compatibility boundary.
+        provenance = os.path.join(te_run_dir, TE_LOOKER_PROVENANCE)
+        dtr_gated = self._is_gated_dtr_output(provenance)
+        source_summary = self._fasta_summary(te_looker_families)
+        stitch_audit = {'attempted': False, 'status': 'not_needed' if dtr_gated else 'not_available'}
+
+        # Fragment-chain stitching is discovery-only. It is deliberately non-fatal: a
+        # failed reconstruction must never fabricate a consensus or prevent the bounded
+        # copy/length + redundancy gate from protecting the final library.
         disc_members_bed = os.path.join(te_run_dir, 'disc.members.bed')
-        if (os.path.exists(te_looker_families)
-                and os.path.getsize(te_looker_families) > 0
-                and not os.path.exists(os.path.join(te_run_dir, TE_LOOKER_PROVENANCE))
+        if (not dtr_gated and os.path.getsize(te_looker_families) > 0
                 and os.path.exists(disc_members_bed)
                 and os.path.getsize(disc_members_bed) > 0):
+            stitch_audit = {'attempted': True, 'status': 'failed',
+                            'members_bed': os.path.abspath(disc_members_bed)}
             try:
                 import fragment_stitcher
                 stitched_fa = os.path.join(te_run_dir, 'families_stitched.fasta')
-                before = count_fasta_sequences(te_looker_families)
                 logger.info("TE-looker fragment-chain stitching (pre-gate)...")
                 fragment_stitcher.stitch_te_looker(
-                    te_looker_families, disc_members_bed,
-                    te_looker_genome, stitched_fa)
+                    te_looker_families, disc_members_bed, te_looker_genome, stitched_fa)
                 if os.path.exists(stitched_fa) and os.path.getsize(stitched_fa) > 0:
-                    after = count_fasta_sequences(stitched_fa)
-                    logger.info(f"TE-looker stitched: {before} -> {after} families")
+                    stitch_audit.update({'status': 'used',
+                                         'input': self._fasta_summary(te_looker_families),
+                                         'output': self._fasta_summary(stitched_fa)})
                     te_looker_families = stitched_fa
-            except Exception as e:
-                logger.warning(f"TE-looker fragment stitching failed "
-                               f"(continuing unstitched): {e}")
+                else:
+                    stitch_audit['reason'] = 'no_nonempty_stitched_output'
+            except Exception as exc:
+                stitch_audit['reason'] = str(exc)
+                logger.warning("TE-looker fragment stitching failed (continuing unstitched): %s", exc)
 
-        # Integrity gate. A gated (full) dtr writes provenance.json and its families.fasta
-        # is final. A discovery-only dtr does not, and its raw per-seed consensi must be
-        # merged + gated here before Combine — otherwise tens of thousands of redundant
-        # fragments dominate the library (see TE_LOOKER_* notes above).
         final_consensus = os.path.join(te_stage_dir, FILE_CONSENSUS)
         legacy_consensus = os.path.join(te_stage_dir, FILE_CONSENSUS_LEGACY)
-        provenance = os.path.join(te_run_dir, TE_LOOKER_PROVENANCE)
-
+        handoff = {
+            'schema': 'pan-te-te-looker-handoff-v1',
+            'dtr_provenance_path': os.path.abspath(provenance),
+            'dtr_declared_gated': dtr_gated,
+            'discovery_source': source_summary,
+            'stitch': stitch_audit,
+        }
         if os.path.getsize(te_looker_families) == 0:
             Path(final_consensus).touch()
+            handoff['mode'] = 'empty'
             logger.warning("TE-looker produced an empty families.fasta")
-        elif os.path.exists(provenance):
-            logger.info("TE-looker output is gated (provenance.json present); using as-is")
+        elif dtr_gated:
+            handoff['mode'] = 'gated_dtr'
+            logger.info("TE-looker output declares %s; using dtr final library", TE_LOOKER_GATED_CONTRACT)
             shutil.copyfile(te_looker_families, final_consensus)
         else:
+            handoff['mode'] = 'discovery_host_gate'
             raw_count = count_fasta_sequences(te_looker_families)
-            logger.info(
-                f"TE-looker output is discovery-grade (no {TE_LOOKER_PROVENANCE}); "
-                f"merging + gating {raw_count} raw families before Combine"
-            )
-            merged = self._gate_and_merge_te_looker(te_looker_families, te_run_dir)
+            logger.info("TE-looker output is discovery-grade; merging + gating %d families before Combine",
+                        raw_count)
+            merged, gate_audit = self._gate_and_merge_te_looker(te_looker_families, te_run_dir)
+            handoff['gate'] = gate_audit
             if os.path.getsize(merged) > 0:
                 shutil.copyfile(merged, final_consensus)
             else:
                 Path(final_consensus).touch()
         shutil.copyfile(final_consensus, legacy_consensus)
+        handoff['final_library'] = self._fasta_summary(final_consensus)
+        handoff['sanity'] = {
+            'max_families_per_mb': TE_LOOKER_SANITY_FAMILIES_PER_MB,
+            'genome_mb': self.get_genome_size_bp() / 1e6,
+        }
+        self._write_te_looker_handoff(
+            os.path.join(te_run_dir, TE_LOOKER_HANDOFF_PROVENANCE), handoff)
 
         count = count_fasta_sequences(final_consensus)
         logger.info(f"TE-looker consensus library: {count} families")
@@ -1913,6 +2013,7 @@ def main():
             anno=args.anno,
             te_looker_bin=args.te_looker_bin,
             te_looker_extra_args=args.te_looker_extra_args,
+            te_looker_final_gated=args.te_looker_final_gated,
             te_looker_w=args.te_looker_w,
             memory_limit_mb=args.M
         )

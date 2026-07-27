@@ -40,15 +40,15 @@ CORE_TOOLS: List[Tuple[str, str, str, Tuple[str, ...]]] = [
     ('RepeatMasker', 'Step 3 (Refiner)',    'bioconda::repeatmasker',  ('mdl_repeat', 'anno')),
     ('dtr',          'Step 4 (te-looker)',  'bioconda::te-looker',     ('te_looker',)),
     ('hmmbuild',     'Step 4 (te-looker)',  'bioconda::hmmer',         ('te_looker',)),
+    ('nhmmer',       'Step 4 (te-looker Track 1)', 'bioconda::hmmer',  ('te_looker',)),
+    ('spoa',         'Step 4 (te-looker refine)', 'bioconda::spoa',   ('te_looker',)),
     ('cd-hit-est',   'Step 5 (Combine)',    'bioconda::cd-hit',        ('te_looker', 'combine')),
 ]
 
 # Used by optional/rescue paths. Their absence degrades a specific feature rather than
 # stopping the run, so they warn instead of failing.
 OPTIONAL_TOOLS: List[Tuple[str, str, str, Tuple[str, ...]]] = [
-    ('nhmmer',   'te-looker boundary refine',  'bioconda::hmmer',    ('te_looker',)),
     ('sourmash', 'te-looker Track 2',          'bioconda::sourmash', ('te_looker',)),
-    ('spoa',     'te-looker consensus refine', 'bioconda::spoa',     ('te_looker',)),
     ('iqtree',   'te-looker family merger',    'bioconda::iqtree',   ('te_looker',)),
     ('TEsorter', 'Refiner_mdl rescue',         'bioconda::tesorter', ('mdl_repeat',)),
     ('barrnap',  'non-TE separation',          'bioconda::barrnap',  ('mdl_repeat',)),
