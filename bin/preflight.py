@@ -56,6 +56,12 @@ OPTIONAL_TOOLS: List[Tuple[str, str, str, Tuple[str, ...]]] = [
 
 CLASSIFIER_TOOLS: List[Tuple[str, str, str, Tuple[str, ...]]] = [
     ('RepeatClassifier', 'Step 5 (classification)', 'bioconda::repeatmodeler', ('combine',)),
+    # ClassifyTE's feature step runs kanalyze under `java` and compiles its collector
+    # with `javac`, so it needs a full JDK -- not a JRE. Nothing declared this before,
+    # and an unusable JDK shows up only as per-sequence "No such file or directory"
+    # errors from the Java collector after hours of k-mer work.
+    ('java',  'Step 5 (ClassifyTE kanalyze)', 'conda-forge::openjdk', ('combine',)),
+    ('javac', 'Step 5 (ClassifyTE collector)', 'conda-forge::openjdk', ('combine',)),
 ]
 
 PERL_MODULES: List[Tuple[str, str, str, Tuple[str, ...]]] = [

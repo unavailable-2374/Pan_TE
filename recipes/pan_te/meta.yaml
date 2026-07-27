@@ -48,6 +48,7 @@ requirements:
     # --- repeat masking / classification ---
     - repeatmasker
     - repeatmodeler
+    - openjdk                     # ClassifyTE kanalyze (java) + feature collector (javac)
     - trf
     # --- profile HMM / k-mer / phylo / structural ---
     - hmmer

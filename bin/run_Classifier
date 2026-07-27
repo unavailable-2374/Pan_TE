@@ -211,22 +211,52 @@ CT_PID=$!
 # Wait for both processes to complete
 log "Waiting for classification processes to complete..."
 
-wait_with_timeout() {
-    local pid=$1
-    local timeout=7200  # 2 hours timeout
-    local count=0
-    while kill -0 $pid 2>/dev/null; do
-        sleep 10
-        count=$((count + 10))
-        if [ $count -ge $timeout ]; then
-            kill $pid 2>/dev/null || true
-            error "Process $pid timed out after $timeout seconds"
+# ClassifyTE's k-mer step launches THREE JVMs per sequence (kanalyze counts 2-, 3- and
+# 4-mers separately), so its runtime is proportional to the library size -- a library of
+# 8.5k consensi means >25k JVM starts. A constant 2-hour ceiling therefore kills large
+# but perfectly healthy runs. Scale the hang guard with the sequence count and let the
+# operator override it outright. This is a guard against a hung process, not a budget.
+TE_SEQ_COUNT="$(grep -c '^>' "$TE_LIBRARY" 2>/dev/null || echo 0)"
+CLASSIFYTE_TIMEOUT="${CLASSIFYTE_TIMEOUT:-$(( 7200 > TE_SEQ_COUNT * 2 ? 7200 : TE_SEQ_COUNT * 2 ))}"
+log "Classification hang guard: ${CLASSIFYTE_TIMEOUT}s for $TE_SEQ_COUNT sequences (override with CLASSIFYTE_TIMEOUT)"
+
+# How many per-sequence k-mer outputs kanalyze failed to produce. A missing file here is
+# the usual sign that `java` is unusable (ClassifyTE needs a JDK, which nothing declares
+# as a dependency), and it otherwise surfaces only as one buried stderr line per sequence
+# from the Java collector, hours later.
+report_kmer_gaps() {
+    local kdir="sup_features/kanalyze-2.0.0/output_data"
+    local expected="$TE_SEQ_COUNT" produced=0 k=""
+    [ -d "$kdir" ] || return 0
+    for k in 2mer 3mer 4mer; do
+        [ -d "$kdir/$k" ] || continue
+        produced=$(find "$kdir/$k" -name '*.txt' 2>/dev/null | wc -l)
+        if [ "$expected" -gt 0 ] && [ "$produced" -lt "$expected" ]; then
+            log "  kanalyze $k: $produced/$expected outputs present ($(( expected - produced )) missing)"
         fi
     done
 }
 
-wait_with_timeout $RC_PID
-wait_with_timeout $CT_PID
+wait_with_timeout() {
+    local pid=$1
+    local label=$2
+    local count=0
+    while kill -0 $pid 2>/dev/null; do
+        sleep 10
+        count=$((count + 10))
+        if [ $count -ge "$CLASSIFYTE_TIMEOUT" ]; then
+            kill $pid 2>/dev/null || true
+            log "$label exceeded ${CLASSIFYTE_TIMEOUT}s; k-mer output status:"
+            report_kmer_gaps
+            error "$label (pid $pid) timed out after ${CLASSIFYTE_TIMEOUT}s. If the run was
+merely slow, raise CLASSIFYTE_TIMEOUT. If k-mer outputs are missing above, check that a
+JDK is usable ('java -version' and 'javac -version'): ClassifyTE's kanalyze step needs one."
+        fi
+    done
+}
+
+wait_with_timeout $RC_PID "RepeatClassifier"
+wait_with_timeout $CT_PID "ClassifyTE feature generation/evaluation"
 
 # Check if both processes completed successfully
 if [ ! -f "$RC_DONE" ] || [ ! -f "$CT_DONE" ]; then

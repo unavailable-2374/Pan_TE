@@ -54,6 +54,10 @@ dependencies:
   # --- repeat masking / classification ---
   - repeatmasker      # RepeatMasker + dustmasker/trf integration
   - repeatmodeler     # provides RepeatClassifier (run_Classifier)
+  - openjdk           # ClassifyTE's kanalyze k-mer step runs under `java` and its
+                      # feature collector is compiled with `javac` -- a JDK, not a JRE.
+                      # Lives here (not environment-classifyte.yml) because run_Classifier
+                      # invokes ClassifyTE's Python directly, inheriting THIS env's PATH.
   - trf               # tandem-repeat finder (build_mdl masking, non-TE separation)
 
   # --- profile HMM (Track-1 seed build + boundary refine) ---
