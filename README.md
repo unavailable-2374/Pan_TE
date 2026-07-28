@@ -81,8 +81,13 @@ at <https://www.dfam.org/releases/>.)
     Pan_TE --gfa pangenome.rgfa --gfa-gaf assemblies_to_graph.gaf \
         --gfa-gaf-fasta assemblies.fa --threads 80
 
-    # Also annotate every GFA node and produce a per-sample presence matrix
-    Pan_TE --gfa pangenome.gfa --anno --threads 80 --model-dir /path/to/ClassifyTE
+    # Project existing per-genome RepeatMasker/GFF3 annotations onto every GFA node
+    Pan_TE --gfa pangenome.gfa --anno-only \
+        --anno-manifest annotations.tsv --out-dir graph_annotation
+
+    # The same annotation projection for minigraph rGFA additionally uses GAF
+    Pan_TE --gfa pangenome.rgfa --gfa-gaf assemblies_to_graph.gaf \
+        --anno-only --anno-manifest annotations.tsv --out-dir graph_annotation
 
     # Enrichment (reference genome + pan-genome insertions)
     Pan_TE --genome ref.fasta --paf all_vs_all.paf --paf-fasta assemblies.fa --threads 80
@@ -101,12 +106,14 @@ at <https://www.dfam.org/releases/>.)
 | `--paf-mapping <tsv>` | Optional chromosome mapping (seqname, assembly_id, chr_id). |
 | `--gfa <file>` / `--gfa-ref <name>` | Pangenome graph (rGFA / PGGB smoothxg); reference sample/path auto-detected if omitted. rGFA default allele mode requires `--gfa-gaf`. |
 | `--gfa-mode {alleles,legacy}` | `alleles` (default) uses PGGB paths or rGFA+GAF to extract locus-aware alternates; `legacy` retains the historical topology walker and is not sample-aware. |
-| `--gfa-gaf <file>` / `--gfa-gaf-fasta <fa>` | Primary minigraph GAF and its query FASTA. Required for default rGFA allele extraction; FASTA names/lengths are validated against GAF. |
+| `--gfa-gaf <file>` / `--gfa-gaf-fasta <fa>` | Primary minigraph GAF and its query FASTA. Required for default rGFA allele extraction and recommended for all-genome rGFA annotation. Annotation resolves node-ID walks, source-coordinate walks and named source paths, and transforms gapped `cg` CIGAR coordinates exactly. |
 | `--gfa-gaf-min-mapq <n>` / `--gfa-gaf-min-identity <f>` | Quality thresholds for rGFA candidate and presence calls (defaults: 20 and 0.90). |
 | `--gfa-window-overlap <bp>` | Overlap for alleles longer than 30 kb (default 1000). Terminal windows are shifted so no sub-100-bp tail is lost. |
 | `--gfa-spacer-length <bp>` | Artificial N spacer between packed candidates (default 0, so every allele is an independent FASTA record). |
 | `--gfa-clean-intermediates` | Remove candidate FASTA intermediates after writing the provenance manifest and summary. |
-| `--anno` | After building the TE library, run sensitive RepeatMasker (`-s`) on GFA P/W path contexts and write node-level TE coverage plus per-sample presence. rGFA without P/W uses `--gfa-gaf`: node columns are conservative `1/NA`, while locus calls are `0/1/NA`. Default simple/low-complexity hits absent from `combine/TEs.fa` are excluded. Requires `--gfa`. |
+| `--anno` / `--anno-manifest <tsv>` | Project every supplied genome's existing TE annotation and optional gene GFF3 onto GFA node coordinates. This does not run RepeatMasker and does not use `combine/TEs.fa`. |
+| `--anno-only` | Run only the all-genome GFA annotation stage, skipping TE-library discovery. |
+| `--anno-te-min-fraction <f>` / `--anno-partial-min-fraction <f>` | Node/occurrence TE and PartialTE coverage thresholds (defaults 0.80 and 0.10). |
 | `--vcf-dir <dir>` | Directory of `.vcf`/`.vcf.gz` structural variants to fold into `--genome`. Explicit ALT insertions and symbolic insertions with `SVINSSEQ`, `INSSEQ`, `SEQ`, or `CONSENSUS` are supported. |
 | `--te-looker-bin <path>` / `--te-looker-extra-args "<args>"` | Override the `dtr` binary / pass extra args to `dtr run`. |
 | `--te-looker-w <int>` | te-discover minimizer window, default 1 (exact: every k-mer). Values >1 emit only ~`2/(w+1)` of k-mer occurrences, cutting memory roughly proportionally — but they **change the seed set**, so this is opt-in only and `--min-count` is re-derived to match. |
@@ -124,22 +131,25 @@ at <https://www.dfam.org/releases/>.)
 - `genome/gfa_enrichment/gfa_rgfa_locus_presence.tsv` — rGFA candidate-locus `0/1/NA` matrix. The SR=0 reference sample is fixed to `0`; other `0` calls require one quality GAF record spanning both candidate anchors; unresolved/overlapping calls remain `NA`.
 - `genome/gfa_enrichment/gfa_unique_locus_alleles.fa` — exact locus-aware representative sequences before QC (kept by default).
 - `genome/gfa_enrichment/gfa_processing_stats.json` — graph, allele, deduplication, QC, and artificial-spacer statistics.
-- `anno/gfa_node_annotations.tsv` — one row per GFA node, including TE-covered/uncovered bp, coverage fraction, annotation status, and sample columns. P/W graphs use 0/1; rGFA+GAF uses conservative 1/NA node evidence.
-- `anno/gfa_rgfa_node_presence.tsv` — long-form complete-node GAF traversal evidence for rGFA.
-- `anno/gfa_node_te_hits.tsv` — every RepeatMasker hit projected to 0-based, half-open node coordinates.
-- `anno/gfa_path_node_map.tsv` — auditable mapping from RepeatMasker path contexts back to GFA nodes.
+- `anno/gfa_node_annotation_intervals.tsv` — authoritative projected feature intervals in 0-based, half-open node coordinates.
+- `anno/gfa_node_occurrence_annotations.tsv` — one row per node occurrence with genome/node coordinates, evidence, callability and TE coverage.
+- `anno/gfa_node_annotations.tsv` — one row per node with `TE`, `PartialTE`, `Mixed`, `GeneStructure`, `NonTE`, `Conflict`, or `Unknown` identity and per-sample states.
+- `anno/gfa_node_sample_matrix.tsv` — long-form node × sample state matrix.
+- `anno/gfa_node_annotation.gff3` — projected node-local features in GFF3 coordinates.
+- `anno/gfa_node_annotation_conflicts.tsv` / `gfa_annotation_unresolved.tsv` — TE–CDS conflicts and records that could not be projected exactly.
+- `anno/pangenome.annotated.gfa` — original graph with `ai`, `it`, `tf`, `tc`, `fm`, `gs`, and `cf` tags on S records.
+- `anno/gfa_annotation_provenance.json` — input checksums, thresholds, graph mode, counts, coordinate contract and missing-data semantics.
 
-Reference-path validation against an independent RepeatMasker run can be performed with:
-
-    python bin/compare_gfa_reference_annotation.py \
-        --gfa pangenome.gfa --reference-fasta reference.fa \
-        --node-hits anno/gfa_node_te_hits.tsv \
-        --direct-out reference.fa.out --repeat-library combine/TEs.fa \
-        --out-dir anno/reference_comparison
-
-The comparison verifies every `SR:i:0` node against its `SN`/`SO` reference
-substring (including orientation), filters the direct run to custom-library
-families, and reports coverage differences, class/family agreement, and direct-hit fragmentation.
+The manifest is tab-delimited with one row per sample/haplotype. `sample` is
+required; `haplotype` defaults to `0`. Supply at least one of `gff3` or
+`te_annotation` (RepeatMasker `.out`, BED, or TE GFF3). Optional columns are
+`fasta`, `path_prefix`, `gaf`, `seqid_map`, and `annotation_complete`. Set
+`annotation_complete=true` only when the TE annotation is genome-wide complete;
+a gene-only GFF3 does not make an unannotated interval TE-negative.
+Relative paths are resolved from the manifest directory. A PanSN seqid such as
+`sample#1#Chr1` is normalized automatically; arbitrary annotation/graph names
+can be connected with a two-column `seqid_map`. See
+`docs/gfa_annotation_manifest.example.tsv`.
 
 ## PGGB scaling model
 

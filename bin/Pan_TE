@@ -22,7 +22,7 @@ from paf_processor import PAFProcessor, count_fasta_sequences
 from gfa_processor import GfaProcessor
 from gfa_annotator import GfaAnnotator
 
-VERSION = '1.1.1'
+VERSION = '1.2.0'
 
 # Usage and help message
 USAGE = f'''Usage:
@@ -65,7 +65,13 @@ Parameters:
                              N spacer between packed candidates; default: 0 (separate records).
     --gfa-clean-intermediates
                              Remove candidate FASTA intermediates after manifest generation.
-    --anno                   Annotate GFA nodes with RepeatMasker and output sample presence (requires --gfa).
+    --anno                   Project all-genome TE/GFF3 annotations onto GFA nodes (requires --gfa and --anno-manifest).
+    --anno-only              Run only the new annotation-projection stage; skip TE-library discovery.
+    --anno-manifest <tsv>    Per-sample/haplotype annotation manifest; replaces the legacy RepeatMasker anno mode.
+    --anno-te-min-fraction <float>
+                             Minimum TE-covered fraction for a node/occurrence TE call; default: 0.80.
+    --anno-partial-min-fraction <float>
+                             Minimum TE-covered fraction for PartialTE; default: 0.10.
     --out-dir <string>       Default: current directory. The work directory.
     --te-looker-bin <string> Path to te-looker dtr binary. Default: TE_LOOKER_BIN or PATH.
     --te-looker-extra-args <string>
@@ -437,7 +443,19 @@ def parse_arguments():
                        help='Remove candidate FASTA intermediates after processing')
     parser.add_argument('--anno',
                        action='store_true',
-                       help='Annotate GFA nodes with RepeatMasker and sample presence')
+                       help='Project all-genome TE/GFF3 annotations onto GFA nodes')
+    parser.add_argument('--anno-only',
+                       action='store_true',
+                       help='Run only all-genome annotation projection')
+    parser.add_argument('--anno-manifest',
+                       type=str,
+                       help='TSV manifest of per-genome GFF3/TE annotations')
+    parser.add_argument('--anno-te-min-fraction',
+                       type=float, default=0.80,
+                       help='Minimum TE-covered fraction for a TE call')
+    parser.add_argument('--anno-partial-min-fraction',
+                       type=float, default=0.10,
+                       help='Minimum TE-covered fraction for a PartialTE call')
     parser.add_argument('--out-dir', '--out',
                        dest='out_dir',
                        type=str,
@@ -483,6 +501,11 @@ def parse_arguments():
                        help='Display help information')
     
     args = parser.parse_args()
+
+    if args.anno_only:
+        args.anno = True
+    if args.anno_only and args.check_env:
+        parser.error('--anno-only and --check-env are mutually exclusive')
 
     if args.threads < 1:
         parser.error('--threads must be a positive integer')
@@ -543,6 +566,14 @@ def parse_arguments():
         parser.error('--gfa-spacer-length must be non-negative')
     if args.anno and not args.gfa:
         parser.error('--anno requires --gfa')
+    if args.anno and not args.anno_manifest:
+        parser.error('--anno requires --anno-manifest')
+    if args.anno_manifest and not args.anno:
+        parser.error('--anno-manifest requires --anno')
+    if args.anno_manifest and not os.path.isfile(args.anno_manifest):
+        parser.error(f'Annotation manifest not found: {args.anno_manifest}')
+    if not (0 <= args.anno_partial_min_fraction <= args.anno_te_min_fraction <= 1):
+        parser.error('annotation fractions must satisfy 0 <= partial <= TE <= 1')
 
     if args.vcf_dir:
         if not args.genome:
@@ -571,6 +602,9 @@ class PanTEPipeline:
                  gfa_gaf_min_mapq: int = 20,
                  gfa_gaf_min_identity: float = 0.90,
                  anno: bool = False,
+                 anno_manifest: Optional[str] = None,
+                 anno_te_min_fraction: float = 0.80,
+                 anno_partial_min_fraction: float = 0.10,
                  te_looker_bin: Optional[str] = None,
                  te_looker_extra_args: str = '',
                  te_looker_final_gated: bool = False,
@@ -596,6 +630,10 @@ class PanTEPipeline:
         self.gfa_gaf_min_mapq = int(gfa_gaf_min_mapq)
         self.gfa_gaf_min_identity = float(gfa_gaf_min_identity)
         self.anno_enabled = bool(anno)
+        self.anno_manifest = (os.path.abspath(anno_manifest)
+                              if anno_manifest else None)
+        self.anno_te_min_fraction = float(anno_te_min_fraction)
+        self.anno_partial_min_fraction = float(anno_partial_min_fraction)
         self.output_dir = os.path.abspath(output_dir)
         self.threads = threads
         self.model_dir = os.path.abspath(model_dir) if model_dir else None
@@ -1907,34 +1945,20 @@ class PanTEPipeline:
         logger.info("Combine done")
 
     def annotate_gfa(self):
-        """Annotate GFA nodes after the final Pan_TE library is available."""
-        if self.check_checkpoint('anno'):
-            return
-
-        combine_dir = self.stage_dir(DIR_COMBINE, DIR_COMBINE_LEGACY)
-        library_candidates = [
-            os.path.join(combine_dir, 'TEs.fa'),
-            os.path.join(combine_dir, FILE_TE_LIBRARY),
-            os.path.join(combine_dir, FILE_TE_LIBRARY_LEGACY),
-        ]
-        te_library = next(
-            (path for path in library_candidates
-             if os.path.isfile(path) and os.path.getsize(path) > 0),
-            None)
-        if not te_library:
-            raise FileNotFoundError(
-                "No final TE library found for --anno; run the combine stage first")
+        """Project all supplied genome annotations onto GFA node coordinates."""
+        if not self.anno_manifest:
+            raise ValueError("--anno requires an all-genome --anno-manifest")
 
         anno_dir = os.path.join(self.output_dir, DIR_ANNO)
         annotator = GfaAnnotator(
             gfa_file=self.gfa_file,
             output_dir=anno_dir,
-            te_library=te_library,
-            threads=self.threads,
+            annotation_manifest=self.anno_manifest,
             gfa_gaf=self.gfa_gaf,
-            gfa_gaf_fasta=self.gfa_gaf_fasta,
             gfa_gaf_min_mapq=self.gfa_gaf_min_mapq,
             gfa_gaf_min_identity=self.gfa_gaf_min_identity,
+            te_min_fraction=self.anno_te_min_fraction,
+            partial_min_fraction=self.anno_partial_min_fraction,
         )
         result = annotator.annotate()
         self.create_checkpoint('anno')
@@ -2011,6 +2035,9 @@ def main():
             gfa_gaf_min_mapq=args.gfa_gaf_min_mapq,
             gfa_gaf_min_identity=args.gfa_gaf_min_identity,
             anno=args.anno,
+            anno_manifest=args.anno_manifest,
+            anno_te_min_fraction=args.anno_te_min_fraction,
+            anno_partial_min_fraction=args.anno_partial_min_fraction,
             te_looker_bin=args.te_looker_bin,
             te_looker_extra_args=args.te_looker_extra_args,
             te_looker_final_gated=args.te_looker_final_gated,
@@ -2021,6 +2048,12 @@ def main():
         if args.M > 0:
             import resource
             resource.setrlimit(resource.RLIMIT_AS, (args.M * 1024 * 1024, -1))
+
+        if args.anno_only:
+            pipeline.setup_directories()
+            pipeline.annotate_gfa()
+            logger.info("GFA annotation-only run completed successfully")
+            return
 
         # Verify the environment before any long-running step. Every dependency the
         # requested run will need is checked in one pass, so a missing tool or an

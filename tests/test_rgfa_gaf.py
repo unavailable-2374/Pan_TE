@@ -7,7 +7,6 @@ from pathlib import Path
 BIN = Path(__file__).resolve().parents[1] / "bin"
 sys.path.insert(0, str(BIN))
 
-from gfa_annotator import GfaAnnotator
 from gfa_processor import GfaProcessor
 from rgfa_gaf import (RgfaGafCallStore, RgfaGafError,
                       derive_rgfa_node_presence, extract_rgfa_gaf_alleles,
@@ -158,25 +157,6 @@ class RgfaGafTests(unittest.TestCase):
                 extract_rgfa_gaf_alleles(
                     str(graph), str(gaf), min_size=3, window_size=30,
                     query_fasta=str(fasta))
-
-    def test_annotator_writes_na_not_false_zero_for_rgfa(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            graph, gaf, fasta = self.make_inputs(root)
-            library = root / "library.fa"
-            library.write_text(">TE1#DNA\nAAA\n")
-            annotator = GfaAnnotator(
-                str(graph), str(root / "anno"), str(library),
-                gfa_gaf=str(gaf), gfa_gaf_fasta=str(fasta))
-            annotator.parse_gfa()
-            annotator.write_outputs([])
-            with open(annotator.node_table_path) as handle:
-                rows = {row["node_id"]: row for row in csv.DictReader(
-                    handle, delimiter="\t")}
-            self.assertEqual(rows["a1"]["sample:SampleA"], "1")
-            self.assertEqual(rows["a1"]["sample:SampleB"], "NA")
-            self.assertEqual(rows["r2"]["sample:SampleB"], "1")
-
 
 if __name__ == "__main__":
     unittest.main()

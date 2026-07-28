@@ -788,4 +788,5 @@ __all__ = [
     "RgfaGafError", "RgfaGafCallStore", "extract_rgfa_gaf_alleles",
     "populate_rgfa_gaf_locus_calls",
     "derive_rgfa_node_presence", "load_rgfa_graph", "read_fasta_lengths",
+    "GafRecord", "GafStep", "Segment", "iter_gaf_records",
 ]

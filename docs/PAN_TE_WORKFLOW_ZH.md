@@ -238,7 +238,114 @@ GAF 后端（`rgfa_gaf.py`）的关键规则如下：
 
 ### 7.4 GFA 注释（可选）
 
-`--anno` 在最终 TE 库建立后，用 sensitive RepeatMasker（`-s`）注释 P/W path context，再把每个 hit 投影回节点的 0-based half-open 坐标。输出包括 `gfa_node_te_hits.tsv`、节点覆盖/未覆盖碱基与比例的 `gfa_node_annotations.tsv`，及 path-to-node 映射。P/W 图可产生 0/1 样本列；rGFA+GAF 的节点证据是保守 `1/NA`，因为“没有完整高质量 traversal”不等于节点真实不存在。
+当前 `anno` **只保留全基因组既有注释投影方案**。旧实现中“用最终 combined library 对拼接的 GFA path context 再跑一次 RepeatMasker”的路径已经删除；新实现不调用 RepeatMasker，也不读取 `combine/TEs.fa`。其目标是回答两个不同层级的问题：某次样本路径上的 node occurrence 覆盖了哪些 TE/CDS/exon/intron 等特征，以及汇总所有 occurrence 后，一个图节点最合理的身份是什么。
+
+可在完整 Pan_TE 运行末尾使用 `--anno --anno-manifest annotations.tsv`，也可用 `--anno-only` 跳过 TE 库发现，直接注释已有图：
+
+```bash
+Pan_TE --gfa graph.gfa --anno-only \
+  --anno-manifest annotations.tsv --out-dir graph_annotation
+
+# 等价的独立入口
+python bin/gfa_annotator.py --gfa graph.gfa \
+  --manifest annotations.tsv --out-dir graph_annotation/anno
+```
+
+#### 7.4.1 manifest 契约
+
+manifest 是制表符分隔文件，每个 sample/haplotype 一行。路径可以是绝对路径，也可相对 manifest 所在目录：
+
+| 列 | 必需 | 含义 |
+|---|---|---|
+| `sample` | 是 | 与 PanSN P/W/GAF 名称中的 sample 一致 |
+| `haplotype` | 否 | 默认 `0`；PGGB 常用 `1` |
+| `gff3` | 二选一 | 基因结构或同时含 TE 的标准 GFF3 |
+| `te_annotation` | 二选一 | RepeatMasker `.out`、BED 或 TE GFF3 |
+| `annotation_complete` | 否 | `true` 表示 TE 注释在全基因组完整，没有 TE 命中才可解释为 NonTE；只有 gene GFF3 时不得据此设 true |
+| `path_prefix` | 否 | 非 PanSN path/query 名称的样本前缀 |
+| `seqid_map` | 否 | 两列 `annotation_seqid -> graph_seqid`，解决 NCBI accession 与 `Chr1` 等命名差异 |
+| `gaf` | 否 | 该样本的 rGFA 映射；全局也可用 `--gfa-gaf/--gaf` |
+| `fasta` | 否 | 输入溯源与 checksum；当前投影坐标来自图路径/GAF而非重新比对 FASTA |
+
+`sample#haplotype#contig` 形式的注释 seqid 会自动去掉前两段，与 P/W 解出的 contig 对齐。显式 `seqid_map` 优先于自动归一化。重复的 sample/haplotype、冲突映射、缺失文件、非法 GFF3 坐标都会立即失败，而不是静默跳过。
+
+输入 GFF3 统一从 1-based inclusive 转成内部 0-based half-open。保留 `gene/mRNA/transcript/exon/CDS/UTR/ncRNA` 等类型；同一 transcript 的相邻 exon 间空隙会派生为 intron。TE 由 feature type/source/attributes 中的 transposon、retrotransposon、retroelement、repeat_region 或 mobile_element 信号识别。`te_annotation` 的 RepeatMasker `.out` 直接读取原基因组坐标；`Simple_repeat`、`Low_complexity`、`Satellite` 和常见 RNA 类保留为 other feature，但不计作 TE。
+
+#### 7.4.2 PGGB/smoothxg 坐标恢复
+
+对 P 行，优先按 PanSN `sample#haplotype#contig` 解析；也支持 manifest `path_prefix` 和单样本回退。每个 step 的节点长度来自 S sequence 或 `LN`。相邻节点起点为 `previous_end - overlap`；只接受完全由 `M/=/X` 组成的 overlap CIGAR。GFA link 是 bidirected，因此 `A+ -> B+` 与 `B- -> A-` 等价，查边时同时检查正向和反向互补键。缺边、复杂 indel overlap、节点缺失或 overlap 数量不符会使该 traversal 进入 `gfa_annotation_unresolved.tsv`，绝不近似坐标。
+
+W 行直接使用 `seqStart`，按 walk 中 `>`/`<` 恢复方向；W 没有相邻节点重叠。对每个 occurrence 保存 genome interval、node-local interval、方向、path 和 evidence。PGGB 的 P/W 是完整装配路径，但 `Absent` 只在该 sample 的所有 manifest haplotype 都有与该节点其他 occurrence **同 contig** 的完整嵌入路径时成立；缺失该 contig 或任一 haplotype 路径则保持 `NA`。
+
+#### 7.4.3 minigraph rGFA 与 GAF
+
+minigraph 注释采用严格 rGFA 后端。每条 S 必须有内嵌序列以及 `SR/SN/SO`；link overlap 必须是 `0M`。程序建立 node、双向 link、`(SN,SO,end)→node` 精确坐标索引和每个来源 contig 的有序区间索引，并验证 SR=0 参考节点连续。`SN/SO` 生成来源基因组的 origin occurrence；它是该 node 来源坐标的直接证据，但不证明其他样本缺失。
+
+真实 minigraph GAF 不只有 `>node_id`。同一文件可以混合三种 path 表示，程序均作严格解析：
+
+1. `>node1<node2` 形式的直接 node walk；
+2. `>sample#hap#contig:start-end` 形式的来源坐标 token。精确命中一个 S 区间时直接解析；跨多个 S 时只允许完整、连续、无 gap 的节点展开；
+3. `sample#hap#contig` 命名来源 path，再由 GAF 的 `path_start/path_end` 截取对齐区间。
+
+对每条 primary GAF，先验证 mandatory fields、query/path 范围、`cg` 消耗长度、解析后 path length 以及每一对相邻 GFA edge；query 名再按 PanSN、注释 seqid 或 manifest `path_prefix` 连接到对应注释。默认只投影 `MAPQ >= 20` 且 `matches/block_length >= 0.90` 的记录。
+
+坐标变换按 `cg` CIGAR 精确执行，而不是要求 gapless：`M/=/X` 同时推进 query 和 graph path，并与每个 node 的 path interval 求交；`I/S` 只推进 query；`D/N` 只推进 graph path；`H/P` 不推进。负链从 `query_end` 向前计算并翻转 node 与 feature 方向。因此 indel 之后的注释不会整体错移，终端部分 node 也只记录实际覆盖的 node-local interval。连续的 `M/=/X` 在坐标上都是 1:1，写出前无损合并为 match run，以免 SNP 的 `=/X` 交替制造数百万个等价碎片。
+
+一个 node traversal 仍可能被 indel 拆成多个线性 occurrence block；节点的 TE 支持率和 disagreement 按 `(样本/单倍型、contig、GAF record、node step)` traversal context 聚合，而不是按 block 数量投票。因此 CIGAR 的分块表达不会改变 `TE/PartialTE/Mixed` 身份。明细表保留 block 级精确坐标，provenance 另外记录总/有效/低质量 GAF 数、三种 path 类型、match-run 数和新增 occurrence 数。
+
+没有高质量 GAF traversal 绝不等同于 absence。rGFA 中未观察到某样本时状态保持 `NA`；只有已有 occurrence 且该样本的 TE 注释标为完整时，才可在该 occurrence 上给出 `NonTE`。这是相对具有完整 P/W 装配路径的 PGGB 最大的能力边界。
+
+#### 7.4.4 投影与方向变换
+
+对 genome feature `[f0,f1)` 和 occurrence `[g0,g1)` 先取交集 `[max(f0,g0), min(f1,g1))`。正向 occurrence 的 node 坐标为 `node_start + (overlap-g0)`；反向 occurrence 为 `node_end - (overlap-g0)` 并翻转 feature strand。内部和 TSV 一律为 0-based half-open，只有输出 GFF3 转回 1-based inclusive。
+
+真实 smoothxg 图节点很短，本实现用 1 kb feature bin 查候选，避免每个约 20 bp 节点扫描 100 kb 内所有注释。图 links 在 occurrence 构建后释放；写 occurrence 时不缓存无用行，node summary 只保留写 annotated GFA 所需的紧凑字段。即便如此，PGGB 每条样本路径、minigraph 每个 GAF match-run/node 交集都会产生 occurrence，完整图的 TSV/GFF3 可能达到数 GB，磁盘空间必须按 `路径步数 + CIGAR 线性块 + 投影碎片数` 规划。
+
+#### 7.4.5 occurrence 与 node 身份
+
+occurrence 是权威层。其 TE fraction 为该 occurrence 的 node-local TE 区间并集长度除以实际覆盖的 node span：默认 `>=0.80` 为 TE，`0.10–0.80` 为 PartialTE；有完整 TE 注释但无 TE 为 NonTE，不完整注释无 TE 命中为 Unknown。gene/CDS/exon 命中本身不把 TE call 变成 callable，避免把“有基因注释”错误等价为“已完整搜索且不是 TE”。
+
+节点汇总将不同样本、不同位点的 occurrence 合并：
+
+- `Conflict`：同一 occurrence 的 TE 与 CDS 有碱基重叠；
+- `Mixed`：节点既带 TE 又带基因结构，或完整注释的 occurrence 对 TE/非 TE 判断不一致；
+- `TE`：节点 TE union fraction 达阈值且至少一半 callable occurrences 支持 TE；
+- `PartialTE`：有 TE 证据但未满足完整 TE 判据；
+- `GeneStructure`：无 TE 且有基因结构；
+- `NonTE`：有 callable occurrence、无 TE/基因结构；
+- `Unknown`：没有足够可调用证据。
+
+样本状态为 `TE/PartialTE/NonTE/Unknown/Absent/NA`，不可把 `Unknown`、`Absent` 和 `NA` 合并。`--anno-te-min-fraction` 默认 0.80，容忍边界误差和极短未注释尾部；`--anno-partial-min-fraction` 默认 0.10，用于显式标记跨节点边界的 TE 碎片，避免把任何 1 bp overlap 都提升为 TE。
+
+#### 7.4.6 输出与审计
+
+| 文件 | 含义 |
+|---|---|
+| `gfa_node_annotation_intervals.tsv` | 所有投影 feature；node、occurrence、原基因组坐标和 family/class 均保留 |
+| `gfa_node_occurrence_annotations.tsv` | 每个 occurrence 的坐标、证据、callability、TE coverage 与身份 |
+| `gfa_node_annotations.tsv` | 每个节点的汇总身份、支持度、gene structure、conflict、confidence 与宽格式样本状态 |
+| `gfa_node_sample_matrix.tsv` | node × sample 长格式状态矩阵 |
+| `gfa_node_annotation.gff3` | node-local GFF3 |
+| `gfa_node_annotation_conflicts.tsv` | TE–CDS overlap 审计 |
+| `gfa_annotation_unresolved.tsv` | path/GAF/seqid 无法精确解释的记录及原因 |
+| `pangenome.annotated.gfa` | S 行增加 `ai` 身份、`it` 是否有 TE、`tf` TE fraction、`tc` class、`fm` family、`gs` gene structure、`cf` confidence |
+| `gfa_annotation_provenance.json` | 输入 SHA-256、阈值、图模式、计数、坐标与缺失值契约 |
+
+#### 7.4.7 拟南芥真实 PGGB 验证
+
+使用 `/scratch/shuoc/TE/Arabidopsis_thaliana/upload` 下 7 套逐基因组 RepeatMasker `.out`，对 PGGB Chr1 smoothxg GFA 完整运行。图含 2,270,366 个节点、3,144,225 条 `0M` links 和 7 条 P paths；程序恢复 17,011,115 个 occurrence，读取 800,587 条全基因组 repeat features，投影 12,150,687 个区间，unresolved 为 0。节点汇总为 TE 853,457、PartialTE 10,872、Mixed 33,237、NonTE 1,372,800。
+
+逐样本将 occurrence 表的 `te_covered_bp` 求和，再独立对原 `.out` 的 Chr1 TE 区间求并集，7 个样本逐 bp 完全相等：TAIR10 6,725,937；T2T 9,089,723；Cvi-0 10,928,548；Ey15-2 10,696,603；IP-Met-6 8,281,890；Rabacal-1 10,936,411；Tsu-0 9,235,551 bp。这同时验证了 PanSN 归一化、P path 坐标、bidirected link、反向节点变换和重叠区间去重。PGGB 将五条染色体拆为五个 community GFA 时应逐文件运行同一 manifest；node id 只在各 community 文件内部解释，不应未经命名空间化直接拼表。
+
+#### 7.4.8 拟南芥真实 minigraph 验证
+
+使用同一套 7 个拟南芥 RepeatMasker 结果，运行 `/scratch/shuoc/TE/Arabidopsis_thaliana/Ara.gfa` 与 `rgfa_validation_20260724/Ara_to_graph.gaf`。rGFA 含 74,660 个节点、总 node sequence 166,090,619 bp；1,376 条 primary GAF 全部通过结构、path length、坐标 token/命名 path 和 graph-edge 验证。默认质量阈值保留 521 条记录，其中 295 条为来源坐标 walk、226 条为命名来源 path，855 条低质量记录被审计性过滤。
+
+最终构建 868,506 个 CIGAR match run、1,179,408 个精确 occurrence block，投影 1,133,307 条 TE 区间，`unresolved=0`。节点身份是 TE 24,596、PartialTE 17,621、Mixed 5,383、NonTE 27,060；所有节点都有可调用证据。node-local TE 区间并集为 66,307,931 / 166,090,619 bp（39.9227%）。这是图中唯一 node 序列的 TE 并集比例，不等同于任一线性基因组的 RepeatMasker mask rate，因为 homologous sequence 在图中共享，而一个 node 也可在不同基因组 context 中出现。
+
+另作了不调用投影器内部数据结构的独立 bp 审计：从 occurrence TSV 合并每个 `sample#hap#contig` 的 callable genome interval；直接解析 7 个原始 `.out`，排除非 TE class 和 `end < start` 的异常记录后合并源 TE interval；再计算 `源 TE 并集 ∩ callable 并集`，与 interval TSV 中实际投影 TE 的 genome-coordinate 并集逐行比较。两者完全一致（`cmp=0`）。可映射 TE bp 为 T2T 41,719,175、TAIR10 28,571,472、Cvi-0 25,520,542、Ey15-2 26,638,897、IP-Met-6 26,671,318、Rabacal-1 26,251,204、Tsu-0 27,629,146，总计 203,001,754 bp。这里使用 callable 交集而不是全基因组 mask bp，避免把 GAF 未覆盖区域错误算作投影缺失。
+
+连续 `M/=/X` 合并前，坐标相同但产生 9,371,468 个 block 和约 4.4 GB 输出；无损合并后 TE node-local 覆盖逐 bp不变，block 降至 1,179,408，输出约 1.2 GB。随后支持率改为 traversal-context 计数，消除了 CIGAR 碎片数对 `Mixed`/TE 支持率的影响。最终结果位于 `/tmp/pan_te_minigraph_anno_context_20260728/anno`；临时目录只用于本机验证，不作为长期发布资产。
 
 ## 8. PAF：插入候选处理算法
 
@@ -340,6 +447,19 @@ Pan_TE ... --te-looker-final-gated
 
 因此使用结果时应区分：`run/families.fasta` 是 dtr 原始输出；`te-looker/consensus.fa` 是 Pan_TE 送入 combine 的最终轨道库；只有前者的 `provenance.json` 满足上述 gated 契约时二者才可等价，否则后者已被 stitch/gate/merge。每次运行还会写入 `run/pan_te_handoff.json`，记录输入/中间/输出 FASTA 的 SHA-256、家族数、总碱基数、门槛、CD-HIT 参数及拼接状态。 
 
+### 9.3.1 嵌套实例分解与自适应边界重估（已实现，当前为显式后处理）
+
+`dtr-nested`、`dtr-boundary` 与 `dtr-boundary-gate` 为已门控的 `families.fasta` 提供保守、可回退的额外 refinement 路径；目前不会由 `dtr run --final-gated` 或 Pan_TE 自动调用，必须显式运行并审阅审计文件后才替换库。这一边界避免把仍属 partial 的 Track 2 结果误混入最终库。
+
+流程为：
+
+1. `dtr-copy` 为原始 final library 建立全基因组 copy catalog（BED 为 0-based、half-open，保留方向）。
+2. `dtr-nested --min-flank 80` 在同一染色体上寻找 inner 被不同 family 的 outer 完整包含、且 outer 两侧各至少保留 80 bp 的关系。它输出 `nested.events.tsv`，并将含内层元件的外层实例从 `clean.copies.bed` 排除。这里的分解是实例拓扑分解：内层家族仍由自己的实例代表，外层边界只从未嵌套实例取证；它不臆造或切割新的 consensus 序列。
+3. `dtr-boundary` 对每个 family 的 clean instances 提取两侧 flank（默认 100 bp），按方向统一后以 POA 建候选共识。只有实例数达到 `--min-members`（默认 5）、候选长度处于原长度的 `1/max-length-ratio` 到该倍数之间（默认 ratio=1.5）时才提出替换；否则逐字保留原序列。`--max-poa-bases`（默认 4,000）和 `--max-refinement-families` 用于限制 POA 的二次复杂度，超出预算的 family 不是被丢弃，而是保留原边界，可在另一批次重估。
+4. 对 proposal library 再运行 `dtr-copy`，`dtr-boundary-gate` 按 family/染色体对实例区间求并集；仅 proposal coverage 相对原库至少增加 `--min-relative-gain`（默认 0.01，即 1%）且序列实际改变时，才接受 proposal。其他 family 原样回退。这个 coverage proxy 只用于选择，不取代最终 RepeatMasker 验证。
+
+拟南芥 `/scratch/shuoc/TE/Arabidopsis_thaliana/demo/genome/genome.fa` 的 69-family final library 测试中，原库有 2,307 个 copy instances；检测到 176 个跨 family 嵌套事件，保留 2,242 个 clean instances。受测试资源预算限制，本次只对最多 5 个、长度 ≤2,000 bp、每家族最多 5 个实例的 family 进行 POA；其中 2 个提案通过 coverage gate：`stitched_3_ref` 从 1,869 bp 到 2,099 bp（coverage proxy +13.18%），`stitched_21_ref` 从 1,196 bp 到 1,472 bp（+372.33%）。其余 67 条记录未改动。以与基线相同的 RepeatMasker 4.2.1、默认模式、`-pa 2` 重新掩蔽，masked bases 从 23,012,842（17.184454%）增加到 23,018,188（17.188446%）：净增 5,346 bp、+0.003992 个百分点（相对 +0.023231%）。完整证据位于 `validation/arabidopsis_dtr_final/boundary_refine/` 和 `validation/arabidopsis_dtr_final/mask_rate_boundary/`。
+
 ### 9.4 Track 2 的 H0 spaced-seed 成本门禁
 
 在实现窗口图前，`dtr-spaced-seed` 对 `/scratch/shuoc/TE/Arabidopsis_thaliana/demo/genome/genome.fa` 进行了精确 canonical spaced-seed 计数；默认 pattern 为 `11101110111011101111`（span 20、weight 16，满足 v4 的 weight≥16 特异性下限），仅将出现次数 ≥3 的 seed 计为重复候选。结果为 96,732,256 个 distinct seed 中 3,754,268 个重复，合计 32,220,331 次发生，最高计数 27,943。即使每 seed 以 hash-bottom cap=200 限制，桶内配对上界仍为 346,260,134；不封顶为 56,151,837,481。故 Track 2 不能实行候选组全配对，必须采用 LSH 桶上限、每窗口固定邻居预算与精确复核。审计 JSON 位于 `validation/arabidopsis_track2/spaced_seed_h0.json`；该阶段只测量成本，不产生 TE 家族。
@@ -354,7 +474,7 @@ Pan_TE ... --te-looker-final-gated
 
 `dtr-community` 读取所有窗口节点及 LSH 边图，输出稳定排序的连通分量 membership；孤立节点被保留，分量只是后续细分容器，`family_call=false` 禁止直接作为 TE 家族。此试验得到 4,681 个分量、214 个多节点分量、最大 36 个节点（`window_components_provenance.json`）。
 
-`dtr-community-refine` 在这些容器内运行确定性的 first-level Louvain local moving（resolution=1，固定节点排序和 tie-break），以模块度局部移动切断桥接；它**不是完整 Leiden**，provenance 明示 `deterministic_first_level_louvain_local_moving_not_leiden`。真实图由 4,681 个容器细分为 4,689 个社区，最大社区从 36 降至 13；满足 5–30 成员 POA 门槛的社区仍为 7 个。`dtr-component-poa` 现在消费细分后的 membership。它以共识消减单拷贝突变，但还没有完成 Leiden aggregation、边界重估、分类或最终 gate，故结果绝不进入 `families.fasta`。
+`dtr-community-refine` 在这些容器内运行确定性的 first-level Louvain local moving（resolution=1，固定节点排序和 tie-break），以模块度局部移动切断桥接；它**不是完整 Leiden**，provenance 明示 `deterministic_first_level_louvain_local_moving_not_leiden`。真实图由 4,681 个容器细分为 4,689 个社区，最大社区从 36 降至 13；满足 5–30 成员 POA 门槛的社区仍为 7 个。`dtr-component-poa` 现在消费细分后的 membership。它以共识消减单拷贝突变，虽然 9.3.1 的可选 final-library 后处理已实现边界重估，Track 2 本身尚未自动接入该阶段，也没有完成 Leiden aggregation、分类或最终 gate，故结果绝不进入 `families.fasta`。
 
 ### 9.4.3 全基因组 copy catalog（当前部分实现）
 
@@ -397,6 +517,8 @@ v3 manifest 完整覆盖 `organelle/rrna/trna/snrna`，因此可令 **G6 的 non
 ### 9.4 已完成的拟南芥端到端验证
 
 在 `/scratch/shuoc/TE/Arabidopsis_thaliana/demo/genome/genome.fa` 上，以 `--threads 4 --min-count 50 --w 1 --final-gated` 完成测试。发现/精修得到 337 个家族（673,452 bp）；共线成员链检测到 37 条可信链，重建 37 条 stitched consensus，并替代 85 个源碎片家族，拼接库为 289 个家族（673,719 bp）。随后 min-members=5、min-length=100 bp 门控保留 211 个家族（326,477 bp），`cd-hit-est -c 0.80 -aS 0.6 -n 5 -r 1 -g 1` 生成最终 69 个家族（167,509 bp）。最终 `provenance.json` 的所有完成阶段和 `families.fasta` 已由 Pan_TE 的契约检查接受。验证副本位于本仓库 `validation/arabidopsis_dtr_final/`；运行细节应以其中 JSON 审计记录为准。
+
+在同一 69-family final library 上，9.3.1 的嵌套/边界后处理进一步产生一个 2-family 替换的 `families.boundary-gated.fasta`；它的独立 RepeatMasker mask rate 为 17.188446%，相对未边界重估的 17.184454% 增加 5,346 bp（+0.003992 pp）。这是小幅、正向的实测收益，不应外推为所有物种或所有家族均会提升；应始终同时保留原库、proposal、gate audit 及 matched RepeatMasker `.tbl`。
 
 ## 10. 三源合并、分类和最终输出
 
@@ -457,7 +579,11 @@ cd-hit-est -c 0.9 -aS 0.8 -aL 0.8 -G 0 -n 8 -r 1 -mask NX
 | `combine/raw_te_library.all.fa` | 合并前所有轨道共识 |
 | `combine/raw_te_library.fa` | 跨轨 0.9 去冗余库 |
 | `combine/TEs.fa` | 有 `--model-dir` 时的分类最终库 |
-| `anno/gfa_node_annotations.tsv` | 可选 GFA 节点 TE 覆盖与样本证据 |
+| `anno/gfa_node_annotation_intervals.tsv` | GFA node-local 的 TE/基因结构投影区间 |
+| `anno/gfa_node_occurrence_annotations.tsv` | occurrence 级坐标、callability 与身份（权威层） |
+| `anno/gfa_node_annotations.tsv` | 节点汇总身份与样本状态 |
+| `anno/pangenome.annotated.gfa` | 带节点身份、TE fraction、class、gene structure 和 confidence 标签的 GFA |
+| `anno/gfa_annotation_provenance.json` | GFA 注释输入 checksum、阈值与缺失值契约 |
 
 建议最少进行以下 QC：
 
@@ -466,7 +592,7 @@ cd-hit-est -c 0.9 -aS 0.8 -aL 0.8 -G 0 -n 8 -r 1 -mask NX
 3. 对 GFA 审阅 manifest 中 `locus_key`、`support_sample_count`、`qc_status`、`sequence_source`；rGFA 矩阵中把 `NA` 与 `0` 分开统计。
 4. 对 mdl 检查原始数、Phase 0 保留数、copy gate、Phase 1 输出、Phase 2 MDL quality gate 的数目及 `mdl_quality_dropped.tsv`；若结构资产缺失，确认门控是否按设计跳过。
 5. 对 TE-looker 验证 `provenance.json` 是否满足 gated 契约，检查 `pan_te_handoff.json` 的输入/输出 SHA-256、原始与最终家族数/bp、stitch/gate/merge 审计及每 Mb 15 家族的 sanity bound；Track 2 的 partial 输出还须检查 window/LSH/component/POA/copy/non-TE provenance，且不得被误作为最终库。
-6. 对最终库抽样用 RepeatMasker 或独立参考注释验证；GFA 场景可运行 `compare_gfa_reference_annotation.py`，它把 `SR:i:0` 节点按 `SN/SO`（含方向）与独立参考子串注释比对，报告覆盖差异、分类/家族一致性和 direct-hit fragmentation。
+6. 对最终库抽样用 RepeatMasker 或独立参考注释验证；GFA 注释则逐样本比较 occurrence `te_covered_bp` 总和与源注释区间并集，并要求 unresolved、Conflict 和 Unknown 比例有可解释原因。
 
 ## 13. 局限性与解释边界
 
@@ -474,6 +600,7 @@ cd-hit-est -c 0.9 -aS 0.8 -aL 0.8 -G 0 -n 8 -r 1 -mask NX
 - PAF 不对称缺口代表候选插入，而不是 TE 的直接证明；复杂重排、assembly gap、重复比对仍可产生候选。
 - PGGB 等位提取依赖路径命名/contig 匹配和可靠锚点；高度重复区域可能只能以不稳定锚链或未解析候选表示。
 - rGFA 候选的 DNA 来源为完整图节点，不是对 query FASTA 作 CIGAR 重放；末端部分节点被保守排除，因此结果偏向高置信但可能少于理论可恢复的序列。
+- GFA 注释的 PGGB absence 依赖完整 P/W 路径；rGFA 若无每个样本的高质量 GAF 只能报告来源节点，不能推断其他样本缺失。含 indel 的 GAF 已作精确 CIGAR block 投影，但 query-only insertion 没有对应 graph node，本身不会凭空生成可注释节点。
 - >2 Gb 的 mdl 路径在发现/精修阶段使用样本；Phase 2b 可恢复全基因组 copy-count 证据，却不能凭空发现样本完全遗漏的家族。
 - TE-looker 的完整多轨社区/门控架构应以所安装 `dtr` 的显式 `te-looker-gated-v1` provenance 契约和版本能力为证。当前 Pan_TE 的宿主侧 gate 是对 discovery-only 输出的必要补偿，并通过 `pan_te_handoff.json` 审计；它不等同于完整 dtr 的内部 G1–G6 审计。
 
@@ -492,4 +619,3 @@ cd-hit-est -c 0.9 -aS 0.8 -aL 0.8 -G 0 -n 8 -r 1 -mask NX
 - rGFA+GAF 验证、锚链、presence：`bin/rgfa_gaf.py`
 - 图节点注释：`bin/gfa_annotator.py`
 - 片段共线重组：`bin/fragment_stitcher.py`
-

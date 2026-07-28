@@ -1,0 +1,3 @@
+sample	haplotype	fasta	gff3	te_annotation	seqid_map	path_prefix	gaf	annotation_complete
+sampleA	1	assemblies/sampleA.fa	genes/sampleA.gff3	repeats/sampleA.fa.out				true
+sampleB	1	assemblies/sampleB.fa	genes/sampleB.gff3	repeats/sampleB.bed	maps/sampleB.seqids.tsv		maps/sampleB.gaf	true

@@ -37,7 +37,7 @@ CORE_TOOLS: List[Tuple[str, str, str, Tuple[str, ...]]] = [
     ('makeblastdb',  'Step 3 (Refiner)',    'bioconda::blast',         ('mdl_repeat',)),
     ('mafft',        'Step 3 (Refiner)',    'bioconda::mafft',         ('mdl_repeat',)),
     ('abpoa',        'Step 3 (Refiner)',    'bioconda::abpoa',         ('mdl_repeat',)),
-    ('RepeatMasker', 'Step 3 (Refiner)',    'bioconda::repeatmasker',  ('mdl_repeat', 'anno')),
+    ('RepeatMasker', 'Step 3 (Refiner)',    'bioconda::repeatmasker',  ('mdl_repeat',)),
     ('dtr',          'Step 4 (te-looker)',  'bioconda::te-looker',     ('te_looker',)),
     ('hmmbuild',     'Step 4 (te-looker)',  'bioconda::hmmer',         ('te_looker',)),
     ('nhmmer',       'Step 4 (te-looker Track 1)', 'bioconda::hmmer',  ('te_looker',)),
