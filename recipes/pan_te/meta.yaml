@@ -67,6 +67,8 @@ test:
     - command -v dtr
     - command -v look4ltrs
     - command -v mdl-repeat
+    - test -s "$PREFIX/share/pan_te/docx/PAN_TE_METHODS_ZH.docx"
+    - test -s "$PREFIX/share/pan_te/docx/PAN_TE_METHODS_ZH.md"
 
 about:
   home: https://github.com/unavailable-2374/Pan_TE
