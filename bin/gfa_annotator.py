@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+from bisect import bisect_right
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -31,7 +32,7 @@ _WALK_STEP_RE = re.compile(r"([><])([^><]+)")
 _CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
 _TE_WORD_RE = re.compile(r"(?:transpos|retrotranspos|retroelement|repeat_region|mobile_element)", re.I)
 _NON_TE_RM_CLASS_RE = re.compile(
-    r"^(?:Simple_repeat|Low_complexity|Satellite|rRNA|tRNA|snRNA|scRNA|srpRNA)$",
+    r"^(?:Simple_repeat|Low_complexity|Satellite(?:/.*)?|rRNA|tRNA|snRNA|scRNA|srpRNA)$",
     re.I,
 )
 _GENE_TYPES = {
@@ -43,7 +44,41 @@ _GENE_TYPES = {
 # keeps node queries selective without building a base-level interval index.
 _BIN_SIZE = 1_000
 
-
+# RepeatMasker-compatible report rows. Aggregates and subtypes are both
+# reported; occupied lengths are independent interval unions and must not be
+# summed across rows.
+_RM_ROWS = (
+    ("retroelements", "Retroelements"),
+    ("sines", "    SINEs:"),
+    ("penelope", "    Penelope:"),
+    ("lines", "    LINEs:"),
+    ("line_cre", "        CRE/SLACS:"),
+    ("line_l2", "        L2/CR1/Rex:"),
+    ("line_r1", "        R1/LOA/Jockey:"),
+    ("line_r2", "        R2/R4/NeSL:"),
+    ("line_rte", "        RTE/Bov-B:"),
+    ("line_l1", "        L1/CIN4:"),
+    ("ltr", "    LTR elements:"),
+    ("ltr_bel", "        BEL/Pao:"),
+    ("ltr_copia", "        Ty1/Copia:"),
+    ("ltr_gypsy", "        Gypsy/DIRS1:"),
+    ("retroviral", "        Retroviral:"),
+    ("dna", "DNA transposons"),
+    ("dna_hobo", "    hobo-Activator:"),
+    ("dna_tc1", "    Tc1-IS630-Pogo:"),
+    ("dna_ensp", "    En-Spm:"),
+    ("dna_mule", "    MuDR-IS905:"),
+    ("dna_piggybac", "    PiggyBac:"),
+    ("dna_tourist", "    Tourist/Harbinger:"),
+    ("dna_other", "    Other (Mirage, P-element, Transib):"),
+    ("rolling", "Rolling-circles"),
+    ("unclassified", "Unclassified:"),
+    ("interspersed", "Total interspersed repeats:"),
+    ("small_rna", "Small RNA:"),
+    ("satellite", "Satellites:"),
+    ("simple_repeat", "Simple repeats:"),
+    ("low_complexity", "Low complexity:"),
+)
 def _open_text(path: str):
     if path.endswith(".gz"):
         return gzip.open(path, "rt")
@@ -134,6 +169,127 @@ def _attributes(text: str) -> Dict[str, str]:
 
 def _clean(value: object) -> str:
     return str(value if value is not None else "").replace("\t", " ").replace("\n", " ")
+
+
+def _repeat_summary_buckets(category: str, feature_type: str, family: str,
+                            te_class: str) -> Tuple[str, ...]:
+    """Map one annotation record to RepeatMasker-style aggregate/subtype rows."""
+    # An explicit class is authoritative. Family names are intentionally not
+    # used to override it: RepeatMasker libraries can contain LINE/LTR-like
+    # strings in names that are formally reported as Unknown/SubclassI.
+    text = " ".join((feature_type, te_class or family)).lower()
+    normalized = re.sub(r"[^a-z0-9]+", " ", text)
+    words = set(normalized.split())
+    if category != "TE":
+        if any(token in words for token in ("rrna", "trna", "snrna", "scrna", "srprna")):
+            return ("small_rna", "masked")
+        if "satellite" in words:
+            return ("satellite", "masked")
+        if "simple" in words and "repeat" in words:
+            return ("simple_repeat", "masked")
+        if "low" in words and "complexity" in words:
+            return ("low_complexity", "masked")
+        return ()
+
+    buckets = {"masked"}
+    raw_class = (te_class or family).strip().lower()
+    line_class = raw_class == "line" or raw_class.startswith("line/")
+    ltr_class = raw_class == "ltr" or raw_class.startswith("ltr/")
+    dna_class = raw_class == "dna" or raw_class.startswith("dna/")
+    if ("helitron" in words or "rolling" in words or
+            re.search(r"(?:^|[/_ -])rc(?:$|[/_ -])", text)):
+        buckets.add("rolling")
+    elif raw_class == "sine" or raw_class.startswith("sine/"):
+        buckets.update(("retroelements", "sines"))
+    elif "penelope" in words:
+        buckets.update(("retroelements", "penelope"))
+    elif line_class:
+        buckets.update(("retroelements", "lines"))
+        if words.intersection({"cre", "slacs"}):
+            buckets.add("line_cre")
+        elif words.intersection({"l2", "cr1", "rex"}):
+            buckets.add("line_l2")
+        elif words.intersection({"r1", "loa", "jockey"}):
+            buckets.add("line_r1")
+        elif words.intersection({"r2", "r4", "nesl"}):
+            buckets.add("line_r2")
+        elif words.intersection({"rte", "bov", "bovb"}):
+            buckets.add("line_rte")
+        elif words.intersection({"l1", "cin4"}):
+            buckets.add("line_l1")
+    elif ltr_class:
+        buckets.update(("retroelements", "ltr"))
+        if words.intersection({"bel", "pao"}):
+            buckets.add("ltr_bel")
+        elif "copia" in words:
+            buckets.add("ltr_copia")
+        elif words.intersection({"gypsy", "dirs", "dirs1"}):
+            buckets.add("ltr_gypsy")
+        elif "retroviral" in words or any(word.startswith("erv") for word in words):
+            buckets.add("retroviral")
+    elif raw_class in {"bel-pao", "bel/pao"}:
+        buckets.add("ltr_bel")
+    elif raw_class in {"dirs", "dirs1"}:
+        buckets.add("ltr_gypsy")
+    elif raw_class in {"pif-harbinger", "pif/harbinger"}:
+        buckets.add("dna_tourist")
+    elif dna_class:
+        buckets.add("dna")
+        if words.intersection({"hobo", "activator", "hat"}):
+            buckets.add("dna_hobo")
+        elif words.intersection({"tc1", "tcmar", "is630", "pogo", "mariner"}):
+            buckets.add("dna_tc1")
+        elif raw_class.startswith(("dna/ensp", "dna/en-spm")):
+            buckets.add("dna_ensp")
+        elif words.intersection({"mule", "mudr", "is905"}):
+            buckets.add("dna_mule")
+        elif "piggybac" in words:
+            buckets.add("dna_piggybac")
+        elif words.intersection({"tourist", "harbinger", "pif"}):
+            buckets.add("dna_tourist")
+        elif words.intersection({"mirage", "transib"}) or "p-element" in raw_class:
+            buckets.add("dna_other")
+    else:
+        buckets.add("unclassified")
+    if buckets.intersection({"retroelements", "dna", "unclassified"}):
+        buckets.add("interspersed")
+    ordered = tuple(key for key, _label in _RM_ROWS if key in buckets)
+    return ordered + (("masked",) if "masked" in buckets else ())
+
+
+class _StreamingUnion:
+    """Accumulate union lengths for independently sorted interval streams."""
+
+    def __init__(self):
+        self.last: Dict[Tuple, Tuple[int, int]] = {}
+        self.total: Counter = Counter()
+
+    def add(self, key: Tuple, start: int, end: int) -> None:
+        if end <= start:
+            return
+        previous = self.last.get(key)
+        if previous is None or start > previous[1]:
+            self.total[key] += end - start
+            self.last[key] = (start, end)
+        elif end > previous[1]:
+            self.total[key] += end - previous[1]
+            self.last[key] = (previous[0], end)
+
+
+def _fasta_sequence_stats(path: str) -> Tuple[int, int, int, Optional[float]]:
+    """Return sequence count, total bp, N/X bp, and GC percentage."""
+    sequences = total = nx = gc = 0
+    with _open_text(path) as handle:
+        for line in handle:
+            if line.startswith(">"):
+                sequences += 1
+                continue
+            sequence = "".join(line.split()).upper()
+            total += len(sequence)
+            nx += sequence.count("N") + sequence.count("X")
+            gc += sequence.count("G") + sequence.count("C")
+    denominator = total - nx
+    return sequences, total, nx, (100.0 * gc / denominator if denominator else None)
 
 
 @dataclass(frozen=True)
@@ -282,6 +438,18 @@ class GfaAnnotator:
         return os.path.join(self.output_dir, "gfa_node_sample_matrix.tsv")
 
     @property
+    def repeat_table_path(self) -> str:
+        return os.path.join(self.output_dir, "gfa_annotation.tbl")
+
+    @property
+    def repeat_sample_table_path(self) -> str:
+        return os.path.join(self.output_dir, "gfa_annotation_by_sample.tbl")
+
+    @property
+    def repeat_summary_path(self) -> str:
+        return os.path.join(self.output_dir, "gfa_annotation_summary.tsv")
+
+    @property
     def gff3_path(self) -> str:
         return os.path.join(self.output_dir, "gfa_node_annotation.gff3")
 
@@ -312,7 +480,7 @@ class GfaAnnotator:
                     len(self.nodes), len(self.occurrences), self.graph_mode)
         logger.info("Projecting genome-coordinate features to node coordinates")
         self.project_annotations()
-        logger.info("Writing node, occurrence, interval, GFF3, GFA and provenance outputs")
+        logger.info("Writing node, occurrence, RepeatMasker-style, GFF3, GFA and provenance outputs")
         self.write_outputs()
         logger.info(
             "Projected %d annotations through %d occurrences onto %d GFA nodes",
@@ -443,7 +611,8 @@ class GfaAnnotator:
                     entry.key, self._normalize_seqid(entry, fields[4]), start, end, strand, ".",
                     "transposable_element" if is_te else fields[10],
                     "TE" if is_te else "other",
-                    f"RM:{fields[4]}:{start}-{end}:{fields[9]}", "",
+                    f"RM:{fields[4]}:{start}-{end}:{fields[9]}",
+                    f"RMID:{fields[14]}" if len(fields) > 14 else "",
                     fields[9] if is_te else "", fields[10] if is_te else "",
                     os.path.basename(path), ";".join((
                         f"SW_score={fields[0]}", f"perc_div={fields[1]}",
@@ -1024,6 +1193,12 @@ class GfaAnnotator:
         for occurrence in self.occurrences:
             node_occurrences[occurrence.node_id].append(occurrence)
 
+        sorted_projected = sorted(
+            self.projected,
+            key=lambda x: (x.node_id, x.node_start, x.node_end,
+                           x.occurrence_id, x.feature_type),
+        )
+
         interval_fields = [
             "node_id", "node_start", "node_end", "overlap_bp", "occurrence_id",
             "sample", "haplotype", "seqid", "genome_start", "genome_end",
@@ -1033,7 +1208,7 @@ class GfaAnnotator:
         with open(self.interval_table_path, "wt", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=interval_fields, delimiter="\t", lineterminator="\n")
             writer.writeheader()
-            for row in sorted(self.projected, key=lambda x: (x.node_id, x.node_start, x.node_end, x.occurrence_id, x.feature_type)):
+            for row in sorted_projected:
                 writer.writerow({
                     "node_id": row.node_id, "node_start": row.node_start, "node_end": row.node_end,
                     "overlap_bp": row.node_end - row.node_start, "occurrence_id": row.occurrence_id,
@@ -1225,9 +1400,259 @@ class GfaAnnotator:
             handle.write("record\treason\tdetail\n")
             for row in self.unresolved:
                 handle.write("\t".join(_clean(x) for x in row) + "\n")
+        self._write_repeat_tables(sorted_projected)
         self._write_gff3()
         self._write_annotated_gfa()
         self._write_provenance(conflicts)
+
+    def _write_repeat_tables(
+            self, sorted_projected: Sequence[ProjectedFeature]) -> None:
+        """Write RepeatMasker-style graph-space and source-space summaries."""
+        ordered_occurrences = sorted(
+            self.occurrences,
+            key=lambda x: (x.entry_key, x.seqid, x.genome_start, x.genome_end),
+        )
+        callable_intervals: Dict[
+            Tuple[Tuple[str, str], str], List[Tuple[int, int]]] = {}
+        current_key = None
+        current_raw: List[Tuple[int, int]] = []
+        for occurrence in ordered_occurrences:
+            key = (occurrence.entry_key, occurrence.seqid)
+            if current_key is not None and key != current_key:
+                callable_intervals[current_key] = _merge_intervals(current_raw)
+                current_raw = []
+            current_key = key
+            current_raw.append((occurrence.genome_start, occurrence.genome_end))
+        if current_key is not None:
+            callable_intervals[current_key] = _merge_intervals(current_raw)
+        callable_ends = {
+            key: [end for _start, end in intervals]
+            for key, intervals in callable_intervals.items()
+        }
+
+        source_union = _StreamingUnion()
+        source_element_counts: Counter = Counter()
+        graph_element_counts: Counter = Counter()
+        counted_repeatmasker_ids: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+        for feature in sorted(
+                self.features,
+                key=lambda x: (x.entry_key, x.seqid, x.start, x.end,
+                               x.feature_id, x.feature_type)):
+            buckets = _repeat_summary_buckets(
+                feature.category, feature.feature_type,
+                feature.family, feature.te_class)
+            source_key = (feature.entry_key, feature.seqid)
+            intervals = callable_intervals.get(source_key)
+            if not buckets or not intervals:
+                continue
+            index = bisect_right(callable_ends[source_key], feature.start)
+            overlaps: List[Tuple[int, int]] = []
+            while index < len(intervals) and intervals[index][0] < feature.end:
+                start = max(feature.start, intervals[index][0])
+                end = min(feature.end, intervals[index][1])
+                if end > start:
+                    overlaps.append((start, end))
+                index += 1
+            if not overlaps:
+                continue
+            count_element = True
+            if feature.parent.startswith("RMID:"):
+                seen_ids = counted_repeatmasker_ids[feature.entry_key]
+                fragment_key = f"{feature.te_class}\0{feature.parent}"
+                count_element = fragment_key not in seen_ids
+                seen_ids.add(fragment_key)
+            for bucket in buckets:
+                if count_element:
+                    source_element_counts[(feature.entry_key, bucket)] += 1
+                    graph_element_counts[bucket] += 1
+                for start, end in overlaps:
+                    source_union.add(
+                        (feature.entry_key, bucket, feature.seqid), start, end)
+
+        source_lengths: Counter = Counter()
+        for (entry_key, bucket, _seqid), length in source_union.total.items():
+            source_lengths[(entry_key, bucket)] += length
+
+        graph_union = _StreamingUnion()
+        for row in sorted_projected:
+            for bucket in _repeat_summary_buckets(
+                    row.category, row.feature_type, row.family, row.te_class):
+                graph_union.add((bucket, row.node_id), row.node_start, row.node_end)
+        graph_lengths: Counter = Counter()
+        for (bucket, _node_id), length in graph_union.total.items():
+            graph_lengths[bucket] += length
+
+        graph_total = sum(node.length for node in self.nodes.values())
+        complete_node_sequence = all(
+            node.sequence is not None for node in self.nodes.values())
+        if complete_node_sequence:
+            graph_nx = sum(
+                node.sequence.upper().count("N") + node.sequence.upper().count("X")
+                for node in self.nodes.values())
+            graph_gc_bp = sum(
+                node.sequence.upper().count("G") + node.sequence.upper().count("C")
+                for node in self.nodes.values())
+            graph_non_nx = graph_total - graph_nx
+            graph_gc = (100.0 * graph_gc_bp / graph_non_nx
+                        if graph_non_nx else None)
+        else:
+            graph_non_nx = None
+            graph_gc = None
+        graph_stats = {
+            "scope": "graph", "sample": ".", "haplotype": ".",
+            "coordinate_space": "unique GFA node sequence space",
+            "denominator_kind": (
+                "complete_node_sequences" if complete_node_sequence
+                else "node_lengths_with_incomplete_sequences"),
+            "sequence_count": len(self.nodes), "total_length": graph_total,
+            "non_nx_length": graph_non_nx, "gc_percent": graph_gc,
+        }
+        with open(self.repeat_table_path, "wt") as handle:
+            handle.write(self._format_repeat_table_block(
+                os.path.basename(self.gfa_file), graph_stats,
+                graph_element_counts, graph_lengths, graph_space=True))
+
+        sample_stats = []
+        with open(self.repeat_sample_table_path, "wt") as handle:
+            for entry in self.entries.values():
+                source_keys = [key for key in callable_intervals
+                               if key[0] == entry.key]
+                if entry.fasta:
+                    sequence_count, total, nx, gc = _fasta_sequence_stats(entry.fasta)
+                    non_nx = total - nx
+                    denominator_kind = "source_fasta"
+                else:
+                    sequence_count = len(source_keys)
+                    total = sum(
+                        end - start for key in source_keys
+                        for start, end in callable_intervals[key])
+                    non_nx = None
+                    gc = None
+                    denominator_kind = "graph_callable_source_intervals"
+                stats = {
+                    "scope": "sample", "sample": entry.sample,
+                    "haplotype": entry.haplotype,
+                    "coordinate_space": "source genome coordinates",
+                    "denominator_kind": denominator_kind,
+                    "sequence_count": sequence_count, "total_length": total,
+                    "non_nx_length": non_nx, "gc_percent": gc,
+                }
+                sample_stats.append((entry, stats))
+                counts, lengths = self._source_repeat_counters(
+                    entry.key, source_element_counts, source_lengths)
+                handle.write(self._format_repeat_table_block(
+                    os.path.basename(entry.fasta) if entry.fasta else
+                    f"{entry.sample}#{entry.haplotype}",
+                    stats, counts, lengths, graph_space=False))
+                handle.write("\n")
+
+        with open(self.repeat_summary_path, "wt", newline="") as handle:
+            fields = [
+                "scope", "sample", "haplotype", "coordinate_space",
+                "denominator_kind", "sequence_count", "total_length",
+                "non_nx_length", "gc_percent", "category_key",
+                "category_label", "element_count", "occupied_bp", "percentage",
+            ]
+            writer = csv.DictWriter(
+                handle, fieldnames=fields, delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            scopes = [(graph_stats, graph_element_counts, graph_lengths)]
+            for entry, stats in sample_stats:
+                counts, lengths = self._source_repeat_counters(
+                    entry.key, source_element_counts, source_lengths)
+                scopes.append((stats, counts, lengths))
+            for stats, counts, lengths in scopes:
+                denominator = stats["total_length"]
+                for category_key, category_label in _RM_ROWS + (("masked", "Bases masked"),):
+                    occupied = lengths[category_key]
+                    writer.writerow({
+                        **stats,
+                        "non_nx_length": (
+                            stats["non_nx_length"]
+                            if stats["non_nx_length"] is not None else "NA"),
+                        "gc_percent": (
+                            f"{stats['gc_percent']:.6f}"
+                            if stats["gc_percent"] is not None else "NA"),
+                        "category_key": category_key,
+                        "category_label": category_label.strip().rstrip(":"),
+                        "element_count": (
+                            "NA" if category_key in {"interspersed", "masked"}
+                            else counts[category_key]),
+                        "occupied_bp": occupied,
+                        "percentage": (
+                            f"{100.0 * occupied / denominator:.6f}"
+                            if denominator else "0.000000"),
+                    })
+
+    @staticmethod
+    def _source_repeat_counters(
+            entry_key: Tuple[str, str], element_counts: Counter,
+            occupied_lengths: Counter) -> Tuple[Counter, Counter]:
+        keys = [key for key, _label in _RM_ROWS] + ["masked"]
+        return (
+            Counter({key: element_counts[(entry_key, key)] for key in keys}),
+            Counter({key: occupied_lengths[(entry_key, key)] for key in keys}),
+        )
+
+    @staticmethod
+    def _format_repeat_table_block(
+            file_name: str, stats: Dict[str, object], counts: Counter,
+            lengths: Counter, graph_space: bool) -> str:
+        total = int(stats["total_length"])
+        non_nx = stats["non_nx_length"]
+        masked = lengths["masked"]
+        masked_percent = 100.0 * masked / total if total else 0.0
+        lines = [
+            "=" * 50, f"file name: {file_name}",
+            f"scope: {stats['coordinate_space']}",
+            f"denominator: {stats['denominator_kind']}",
+            f"sequences: {int(stats['sequence_count']):13d}",
+        ]
+        if non_nx is None:
+            lines.extend((
+                f"total length: {total:13d} bp (N/X-excluded length unavailable)",
+                "GC level: NA",
+            ))
+        else:
+            lines.append(
+                f"total length: {total:13d} bp ({int(non_nx)} bp excl N/X-runs)")
+            gc = stats["gc_percent"]
+            lines.append(f"GC level: {gc:.2f} %" if gc is not None else "GC level: NA")
+        lines.extend((
+            f"bases masked: {masked:13d} bp ({masked_percent:6.2f} %)",
+            "=" * 50,
+            "                       number of      length       percentage",
+            "                       elements*    occupied     of sequence",
+            "------------------------------------------------------------",
+        ))
+        for key, label in _RM_ROWS:
+            occupied = lengths[key]
+            percentage = 100.0 * occupied / total if total else 0.0
+            count = "" if key == "interspersed" else str(counts[key])
+            lines.append(
+                f"{label:<40}{count:>10} {occupied:>12} bp {percentage:>7.2f} %")
+            if key in {"retroelements", "ltr", "dna", "interspersed"}:
+                lines.append("")
+        lines.extend((
+            "* RepeatMasker fragments sharing class and ID count as one element;",
+            "  other inputs count distinct source records overlapping callable sequence.",
+            "  Occupied lengths are coordinate-space interval unions.",
+        ))
+        if graph_space:
+            lines.extend((
+                "  Shared nodes are counted once. Class rows are independent unions and",
+                "  can overlap when assemblies assign different identities to one node.",
+            ))
+        else:
+            lines.append(
+                "  Source annotations are intersected with graph-callable genome intervals.")
+        lines.extend((
+            "  Total interspersed repeats unions retroelement, DNA and unclassified",
+            "  aggregate intervals; Rolling-circles remains a separate RepeatMasker row.",
+            "Generated by Pan_TE GFA annotation; this is a RepeatMasker-compatible",
+            "summary, not a RepeatMasker run.",
+        ))
+        return "\n".join(lines) + "\n"
 
     def _write_gff3(self) -> None:
         with open(self.gff3_path, "wt") as handle:
@@ -1292,6 +1717,11 @@ class GfaAnnotator:
                        "projected_intervals": len(self.projected), "conflicts": len(conflicts),
                        "unresolved": len(self.unresolved)},
             "gaf_statistics": dict(sorted(self.gaf_stats.items())),
+            "outputs": {
+                "graph_repeatmasker_style_table": self.repeat_table_path,
+                "sample_repeatmasker_style_table": self.repeat_sample_table_path,
+                "machine_readable_repeat_summary": self.repeat_summary_path,
+            },
             "inputs": [
                 {"sample": entry.sample, "haplotype": entry.haplotype,
                  "annotation_complete": entry.annotation_complete,
@@ -1308,6 +1738,10 @@ class GfaAnnotator:
                 "occurrence_table_is_authoritative": True,
                 "missing_annotation_is_not_negative_without_annotation_complete": True,
                 "rgfa_without_embedded_paths_never_infers_absence": True,
+                "graph_tbl_uses_unique_node_coordinate_unions": True,
+                "sample_tbl_uses_source_coordinate_unions_intersected_with_graph_callable_intervals": True,
+                "tbl_repeatmasker_elements_are_distinct_class_and_fragment_id": True,
+                "tbl_other_elements_are_distinct_source_annotation_records": True,
             },
         }
         with open(self.provenance_path, "wt") as handle:

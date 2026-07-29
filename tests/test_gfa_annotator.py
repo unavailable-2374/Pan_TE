@@ -24,7 +24,7 @@ class GfaAnnotatorTests(unittest.TestCase):
     def write_manifest(root, rows):
         path = root / "annotations.tsv"
         fields = [
-            "sample", "haplotype", "gff3", "te_annotation", "seqid_map",
+            "sample", "haplotype", "fasta", "gff3", "te_annotation", "seqid_map",
             "path_prefix", "gaf", "annotation_complete",
         ]
         with path.open("w", newline="") as handle:
@@ -40,6 +40,91 @@ class GfaAnnotatorTests(unittest.TestCase):
         self.assertEqual(_simple_overlap("4M3=2X"), 9)
         self.assertIsNone(_simple_overlap("4M1I3M"))
         self.assertIsNone(_simple_overlap("*"))
+
+    def test_repeatmasker_style_tbl_reports_union_gc_and_machine_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph = root / "graph.gfa"
+            graph.write_text(
+                "S\tn1\tAAAAANNNNN\n"
+                "S\tn2\tCCCCCCCCCC\n"
+                "S\tn3\tGGGGGGGGGG\n"
+                "P\tsample#1#chr1\tn1+,n2+,n3+\t0M,0M\n")
+            fasta = root / "sample.fa"
+            fasta.write_text(
+                ">chr1\nAAAAANNNNNCCCCCCCCCCGGGGGGGGGG\n")
+            repeats = root / "sample.out"
+            repeats.write_text(
+                " 100 1.0 0.0 0.0 chr1 1 5 (25) + Gypsy1 LTR/Gypsy 1 5 (0) 1\n"
+                " 100 1.0 0.0 0.0 chr1 4 5 (25) + Gypsy1 LTR/Gypsy 4 5 (0) 1\n"
+                " 100 1.0 0.0 0.0 chr1 8 15 (15) + Mu1 DNA/MuDR 1 8 (0) 2\n"
+                " 100 1.0 0.0 0.0 chr1 21 25 (5) + (AT)n Simple_repeat 1 5 (0) 3\n")
+            manifest = self.write_manifest(root, [{
+                "sample": "sample", "haplotype": "1", "fasta": fasta.name,
+                "te_annotation": repeats.name, "annotation_complete": "true",
+            }])
+            annotator = GfaAnnotator(
+                str(graph), str(root / "anno"), str(manifest))
+            annotator.annotate()
+
+            with open(annotator.repeat_summary_path) as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            indexed = {(row["scope"], row["category_key"]): row for row in rows}
+            graph_rows = {key[1]: value for key, value in indexed.items()
+                          if key[0] == "graph"}
+            sample_rows = {row["category_key"]: row for row in rows
+                           if row["scope"] == "sample" and row["sample"] == "sample"}
+
+            self.assertEqual(graph_rows["interspersed"]["occupied_bp"], "13")
+            self.assertEqual(graph_rows["masked"]["occupied_bp"], "18")
+            self.assertEqual(graph_rows["ltr_gypsy"]["occupied_bp"], "5")
+            self.assertEqual(graph_rows["ltr_gypsy"]["element_count"], "1")
+            self.assertEqual(graph_rows["dna_mule"]["occupied_bp"], "8")
+            self.assertEqual(graph_rows["simple_repeat"]["occupied_bp"], "5")
+            self.assertEqual(sample_rows["masked"]["total_length"], "30")
+            self.assertEqual(sample_rows["masked"]["non_nx_length"], "25")
+            self.assertEqual(sample_rows["masked"]["gc_percent"], "80.000000")
+            self.assertEqual(sample_rows["masked"]["denominator_kind"], "source_fasta")
+            with open(annotator.repeat_table_path) as handle:
+                table = handle.read()
+            self.assertIn("bases masked:", table)
+            self.assertIn("Gypsy/DIRS1", table)
+            self.assertIn("summary, not a RepeatMasker run", table)
+
+    def test_graph_tbl_counts_a_shared_node_once_across_sample_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph = root / "graph.gfa"
+            graph.write_text(
+                "S\tn1\tAAAAAAAAAA\n"
+                "P\tsampleA#1#chr1\tn1+\t*\n"
+                "P\tsampleB#1#chr1\tn1+\t*\n")
+            repeat_a = root / "a.out"
+            repeat_b = root / "b.out"
+            repeat_a.write_text(
+                " 100 1.0 0.0 0.0 chr1 1 10 (0) + Gypsy1 LTR/Gypsy 1 10 (0) 1\n")
+            repeat_b.write_text(
+                " 100 1.0 0.0 0.0 chr1 1 10 (0) + Mu1 DNA/MuDR 1 10 (0) 1\n")
+            manifest = self.write_manifest(root, [
+                {"sample": "sampleA", "haplotype": "1",
+                 "te_annotation": repeat_a.name, "annotation_complete": "true"},
+                {"sample": "sampleB", "haplotype": "1",
+                 "te_annotation": repeat_b.name, "annotation_complete": "true"},
+            ])
+            annotator = GfaAnnotator(
+                str(graph), str(root / "anno"), str(manifest))
+            annotator.annotate()
+
+            with open(annotator.repeat_summary_path) as handle:
+                graph_rows = {row["category_key"]: row
+                              for row in csv.DictReader(handle, delimiter="\t")
+                              if row["scope"] == "graph"}
+            self.assertEqual(graph_rows["interspersed"]["occupied_bp"], "10")
+            self.assertEqual(graph_rows["masked"]["occupied_bp"], "10")
+            self.assertEqual(graph_rows["retroelements"]["occupied_bp"], "10")
+            self.assertEqual(graph_rows["dna"]["occupied_bp"], "10")
+            self.assertEqual(graph_rows["retroelements"]["element_count"], "1")
+            self.assertEqual(graph_rows["dna"]["element_count"], "1")
 
     def test_pggb_paths_project_all_genome_te_and_gene_annotations(self):
         with tempfile.TemporaryDirectory() as tmp:

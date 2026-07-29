@@ -265,7 +265,7 @@ manifest 是制表符分隔文件，每个 sample/haplotype 一行。路径可�
 | `path_prefix` | 否 | 非 PanSN path/query 名称的样本前缀 |
 | `seqid_map` | 否 | 两列 `annotation_seqid -> graph_seqid`，解决 NCBI accession 与 `Chr1` 等命名差异 |
 | `gaf` | 否 | 该样本的 rGFA 映射；全局也可用 `--gfa-gaf/--gaf` |
-| `fasta` | 否 | 输入溯源与 checksum；当前投影坐标来自图路径/GAF而非重新比对 FASTA |
+| `fasta` | 否 | 输入溯源与 checksum，并为逐样本 `.tbl` 提供精确的 sequence 数、总长度、N/X-excluded 长度和 GC；投影坐标仍来自图路径/GAF而非重新比对 FASTA |
 
 `sample#haplotype#contig` 形式的注释 seqid 会自动去掉前两段，与 P/W 解出的 contig 对齐。显式 `seqid_map` 优先于自动归一化。重复的 sample/haplotype、冲突映射、缺失文件、非法 GFF3 坐标都会立即失败，而不是静默跳过。
 
@@ -325,19 +325,38 @@ occurrence 是权威层。其 TE fraction 为该 occurrence 的 node-local TE �
 | `gfa_node_occurrence_annotations.tsv` | 每个 occurrence 的坐标、证据、callability、TE coverage 与身份 |
 | `gfa_node_annotations.tsv` | 每个节点的汇总身份、支持度、gene structure、conflict、confidence 与宽格式样本状态 |
 | `gfa_node_sample_matrix.tsv` | node × sample 长格式状态矩阵 |
+| `gfa_annotation.tbl` | RepeatMasker 风格的唯一 GFA node-sequence 空间汇总；共享节点只计一次 |
+| `gfa_annotation_by_sample.tbl` | 每个 sample/haplotype 一个区块的 RepeatMasker 风格源基因组坐标汇总 |
+| `gfa_annotation_summary.tsv` | 上述两种 scope 的机器可读分类、element 数、区间并集长度、百分比、分母、N/X 与 GC |
 | `gfa_node_annotation.gff3` | node-local GFF3 |
 | `gfa_node_annotation_conflicts.tsv` | TE–CDS overlap 审计 |
 | `gfa_annotation_unresolved.tsv` | path/GAF/seqid 无法精确解释的记录及原因 |
 | `pangenome.annotated.gfa` | S 行增加 `ai` 身份、`it` 是否有 TE、`tf` TE fraction、`tc` class、`fm` family、`gs` gene structure、`cf` confidence |
 | `gfa_annotation_provenance.json` | 输入 SHA-256、阈值、图模式、计数、坐标与缺失值契约 |
 
-#### 7.4.7 拟南芥真实 PGGB 验证
+#### 7.4.7 RepeatMasker 风格 `.tbl` 的统计算法
+
+`.tbl` 是对已经投影到图上的既有注释作汇总，不重新运行 RepeatMasker，也不把图拓扑分支数当成重复元件数。程序同时输出两个不可互换的坐标 scope。
+
+`gfa_annotation.tbl` 的分母是所有 S 行节点长度之和，称为 **unique GFA node sequence space**。对每个投影区间使用 `(category,node_id,node_start,node_end)` 排序流式合并；同一 node 被多个样本、多个路径或同一路径的多个 CIGAR block 覆盖时，其相同碱基只计一次。因此 graph `bases masked`、`Total interspersed repeats` 和各 class 长度都不会因样本数而线性膨胀。若两个组装把同一共享 node 分别注释成 Gypsy 和 DNA/MuDR，Gypsy 行和 DNA 行各自都可覆盖该 node；这些 class 行是独立并集，允许相互重叠，不能相加。`Total interspersed repeats` 单独对 Retroelements、DNA transposons 和 Unclassified 三个聚合类求并集，仍是非冗余值。若所有 S 行都有实际 sequence，sequence 数、总长度、N/X-excluded 长度和 `GC/(total-N-X)` 可精确计算；只给 `*` 与 `LN` 时总长度仍可计算，但 N/X 与 GC 明确写 `NA`。
+
+`gfa_annotation_by_sample.tbl` 在每个 `(sample,haplotype)` 的原基因组坐标中统计。先将该样本所有 occurrence 按 `(seqid,genome_start,genome_end)` 合并为 graph-callable 区间；再将每条源 annotation feature 与同 seqid callable union 求交。求交通过已经合并区间的 end 数组和 `bisect_right` 定位首个可能重叠区间，随后只线性扫描实际相邻区间，而不是对每条 feature 扫描整条染色体。交集片段按 `(sample,haplotype,category,seqid)` 的起点顺序流式求并集。manifest 有 `fasta` 时，报告分母为完整 FASTA，总长度、N/X 与 GC 精确；没有 FASTA 时，分母退化为 callable source interval union，GC/N/X 不可由坐标推断而写 `NA`。无论哪种分母，重复长度只来自 annotation 与 graph-callable 区域的交集，因而不会把 minigraph GAF 未覆盖区误说成已投影。
+
+`bases masked` 对 TE、Simple_repeat、Low_complexity、Satellite 和常见 small-RNA 类的全部区间作联合并集；`Total interspersed repeats` 对 Retroelements、DNA transposons 与 Unclassified 三个聚合类的区间作并集，Helitron/RC 按 RepeatMasker 习惯单列 Rolling-circles，不并入该行，所以两者通常不同。分类映射保留 RepeatMasker 常见层次：SINE、Penelope、LINE 及 CRE/L2/R1/R2/RTE/L1 子类，LTR 及 BEL/Copia/Gypsy/retroviral 子类，DNA 及 hAT/Tc1/EnSpm/MULE/PiggyBac/Tourist/other 子类，不能解析的 TE 归 Unclassified。聚合行和子类行都是各自区间并集，聚合行不是对子行简单求和；某些历史 RepeatMasker alias 只进入其兼容子类行，这是为了复现 `.tbl` 的既有层次而不是重新定义生物学分类。
+
+`number of elements` 只统计与 graph-callable 区域至少有 1 bp 交集的来源元素。RepeatMasker `.out` 按 `(class/family, RepeatMasker ID)` 合并被 insertion/deletion 拆开的 fragment，与原 `.tbl` 的 element 计数一致；GFF3/BED 等没有 fragment ID 的输入按去重后的源 annotation record 计。一个元素即使跨越许多节点仍只计一次。图级 element 数是各样本来源元素数，不是 node 数或 graph component 数。上述定义、坐标 scope、分母种类和精确数值同时写入 `gfa_annotation_summary.tsv`；该 TSV 是比较、作图和自动 QC 的权威统计接口，`.tbl` 是便于人工阅读的兼容布局。
+
+复杂度方面，occurrence 和 feature 各进行一次排序；callable 区间先压缩，feature–callable 求交为二分定位加局部扫描；node-space 与 source-space 长度均用每个键只保存最后一个 union 尾端的流式累加器。除了已生成的投影明细及排序引用，不建立逐碱基数组。provenance 明确记录两个 `.tbl` 路径，并声明 graph 使用 unique-node union、sample 使用 callable-source union，以及 RepeatMasker fragment-ID/其他来源 record 的 element 语义。
+
+以 `/scratch/shuoc/TE/Arabidopsis_thaliana/V2/GCA_020911765.2_ASM2091176v2_genomic.fna.tbl` 为参照，将对应 FASTA 的 5 条染色体构造成 5 个 `LN` 节点和 5 条完整 P path，并用显式 `seqid_map` 连接 `CP087126.2–CP087130.2` 与 PanSN 染色体名。程序读取 102,569 条坐标合法的 `.out` feature 并全部投影。逐样本表与原表的 sequence 数 5、总长度 133,917,131 bp、N/X-excluded 长度 133,916,631 bp、GC 36.35%、`bases masked` 43,771,690 bp 和 mask rate 32.69% 完全一致。原 `.out` 另有 18 行 `end < start`，不形成正长度区间，按输入契约排除；其中仅由非法行代表的 fragment ID 不进入 element count。Pan_TE 的 category occupied bp 使用明确的坐标区间并集，RepeatMasker 原 `.tbl` 还包含其内部 overlap/fragment 归属规则，因此分类行的 bp 可有小幅差异；自动比较 mask rate 时以 `masked` 行为准，不把分类行之和替代非冗余 masked union。
+
+#### 7.4.8 拟南芥真实 PGGB 验证
 
 使用 `/scratch/shuoc/TE/Arabidopsis_thaliana/upload` 下 7 套逐基因组 RepeatMasker `.out`，对 PGGB Chr1 smoothxg GFA 完整运行。图含 2,270,366 个节点、3,144,225 条 `0M` links 和 7 条 P paths；程序恢复 17,011,115 个 occurrence，读取 800,587 条全基因组 repeat features，投影 12,150,687 个区间，unresolved 为 0。节点汇总为 TE 853,457、PartialTE 10,872、Mixed 33,237、NonTE 1,372,800。
 
 逐样本将 occurrence 表的 `te_covered_bp` 求和，再独立对原 `.out` 的 Chr1 TE 区间求并集，7 个样本逐 bp 完全相等：TAIR10 6,725,937；T2T 9,089,723；Cvi-0 10,928,548；Ey15-2 10,696,603；IP-Met-6 8,281,890；Rabacal-1 10,936,411；Tsu-0 9,235,551 bp。这同时验证了 PanSN 归一化、P path 坐标、bidirected link、反向节点变换和重叠区间去重。PGGB 将五条染色体拆为五个 community GFA 时应逐文件运行同一 manifest；node id 只在各 community 文件内部解释，不应未经命名空间化直接拼表。
 
-#### 7.4.8 拟南芥真实 minigraph 验证
+#### 7.4.9 拟南芥真实 minigraph 验证
 
 使用同一套 7 个拟南芥 RepeatMasker 结果，运行 `/scratch/shuoc/TE/Arabidopsis_thaliana/Ara.gfa` 与 `rgfa_validation_20260724/Ara_to_graph.gaf`。rGFA 含 74,660 个节点、总 node sequence 166,090,619 bp；1,376 条 primary GAF 全部通过结构、path length、坐标 token/命名 path 和 graph-edge 验证。默认质量阈值保留 521 条记录，其中 295 条为来源坐标 walk、226 条为命名来源 path，855 条低质量记录被审计性过滤。
 
@@ -582,6 +601,9 @@ cd-hit-est -c 0.9 -aS 0.8 -aL 0.8 -G 0 -n 8 -r 1 -mask NX
 | `anno/gfa_node_annotation_intervals.tsv` | GFA node-local 的 TE/基因结构投影区间 |
 | `anno/gfa_node_occurrence_annotations.tsv` | occurrence 级坐标、callability 与身份（权威层） |
 | `anno/gfa_node_annotations.tsv` | 节点汇总身份与样本状态 |
+| `anno/gfa_annotation.tbl` | 唯一 GFA node sequence 空间的 RepeatMasker 风格汇总 |
+| `anno/gfa_annotation_by_sample.tbl` | 各 sample/haplotype 的源坐标 RepeatMasker 风格汇总 |
+| `anno/gfa_annotation_summary.tsv` | 两种 scope 的机器可读长度、数量、百分比与分母 |
 | `anno/pangenome.annotated.gfa` | 带节点身份、TE fraction、class、gene structure 和 confidence 标签的 GFA |
 | `anno/gfa_annotation_provenance.json` | GFA 注释输入 checksum、阈值与缺失值契约 |
 
