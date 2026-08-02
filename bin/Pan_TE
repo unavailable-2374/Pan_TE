@@ -854,13 +854,35 @@ class PanTEPipeline:
         return exists
 
     def run_cmd(self, cmd: str, workdir: Optional[str] = None,
-                env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+                env: Optional[Dict[str, str]] = None,
+                stream: bool = False) -> subprocess.CompletedProcess:
         """Run shell command with error handling and logging."""
         start_time = time.time()
         label = _cmd_label(cmd)
 
         try:
             logger.debug(f"Command: {cmd}")
+            if stream:
+                proc = subprocess.Popen(
+                    cmd, shell=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, encoding='utf-8',
+                    cwd=workdir, env=env)
+                tail = []
+                for line in proc.stdout:
+                    message = line.rstrip()
+                    if message:
+                        logger.info(f"  {message}")
+                        tail.append(message)
+                        tail = tail[-20:]
+                returncode = proc.wait()
+                proc.stdout.close()
+                if returncode:
+                    raise subprocess.CalledProcessError(
+                        returncode, cmd, stderr='\n'.join(tail))
+                duration = time.time() - start_time
+                logger.info(f"  {label} done ({duration:.0f}s)")
+                return subprocess.CompletedProcess(cmd, returncode)
+
             result = subprocess.run(
                 cmd,
                 shell=True,
@@ -1131,6 +1153,7 @@ class PanTEPipeline:
             for fname in files:
                 if fname.endswith('.rtr'):
                     rtr_files.append(os.path.join(root, fname))
+        rtr_files.sort()
 
         if not rtr_files:
             logger.warning("No .rtr files found, skipping LTR consensus")
@@ -1141,44 +1164,12 @@ class PanTEPipeline:
         lib_dir = os.path.join(look4ltrs_dir, 'consensus_lib')
         os.makedirs(lib_dir, exist_ok=True)
 
-        if len(rtr_files) == 1:
-            cmd = (f"python3 {q(build_script)} "
-                   f"--rtr {q(rtr_files[0])} "
-                   f"--genome {q(genome_file)} "
-                   f"--output {q(lib_dir)} "
-                   f"--threads {self.ltr_threads}")
-            self.run_cmd(cmd)
-        else:
-            part_libs = []
-            for i, rtr_file in enumerate(rtr_files):
-                part_dir = os.path.join(lib_dir, f'part_{i}')
-                cmd = (f"python3 {q(build_script)} "
-                       f"--rtr {q(rtr_file)} "
-                       f"--genome {q(genome_file)} "
-                       f"--output {q(part_dir)} "
-                       f"--threads {self.ltr_threads}")
-                try:
-                    self.run_cmd(cmd)
-                    part_lib = os.path.join(part_dir, 'ltr_library.fa')
-                    if (os.path.exists(part_lib)
-                            and os.path.getsize(part_lib) > 0):
-                        part_libs.append(part_lib)
-                except Exception as e:
-                    logger.warning(f"Part {i} consensus failed: {e}")
-
-            if part_libs:
-                combined = os.path.join(lib_dir, 'combined_raw.fa')
-                self.run_cmd(
-                    f"cat {' '.join(q(path) for path in part_libs)} > {q(combined)}"
-                )
-                final = os.path.join(lib_dir, 'ltr_library.fa')
-                self.run_cmd(
-                    f"cd-hit-est -i {q(combined)} -o {q(final)} "
-                    f"-c 0.8 -aS 0.8 -T {self.ltr_threads} -M 0 "
-                    f"> /dev/null 2>&1")
-                logger.info(f"Combined {len(part_libs)} part libraries")
-            else:
-                logger.warning("No part libraries built successfully")
+        cmd = (f"python3 {q(build_script)} "
+               f"--rtr {' '.join(q(path) for path in rtr_files)} "
+               f"--genome {q(genome_file)} "
+               f"--output {q(lib_dir)} "
+               f"--threads {self.ltr_threads}")
+        self.run_cmd(cmd, stream=True)
 
         final_lib = os.path.join(lib_dir, 'ltr_library.fa')
         if os.path.exists(final_lib):

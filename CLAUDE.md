@@ -134,10 +134,12 @@ Pan_TE (main orchestrator)
   - >20GB: sample 4 chunks of ~5GB each
   - Uses ProcessPoolExecutor for parallel part processing
 - **build_ltr_library.py**: Builds consensus from .rtr files
-  - Uses Look4LTRs GraphGroup family assignment
-  - LTR identity-weighted consensus
-  - Cross-family merging via FastGA
-  - Multi-part: build per-part then CD-HIT-EST merge (80% identity)
+  - Uses evidence-gated Look4LTRs GraphGroups and de-nested interiors
+  - LTR identity-weighted consensus with bounded MSA inputs
+  - In scalable mode, pre-clusters at 80% identity by default and skips FastGA for representatives with two non-overlapping RTR loci
+  - In sensitive mode, maps all representatives to retain the small-genome family graph
+  - Uses RTR loci for copy support only; only FastGA homology hits can union families
+  - Processes all RTR parts jointly, so the full genome is searched once
 
 ### 3. mdl-repeat (`build_mdl`)
 - **Language**: Perl (v3.0.0) wrapper around mdl-repeat C binary

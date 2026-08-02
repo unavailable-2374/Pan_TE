@@ -299,9 +299,19 @@ TE context support 为含 TE 的 callable traversal context 数除以全部 call
 
 # 6. Look4LTRs 结构轨道
 
-`LTR_detect` 在规范化基因组上识别具有长末端重复结构的候选，并输出 `.rtr`。`build_ltr_library.py` 根据图分组和家族归属建立共识。分块结果通过 `cd-hit-est -c 0.8 -aS 0.8` 合并为 `Look4LTRs/consensus_lib/ltr_library.fa`。
+`LTR_detect` 在规范化基因组上识别具有左右 LTR 结构的候选并输出 `.rtr`。大于 5 GB 的输入可分块检测，但所有 `.rtr` 在一次 `build_ltr_library.py` 调用中联合建库；文件来源写入内部家族键，从而区分不同分块中的局部 element ID/GraphGroup ID，并且完整基因组只执行一次 FastGA。
 
-该轨道的证据来自 LTR 边界和内部结构，因此优先覆盖结构保存良好且相对年轻的 LTR retrotransposon。结构破损、嵌套或高度分化的候选由 mdl-repeat 和 TE-looker 补充。80% identity 和 80% shorter-sequence coverage 用于轨道内去除明显重复共识，同时保留分化家族。
+完整元件按结构证据分层：LTR identity≥0.85且同时存在PPT、TSD为Tier 1；identity≥0.70且存在PPT为Tier 2；其余完整元件为Tier 3；无右LTR为solo。基因组FASTA文件≥250 MB或原始GraphGroup≥2500时进入scalable mode，否则为sensitive mode。sensitive mode保留全部GraphGroup；scalable mode要求家族含至少两个完整元件，或至少一个Tier 1/2完整元件。solo可为合格家族补充LTR观测，但solo-only组和无第二拷贝证据的Tier-3单例在scalable mode中门控。两个规模触发值和低证据单例策略均可由CLI覆盖。
+
+左右 LTR 和内部区分别提取；`.rtr` 报告的嵌套元件区间从宿主内部区中扣除。每个家族最多选 identity最高的20个元件用于 LTR MSA，最多选10条内部序列。MAFFT 比对后按 LTR identity加权逐列投票，非gap权重超过总权重0.5时保留该列。初始完整共识为左右对称的 `LTR + interior + LTR`。
+
+scalable mode默认先经`cd-hit-est -c 0.8 -aS 0.8 -d 0`去冗余，sensitive mode默认跳过该固定开销；`--precluster`和`--no-precluster`只覆盖预聚类选择，不改变scale mode、证据门控或FastGA查询选择。代表序列首先继承Look4LTRs完整元件坐标。sensitive mode将全部代表送入FastGA，以维持小基因组中的跨GraphGroup连接；scalable mode只搜索少于两个非重叠已知loci的代表。sensitive mode使用identity≥0.60、最短比对200 bp和query coverage≥0.30；scalable mode使用0.70、300 bp和0.50。每个query在流入PAF时仅保留按`identity×query_coverage`排序的前30个命中，所以保存的PAF和下游区间数有严格上界。只有FastGA序列比对命中用于family union；`.rtr`完整区间仅用于copy support和序列提取，避免嵌套/相邻元件造成过度union。FastGA默认7200 s硬超时，并输出每分钟心跳；超时后使用`.rtr`已知拷贝继续完成，未取得第二个非重叠locus的低支持单例由copy QC淘汰。
+
+不同代表若命中同一基因组区间且重叠达到较短区间的50%，则由union-find合并。每组最多保留30个去重loci作为copy support，校正MSA从这些loci的序列中确定性均匀抽取最多10条；header copy数仍按全部loci计算。不足两个拷贝时回退到组内最长初始共识。长度<200 bp、N比例>0.25或拷贝数<2的序列被过滤，之后再以80% identity和80% shorter-sequence coverage去冗余，形成 `Look4LTRs/consensus_lib/ltr_library.fa`。`--no-extend`直接使用`.rtr`已知完整元件数执行copy gate。
+
+FastGA的有界PAF、查询参数指纹和基因组索引指纹保存在`work/`。仅当query哈希、基因组路径/大小/mtime和阈值完全相同才复用；大型MSA目录在成功后移除，`--clean-work`用于显式删除全部断点。Pan_TE实时转发builder日志。
+
+该轨道优先覆盖结构保存良好且相对年轻的LTR retrotransposon；结构破损、严重截断或高度分化的候选由mdl-repeat和TE-looker补充。
 
 # 7. mdl-repeat 的 MDL 重复发现
 

@@ -83,9 +83,19 @@ density(w) = 1                         (w ≤ 1)
 
 ## 4. Look4LTRs 轨道
 
-`process_ltr` 对 `genome/genome.fa` 调用 `LTR_detect`。后者是 Look4LTRs C++ 检测器的封装；规模较大的输入按其策略分块。每个 `.rtr` 结果交给 `build_ltr_library.py`，该步骤以 Look4LTRs 的图分组/家族归属构建 LTR 共识。多个分块库先独立建库，再用 `cd-hit-est -c 0.8 -aS 0.8` 合并为 `Look4LTRs/consensus_lib/ltr_library.fa`。
+`process_ltr` 对 `genome/genome.fa` 调用 `LTR_detect`。后者封装 Look4LTRs C++ 检测器；输入文件大于 5 GB 时按既定规模策略分块。所有 `.rtr` 在一次 `build_ltr_library.py` 调用中联合处理，文件来源加入内部家族键，使分块内局部 element ID 和 GraphGroup ID 不会碰撞，同时避免对同一完整基因组串行重复执行 FastGA。
 
-这一轨道故意依赖 LTR 边界及内部结构信号，因而对“完整、较年轻”的 LTR 元件特别有效；但结构腐蚀、嵌套或远缘家族可能缺少稳定信号，需由另两轨补充。80% 的分块间阈值是轨道内收敛：它合并明显重复的分块产物，但保留足够的进化分化供最后的分类阶段判别。
+`.rtr` 完整元件按 LTR identity、PPT 和 TSD 分层：identity≥0.85 且同时有 PPT/TSD 为 Tier 1；identity≥0.70 且有 PPT 为 Tier 2；其余完整元件为 Tier 3；缺少右 LTR 的记录为 solo。GraphGroup 是局部候选家族，不被解释为跨染色体的全局家族。builder 以基因组 FASTA 文件≥250 MB或原始 GraphGroup≥2500作为 scalable mode 触发条件；阈值分别可由 `--scale-genome-mb` 和 `--scale-family-count` 调整。小输入使用 sensitive mode，保留全部 GraphGroup；scalable mode 保留含至少两个完整元件、或至少一个 Tier 1/2完整元件的 GraphGroup。solo仍可在合格组中贡献LTR序列，但solo-only组不能定义内部区；缺乏第二拷贝和高等级结构证据的Tier-3单例只在scalable mode中门控。`--include-low-confidence-singletons` 可在scalable mode恢复全组输入。
+
+序列提取分别处理左 LTR、右 LTR和内部区。已知嵌套元件的坐标从内部区中扣除，剩余片段按原顺序拼接，因此内部共识不会直接吸收已报告的嵌套插入。每个家族最多使用 identity 最高的 20 个元件（最多 40 条左右 LTR 序列）及 10 条内部序列；MAFFT 后按 LTR identity 加权逐列投票，非 gap 权重大于总权重的 0.5 才输出该列。初始完整共识为 `LTR_consensus + interior_consensus + LTR_consensus`；没有可用内部区时仅输出 LTR 共识。
+
+scalable mode默认在全基因组校正前以`cd-hit-est -c 0.8 -aS 0.8 -d 0`对初始共识去冗余；`-d 0`保留完整家族ID，聚类成员与FASTA ID必须精确闭合。sensitive mode默认跳过这一固定开销；`--precluster`和`--no-precluster`只覆盖预聚类选择，不改变scale mode、证据门控或FastGA查询选择。每个代表首先继承Look4LTRs已报告的完整元件坐标。sensitive mode将全部代表送入FastGA，以保持小基因组中的跨GraphGroup连接；scalable mode只搜索少于两个非重叠已知loci的代表。sensitive mode的FastGA阈值为identity≥0.60、alignment length≥200 bp、query coverage≥0.30；scalable mode相应为0.70、300 bp和0.50。三项均可由命令行覆盖。每个query只保留按`identity × query_coverage`排序的前30个命中，PAF在流入时即限流，因而内存、磁盘和后续区间复杂度均受`30 × query数`约束。只有FastGA序列比对命中参与50%重叠的family union；`.rtr`完整区间可因嵌套或相邻而重叠，只用于copy support与序列提取，不参与union。默认硬超时为7200 s；运行期间每60 s输出心跳。发生超时时，流程保留`.rtr`已知拷贝证据继续完成，无法取得第二个非重叠locus的低支持单例在copy QC中淘汰，而不是让整个LTR轨道失败。
+
+共享基因组区间重叠达到较短区间的 50% 时，代表通过 union-find 合并。每个合并组最多保留 30 个去重基因组 loci 作为 copy support；校正 MSA 从这些 loci 的坐标序列中确定性均匀抽取最多 10 条，避免长 LTR 家族使 MAFFT 规模失控，而 header 中的 copy 数仍按全部 loci 计算。可用拷贝不足两个时回退到组内最长初始共识。最终过滤长度<200 bp、N比例>0.25或基因组拷贝数<2的序列，再以 80% identity/80% shorter coverage 去冗余，输出 `Look4LTRs/consensus_lib/ltr_library.fa`。`--no-extend` 使用 `.rtr` 已知完整元件数执行相同 copy gate，不会因缺少 Phase 6 header 而把全部家族误删。
+
+FastGA PAF、参数指纹和基因组索引指纹默认保存在 `work/`；只有 query 哈希、基因组路径/大小/mtime及阈值完全一致时才复用。大型逐家族 MSA 目录在成功后清除；`--clean-work` 可显式删除所有断点。Pan_TE 将 builder 的阶段日志实时转发到主日志，因此索引、比对、合并和校正进度均可观察。
+
+这一轨道依赖 LTR 边界及内部结构信号，因而优先覆盖完整、相对年轻的 LTR 元件；结构腐蚀、严重截断或高度分化家族由 mdl-repeat 和 TE-looker 补充。
 
 ## 5. mdl-repeat：MDL 核心原理与运行过程
 
