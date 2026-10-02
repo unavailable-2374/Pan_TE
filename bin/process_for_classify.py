@@ -6,6 +6,7 @@ This script processes TE sequences and assigns them to appropriate classificatio
 hierarchies based on predefined rules and characteristics.
 """
 
+import csv
 import sys
 import logging
 import argparse
@@ -29,40 +30,47 @@ class ClassificationRule:
 class TEClassifier:
     """Handles the classification of transposable elements."""
     
+    # ClassifyTE predicts Wicker nodes (nodes/tree.txt). Map them onto the
+    # RepeatMasker Class/Family vocabulary so RepeatMasker's .tbl summary can
+    # bucket them; bare node names are silently counted as Unclassified.
+    # SubclassI is the DNA-transposon (TIR) subclass, not retrotransposon Class I.
     CLASSIFICATION_HIERARCHY = {
-        # LTR Elements
-        'gypsy': 'LTR/Gypsy',
-        'Copia': 'LTR/Copia',
-        'Bel-Pao': 'LTR/Bel-Pao',
-        'Retrovirus': 'LTR/Retrovirus',
-        
-        # Non-LTR Elements
-        'DIRS': 'non-LTR/DIRS',
-        'Ngaro': 'non-LTR/Ngaro',
-        'VIPER': 'non-LTR/VIPER',
-        'LINE': 'non-LTR/LINE',
-        'SINE': 'non-LTR/SINE',
-        'R2': 'non-LTR/R2',
-        'RTE': 'non-LTR/RTE',
-        'Jockey': 'non-LTR/Jockey',
-        'L1': 'non-LTR/L1',
-        
-        # DNA Transposons
-        'TIR': 'DNA/TIR',
-        'Helitron': 'DNA/Helitron',
-        'Maverick': 'DNA/Maverick',
-        'Tc1-Mariner': 'DNA/Tc1-Mariner',
-        'hAT': 'DNA/hAT',
-        'Mutator': 'DNA/Mutator',
-        'Merlin': 'DNA/Merlin',
-        'PiggyBac': 'DNA/PiggyBac',
-        'CACTA': 'DNA/CACTA',
-        
-        # General Categories
+        # nodes/tree.txt
+        'Retrotransposon': 'Unknown',
         'LTR': 'LTR',
-        'non-LTR': 'non-LTR',
+        'Copia': 'LTR/Copia',
+        'gypsy': 'LTR/Gypsy',
+        'Bel-Pao': 'LTR/Pao',
+        'DIRS': 'LTR/DIRS',
+        'LINE': 'LINE',
+        'R2': 'LINE/R2',
+        'RTE': 'LINE/RTE',
+        'Jockey': 'LINE/I-Jockey',
+        'L1': 'LINE/L1',
+        'I': 'LINE/I',
+        'SINE': 'SINE',
+        'tRNA': 'SINE/tRNA',
+        '7SL': 'SINE/7SL',
+        '5S': 'SINE/5S',
+        'DNA transposon': 'DNA',
         'SubclassI': 'DNA',
+        'TIRS': 'DNA',
+        'Tc1-Mariner': 'DNA/TcMar-Tc1',
+        'hAT': 'DNA/hAT',
+        'Mutator': 'DNA/MULE-MuDR',
+        'Merlin': 'DNA/Merlin',
+        'Transib': 'DNA/CMC-Transib',
+        'P': 'DNA/P',
+        'PiggyBac': 'DNA/PiggyBac',
+        'PIF-Harbinger': 'DNA/PIF-Harbinger',
+        'CACTA': 'DNA/CMC-EnSpm',
+        # Other Wicker nodes some ClassifyTE models emit
+        'Retrovirus': 'LTR/ERV',
+        'Ngaro': 'LTR/Ngaro',
+        'TIR': 'DNA',
         'SubclassII': 'DNA',
+        'Helitron': 'RC/Helitron',
+        'Maverick': 'DNA/Maverick',
     }
 
     def __init__(self):
@@ -72,17 +80,17 @@ class TEClassifier:
             for k, v in self.CLASSIFICATION_HIERARCHY.items()
         ]
 
-    def get_classification(self, keyword: str) -> str:
+    def get_classification(self, keyword: str) -> Optional[str]:
         """
-        Get the full classification for a given keyword.
+        Get the RepeatMasker classification for a ClassifyTE label.
         
         Args:
-            keyword: The classification keyword to look up
+            keyword: The ClassifyTE predicted label
             
         Returns:
-            The full classification path
+            The RepeatMasker Class/Family, or None if the label is not known
         """
-        return self.CLASSIFICATION_HIERARCHY.get(keyword, keyword)
+        return self.CLASSIFICATION_HIERARCHY.get(keyword)
 
 class TEProcessor:
     """Processes TE sequences and their classifications."""
@@ -113,37 +121,28 @@ class TEProcessor:
 
         logger.info(f"Processing file: {input_file}")
         
+        # ClassifyTE writes one prediction per line: "<sequence id>,<label>".
+        unmapped: Dict[str, int] = {}
         with input_file.open('r') as file:
-            # Skip header line
-            next(file)
-            
-            # Process file two lines at a time
-            while True:
-                try:
-                    id_line = next(file).strip()
-                    class_line = next(file, '').strip()
-                    
-                    if not class_line:  # End of file
-                        break
-                        
-                    if id_line.startswith('TE_'):
-                        # Get classification keyword (remove comma)
-                        classification_keyword = class_line[1:]
-                        
-                        # Map to full classification
-                        full_classification = self.classifier.get_classification(
-                            classification_keyword
-                        )
-                        
-                        # Create processed line
-                        processed_line = f"{id_line}#{full_classification}"
-                        self.processed_lines.append(processed_line)
-                        
-                except StopIteration:
-                    break
-                except Exception as e:
-                    logger.error(f"Error processing lines: {e}")
+            reader = csv.reader(file)
+            header = next(reader, None)
+            if header is None:
+                raise ValueError(f"Empty prediction file: {input_file}")
+            for row in reader:
+                if len(row) < 2 or not row[0].startswith('TE_'):
                     continue
+                seq_id = row[0].split('#', 1)[0]
+                label = row[1].strip()
+                full_classification = self.classifier.get_classification(label)
+                if full_classification is None:
+                    # Keep the sequence visible as Unknown rather than guess.
+                    unmapped[label] = unmapped.get(label, 0) + 1
+                    full_classification = 'Unknown'
+                # Combine_for_Two reads "<id>#Unknown,<class>"
+                self.processed_lines.append(f"{seq_id}#Unknown,{full_classification}")
+
+        for label, count in sorted(unmapped.items()):
+            logger.warning(f"Unmapped ClassifyTE label '{label}' written as Unknown ({count} sequences)")
 
         logger.info(f"Processed {len(self.processed_lines)} entries")
 
