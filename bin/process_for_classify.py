@@ -21,8 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Calibrated against RepeatClassifier-classified families; see tests and PR notes.
-DEFAULT_MIN_CONFIDENCE = 0.0
+# Calibrated on A. thaliana PAF families that RepeatClassifier did classify,
+# rerun with private KAnalyze temp dirs: at 0.9 precision against
+# RepeatClassifier rises from 0.40 to 0.74 while about 40% fall back to Unknown.
+DEFAULT_MIN_CONFIDENCE = 0.9
 
 @dataclass
 class ClassificationRule:
