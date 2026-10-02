@@ -51,12 +51,15 @@ public class ParallelKmersFeaturesCollector {
                 futures.add(future);
             }
             
-            // Collect results in order
-            for (Future<String> future : futures) {
-                String featureLine = future.get();
-                if (featureLine != null) {
-                    writer.println(featureLine);
+            // Collect results in order. A skipped row would shift every later
+            // feature row onto the wrong sequence ID, so any failure is fatal.
+            for (int i = 0; i < futures.size(); i++) {
+                String featureLine = futures.get(i).get();
+                if (featureLine == null) {
+                    executor.shutdownNow();
+                    throw new IOException("Feature extraction failed for " + sequenceIds.get(i));
                 }
+                writer.println(featureLine);
             }
             
             executor.shutdown();
