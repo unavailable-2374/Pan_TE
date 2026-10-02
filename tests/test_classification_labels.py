@@ -18,15 +18,23 @@ TREE_NODES = [
 RM_CLASS = r"^(LTR|LINE|SINE|DNA|RC|Unknown)(/[^\s#]+)?$"
 
 
-def classify(rc_headers, predictions):
-    """Run process_for_classify.py then Combine_for_Two; return {id: label} and logs."""
+def classify(rc_headers, predictions, extra_args=()):
+    """Run process_for_classify.py then Combine_for_Two; return {id: label} and logs.
+
+    predictions are (id, label) pairs, or (id, label, path, path_probs) for the
+    four-column CSV written by ClassifyTE's evaluate.py.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         (work / "data").mkdir()
         (work / "data" / "re.fa.classified").write_text("".join(f">{h}\nACGT\n" for h in rc_headers))
-        csv_text = "Sequence ID,Predicted label\n" + "".join(f"{i},{label}\n" for i, label in predictions)
+        if predictions and len(predictions[0]) == 4:
+            header = "Sequence ID,Predicted label,Path,Path probability\n"
+        else:
+            header = "Sequence ID,Predicted label\n"
+        csv_text = header + "".join(",".join(p) + "\n" for p in predictions)
         (work / "predicted.csv").write_text(csv_text)
-        proc = subprocess.run([sys.executable, str(PROCESS), "predicted.csv", "result.txt"],
+        proc = subprocess.run([sys.executable, str(PROCESS), "predicted.csv", "result.txt", *extra_args],
                               cwd=work, capture_output=True, text=True, check=True)
         comb = subprocess.run(["perl", str(COMBINE)], cwd=work, capture_output=True, text=True, check=True)
         labels = {}
@@ -77,6 +85,44 @@ class ClassificationLabelTests(unittest.TestCase):
         labels, logs = classify(["TE_00000001#Unknown"], [("TE_00000001#Unknown", "Crypton")])
         self.assertEqual(labels["TE_00000001"], "Unknown")
         self.assertIn("Unmapped ClassifyTE label 'Crypton'", logs)
+
+
+
+HAT_PATH = "DNA transposon|SubclassI|TIRS|hAT"
+
+
+class ConfidenceBackoffTests(unittest.TestCase):
+    def test_low_confidence_leaf_backs_off_to_confident_ancestor(self):
+        # cumulative: 0.95, 0.855, 0.855, 0.342 -> hAT falls below 0.5, TIRS is kept
+        labels, _ = classify(["TE_00000001#Unknown"],
+                             [("TE_00000001#Unknown", "hAT", HAT_PATH, "0.95|0.9|1.0|0.4")],
+                             ["--min-confidence", "0.5"])
+        self.assertEqual(labels["TE_00000001"], "DNA")
+
+    def test_confident_leaf_is_kept(self):
+        labels, _ = classify(["TE_00000001#Unknown"],
+                             [("TE_00000001#Unknown", "hAT", HAT_PATH, "0.99|0.95|1.0|0.9")],
+                             ["--min-confidence", "0.5"])
+        self.assertEqual(labels["TE_00000001"], "DNA/hAT")
+
+    def test_unconfident_first_level_becomes_unknown(self):
+        labels, _ = classify(["TE_00000001#Unknown"],
+                             [("TE_00000001#Unknown", "gypsy", "Retrotransposon|LTR|gypsy", "0.4|0.9|0.9")],
+                             ["--min-confidence", "0.5"])
+        self.assertEqual(labels["TE_00000001"], "Unknown")
+
+    def test_zero_threshold_keeps_predicted_label(self):
+        # Positive control: with the threshold off the predicted leaf is reported.
+        labels, _ = classify(["TE_00000001#Unknown"],
+                             [("TE_00000001#Unknown", "gypsy", "Retrotransposon|LTR|gypsy", "0.4|0.9|0.9")],
+                             ["--min-confidence", "0"])
+        self.assertEqual(labels["TE_00000001"], "LTR/Gypsy")
+
+    def test_two_column_csv_ignores_threshold_with_warning(self):
+        labels, logs = classify(["TE_00000001#Unknown"], [("TE_00000001#Unknown", "gypsy")],
+                                ["--min-confidence", "0.5"])
+        self.assertEqual(labels["TE_00000001"], "LTR/Gypsy")
+        self.assertIn("no path probabilities", logs)
 
 
 if __name__ == "__main__":

@@ -70,6 +70,7 @@ def getCodeLabel(lines):
 
 def evaluate_model(test_data, parent_classifiers, algorithm, h):
 	labels_evaluate = []
+	probs_evaluate = []
 	for i in range(len(test_data)):
 		if algorithm == "lcpnb":
 			c = lcpnb.lcpnb(h)
@@ -77,7 +78,8 @@ def evaluate_model(test_data, parent_classifiers, algorithm, h):
 			c = nllcpn.nllcpn(h)
 		predicted = c.classify(test_data.iloc[i].values.reshape(1,-1),parent_classifiers)
 		labels_evaluate.append(predicted)
-	return labels_evaluate
+		probs_evaluate.append(getattr(c, 'predicted_probs', []))
+	return labels_evaluate, probs_evaluate
 
 
 def main(h, data, algorithm, modelname):
@@ -96,10 +98,10 @@ def main(h, data, algorithm, modelname):
 
 	print("---------------------------Evaluation Started----------------------------\n")
 
-	labels_test = evaluate_model(test_data, parent_classifiers, algorithm, h )
+	labels_test, probs_test = evaluate_model(test_data, parent_classifiers, algorithm, h )
 	
 	fb.close()
-	return labels_test
+	return labels_test, probs_test
 
 
 
@@ -141,7 +143,7 @@ if __name__ == '__main__':
 	
 
 	hier_label = {}
-	hier_label = main(h, data, options.algorithm, options.modelname)
+	hier_label, hier_probs = main(h, data, options.algorithm, options.modelname)
 
 	output_filepath = "output/"
 	if not os.path.isdir(output_filepath):
@@ -150,7 +152,9 @@ if __name__ == '__main__':
 	output_txt = "predicted_result_" + options.feature_dir + ".txt"
 	f = open(os.path.join(output_filepath, output_filename) ,'w')
 	ft = open(os.path.join(output_filepath, output_txt) ,'w')
-	f.write("Sequence ID" + "," + "Predicted label" + "\n")
+	# Path / Path probability: node labels from root to leaf and each node's
+	# probability given its parent. Readers of the first two columns are unaffected.
+	f.write("Sequence ID" + "," + "Predicted label" + "," + "Path" + "," + "Path probability" + "\n")
 	ft.write("Prediction Results" + "\n")
 	
 	count = 0
@@ -173,9 +177,14 @@ if __name__ == '__main__':
 		ft.write('\n\n')
 		seq_id = name.split(" ")
 		print(seq_id[0])
+		path_probs = hier_probs[count] if count < len(hier_probs) else []
 		f.write(seq_id[0])
 		f.write(',')
 		f.write(label)
+		f.write(',')
+		f.write('|'.join(predicted_labels))
+		f.write(',')
+		f.write('|'.join('{:.6f}'.format(p) for p in path_probs))
 		f.write('\n')
 		print('\n')
 		print('###############################################################')

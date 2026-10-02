@@ -9,6 +9,7 @@ class lcpnb:
 	def __init__(self,h):
 		self.H = h
 		self.predicted = []
+		self.predicted_probs = []
 		self.probs = {}
 
 
@@ -45,5 +46,7 @@ class lcpnb:
 		self.predicted = predicteds[np.argmax(sum_probs)]
 		
 		self.predicted = [ c for c in self.predicted if not c.startswith('#') ]
+		# Conditional probability of each node given its parent, along the chosen path.
+		self.predicted_probs = [ float(self.probs[c]) for c in self.predicted ]
 		return self.predicted
 		

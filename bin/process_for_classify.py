@@ -21,6 +21,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Calibrated against RepeatClassifier-classified families; see tests and PR notes.
+DEFAULT_MIN_CONFIDENCE = 0.0
+
 @dataclass
 class ClassificationRule:
     """Data class for TE classification rules."""
@@ -95,15 +98,43 @@ class TEClassifier:
 class TEProcessor:
     """Processes TE sequences and their classifications."""
     
-    def __init__(self, classifier: TEClassifier):
+    def __init__(self, classifier: TEClassifier, min_confidence: float = 0.0):
         """
         Initialize the processor.
         
         Args:
             classifier: TEClassifier instance for handling classifications
+            min_confidence: Minimum cumulative path probability for a node to be
+                reported; deeper nodes below it back off to their ancestor
         """
         self.classifier = classifier
+        self.min_confidence = min_confidence
         self.processed_lines: List[str] = []
+        self.backoff_counts: Dict[str, int] = {}
+
+    def choose_label(self, label: str, path: Optional[str], path_probs: Optional[str]) -> str:
+        """
+        Pick the deepest node on the predicted path whose cumulative probability
+        reaches min_confidence; return 'Unknown' if even the first level does not.
+        Without path probabilities (older ClassifyTE) the predicted label is kept.
+        """
+        if self.min_confidence <= 0 or not path or not path_probs:
+            return label
+        nodes = path.split('|')
+        probs = [float(p) for p in path_probs.split('|')]
+        if len(nodes) != len(probs):
+            raise ValueError(f"Path and probabilities differ in length: {path} / {path_probs}")
+        chosen = 'Unknown'
+        cumulative = 1.0
+        for node, prob in zip(nodes, probs):
+            cumulative *= prob
+            if cumulative < self.min_confidence:
+                break
+            chosen = node
+        if chosen != label:
+            key = f"{label}->{chosen}"
+            self.backoff_counts[key] = self.backoff_counts.get(key, 0) + 1
+        return chosen
 
     def process_file(self, input_file: Path) -> None:
         """
@@ -128,11 +159,17 @@ class TEProcessor:
             header = next(reader, None)
             if header is None:
                 raise ValueError(f"Empty prediction file: {input_file}")
+            has_probs = len(header) >= 4
+            if self.min_confidence > 0 and not has_probs:
+                logger.warning("Prediction file has no path probabilities; "
+                               "--min-confidence is ignored (update ClassifyTE's evaluate.py)")
             for row in reader:
                 if len(row) < 2 or not row[0].startswith('TE_'):
                     continue
                 seq_id = row[0].split('#', 1)[0]
                 label = row[1].strip()
+                if has_probs and len(row) >= 4:
+                    label = self.choose_label(label, row[2].strip(), row[3].strip())
                 full_classification = self.classifier.get_classification(label)
                 if full_classification is None:
                     # Keep the sequence visible as Unknown rather than guess.
@@ -143,6 +180,8 @@ class TEProcessor:
 
         for label, count in sorted(unmapped.items()):
             logger.warning(f"Unmapped ClassifyTE label '{label}' written as Unknown ({count} sequences)")
+        for change, count in sorted(self.backoff_counts.items()):
+            logger.info(f"Backed off below confidence {self.min_confidence}: {change} ({count} sequences)")
 
         logger.info(f"Processed {len(self.processed_lines)} entries")
 
@@ -193,6 +232,15 @@ def parse_arguments() -> argparse.Namespace:
     )
     
     parser.add_argument(
+        '--min-confidence',
+        type=float,
+        default=DEFAULT_MIN_CONFIDENCE,
+        help="Minimum cumulative ClassifyTE path probability for a node to be "
+             "reported; less confident predictions back off to their ancestor "
+             "(0 disables; default: %(default)s)"
+    )
+    
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help="Enable verbose logging"
@@ -210,7 +258,7 @@ def main() -> None:
     try:
         # Initialize classifier and processor
         classifier = TEClassifier()
-        processor = TEProcessor(classifier)
+        processor = TEProcessor(classifier, args.min_confidence)
         
         # Process input file
         processor.process_file(args.input_file)
