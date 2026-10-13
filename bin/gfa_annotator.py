@@ -533,6 +533,162 @@ def _group_offsets(sorted_keys: np.ndarray, groups: int) -> np.ndarray:
     return np.searchsorted(sorted_keys, np.arange(groups + 1), side="left")
 
 
+class _StringPool:
+    """Append-only UTF-8 pool for per-feature strings (ids, parents, attributes)."""
+
+    __slots__ = ("data", "offset", "length")
+
+    def __init__(self):
+        self.data = bytearray()
+        self.offset = array("q")
+        self.length = array("I")
+
+    def add(self, value: str) -> None:
+        encoded = value.encode("utf-8", "surrogatepass")
+        self.offset.append(len(self.data))
+        self.length.append(len(encoded))
+        self.data += encoded
+
+    def get(self, i: int) -> str:
+        start = int(self.offset[i])
+        return self.data[start:start + int(self.length[i])].decode("utf-8", "surrogatepass")
+
+    def keep(self, mask: np.ndarray) -> None:
+        self.offset = _column(self.offset, np.int64)[mask]
+        self.length = _column(self.length, np.uint32)[mask]
+
+
+class _FeatureStore:
+    """Column store for source annotations, materialized as ``Feature`` on read.
+
+    Repeated strings (seqids, types, classes, families, file names) are interned
+    to codes; strings that are unique per record live in byte pools.  Rows are
+    appended during loading, then ``finalize`` drops exact duplicates (keeping
+    the first) and builds the 1 kb bin index used for projection.
+    """
+
+    _COLUMNS = (
+        ("source", "I"), ("start", "q"), ("end", "q"), ("strand", "I"),
+        ("phase", "I"), ("feature_type", "I"), ("category", "I"),
+        ("family", "I"), ("te_class", "I"), ("file", "I"),
+    )
+    _DTYPES = {"I": np.uint32, "q": np.int64}
+
+    def __init__(self):
+        self.sources = _Interner()      # (entry_key, seqid)
+        self.labels = _Interner()
+        for name, code in self._COLUMNS:
+            setattr(self, name, array(code))
+        self.feature_id = _StringPool()
+        self.parent = _StringPool()
+        self.attributes = _StringPool()
+        self.hashes = array("q")
+        self.bin_keys = np.zeros(0, dtype=np.int64)
+        self.bin_features = np.zeros(0, dtype=np.uint32)
+
+    def add(self, entry_key: Tuple[str, str], seqid: str, start: int, end: int,
+            strand: str, phase: str, feature_type: str, category: str,
+            feature_id: str, parent: str, family: str, te_class: str,
+            source: str, attributes: str) -> None:
+        label = self.labels.code
+        source_code = self.sources.code((entry_key, seqid))
+        codes = (label(strand), label(feature_type), label(category),
+                 label(family), label(te_class))
+        self.source.append(source_code)
+        self.start.append(start)
+        self.end.append(end)
+        self.strand.append(codes[0])
+        self.phase.append(label(phase))
+        self.feature_type.append(codes[1])
+        self.category.append(codes[2])
+        self.family.append(codes[3])
+        self.te_class.append(codes[4])
+        self.file.append(label(source))
+        self.feature_id.add(feature_id)
+        self.parent.add(parent)
+        self.attributes.add(attributes)
+        self.hashes.append(hash((source_code, start, end, codes, feature_id, parent)))
+
+    def append(self, feature: Feature) -> None:
+        self.add(feature.entry_key, feature.seqid, feature.start, feature.end,
+                 feature.strand, feature.phase, feature.feature_type, feature.category,
+                 feature.feature_id, feature.parent, feature.family, feature.te_class,
+                 feature.source, feature.attributes)
+
+    def __len__(self) -> int:
+        return len(self.start)
+
+    def __getitem__(self, i: int) -> Feature:
+        if i < 0:
+            i += len(self)
+        labels = self.labels.values
+        entry_key, seqid = self.sources.values[int(self.source[i])]
+        return Feature(
+            entry_key, seqid, int(self.start[i]), int(self.end[i]),
+            labels[int(self.strand[i])], labels[int(self.phase[i])],
+            labels[int(self.feature_type[i])], labels[int(self.category[i])],
+            self.feature_id.get(i), self.parent.get(i), labels[int(self.family[i])],
+            labels[int(self.te_class[i])], labels[int(self.file[i])],
+            self.attributes.get(i),
+        )
+
+    def __iter__(self) -> Iterator[Feature]:
+        return (self[i] for i in range(len(self)))
+
+    def _key(self, i: int) -> Tuple:
+        return (int(self.source[i]), int(self.start[i]), int(self.end[i]),
+                int(self.strand[i]), int(self.feature_type[i]), int(self.category[i]),
+                int(self.family[i]), int(self.te_class[i]),
+                self.feature_id.get(i), self.parent.get(i))
+
+    def finalize(self) -> None:
+        hashes = _column(self.hashes, np.int64)
+        keep = np.ones(len(hashes), dtype=bool)
+        if len(hashes) > 1:
+            order = np.argsort(hashes, kind="stable")
+            ordered = hashes[order]
+            starts = np.flatnonzero(np.concatenate(([True], ordered[1:] != ordered[:-1])))
+            sizes = np.diff(np.append(starts, len(ordered)))
+            del ordered
+            # Equal hashes are confirmed on the full key; members of a group are
+            # in row order, so the first copy of each key is the one kept.
+            for group in np.flatnonzero(sizes > 1).tolist():
+                seen = set()
+                start = int(starts[group])
+                for row in order[start:start + int(sizes[group])].tolist():
+                    key = self._key(row)
+                    if key in seen:
+                        keep[row] = False
+                    else:
+                        seen.add(key)
+            del order, starts, sizes
+        del hashes
+        self.hashes = array("q")
+        for name, code in self._COLUMNS:
+            setattr(self, name, _column(getattr(self, name), self._DTYPES[code])[keep])
+        for pool in (self.feature_id, self.parent, self.attributes):
+            pool.keep(keep)
+        del keep
+        self._build_bins()
+
+    def _build_bins(self) -> None:
+        if not len(self):
+            return
+        if len(self.sources.values) >= 1 << 27:
+            raise ValueError("too many annotated sequences for packed bin keys")
+        first = self.start // _BIN_SIZE
+        counts = (self.end - 1) // _BIN_SIZE - first + 1
+        if int(first.max() + counts.max()) >= 1 << 36:
+            raise ValueError("annotation coordinate too large for packed bin keys")
+        rows = np.repeat(np.arange(len(self), dtype=np.int64), counts)
+        within = np.arange(len(rows), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+        keys = (self.source.astype(np.int64)[rows] << 36) | (first[rows] + within)
+        del within
+        order = np.argsort(keys, kind="stable")
+        self.bin_keys = keys[order]
+        self.bin_features = rows[order].astype(np.uint32)
+
+
 class GfaAnnotator:
     """Project all-genome annotations and summarize GFA node identities."""
 
@@ -560,9 +716,7 @@ class GfaAnnotator:
 
         self.entries: Dict[Tuple[str, str], ManifestEntry] = {}
         self.seqid_maps: Dict[Tuple[str, str], Dict[str, str]] = defaultdict(dict)
-        self.features: List[Feature] = []
-        self.features_by_source: Dict[Tuple[Tuple[str, str], str], List[int]] = defaultdict(list)
-        self.feature_bins: Dict[Tuple[Tuple[str, str], str, int], List[int]] = defaultdict(list)
+        self.features = _FeatureStore()
         self.annotation_seqids: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
         self.nodes: Dict[str, Node] = {}
         # Segment ids by Node.index, followed by ids that occur only in L lines
@@ -709,22 +863,9 @@ class GfaAnnotator:
                     self._read_gff3(entry, entry.te_annotation, force_te=True)
             self._derive_introns(entry, before)
 
-        seen = set()
-        unique = []
-        for feature in self.features:
-            key = (feature.entry_key, feature.seqid, feature.start, feature.end,
-                   feature.strand, feature.feature_type, feature.category,
-                   feature.feature_id, feature.parent, feature.family, feature.te_class)
-            if key not in seen:
-                seen.add(key)
-                unique.append(feature)
-        self.features = unique
-        for index, feature in enumerate(self.features):
-            source_key = (feature.entry_key, feature.seqid)
-            self.features_by_source[source_key].append(index)
-            self.annotation_seqids[feature.entry_key].add(feature.seqid)
-            for bin_id in range(feature.start // _BIN_SIZE, (feature.end - 1) // _BIN_SIZE + 1):
-                self.feature_bins[(feature.entry_key, feature.seqid, bin_id)].append(index)
+        self.features.finalize()
+        for entry_key, seqid in self.features.sources.values:
+            self.annotation_seqids[entry_key].add(seqid)
 
     def _read_gff3(self, entry: ManifestEntry, path: str, force_te: bool) -> None:
         with _open_text(path) as handle:
@@ -753,11 +894,11 @@ class GfaAnnotator:
                 if is_te:
                     family = next((lower[k] for k in ("family", "repeat_family", "name", "id", "target") if k in lower), feature_id)
                     te_class = next((lower[k] for k in ("classification", "repeat_class", "class", "superfamily") if k in lower), feature_type)
-                self.features.append(Feature(
+                self.features.add(
                     entry.key, self._normalize_seqid(entry, fields[0]), start, end, fields[6], fields[7],
                     feature_type, category, feature_id, parent, family, te_class,
                     os.path.basename(path), fields[8],
-                ))
+                )
 
     def _read_repeatmasker(self, entry: ManifestEntry, path: str) -> None:
         with _open_text(path) as handle:
@@ -773,7 +914,7 @@ class GfaAnnotator:
                     continue
                 strand = "-" if fields[8] == "C" else "+"
                 is_te = not bool(_NON_TE_RM_CLASS_RE.match(fields[10]))
-                self.features.append(Feature(
+                self.features.add(
                     entry.key, self._normalize_seqid(entry, fields[4]), start, end, strand, ".",
                     "transposable_element" if is_te else fields[10],
                     "TE" if is_te else "other",
@@ -785,7 +926,7 @@ class GfaAnnotator:
                         f"perc_del={fields[2]}", f"perc_ins={fields[3]}",
                         f"RepeatID={fields[14] if len(fields) > 14 else ''}",
                     )),
-                ))
+                )
 
     def _read_bed(self, entry: ManifestEntry, path: str) -> None:
         with _open_text(path) as handle:
@@ -798,12 +939,12 @@ class GfaAnnotator:
                 start, end = int(fields[1]), int(fields[2])
                 name = fields[3] if len(fields) > 3 else f"TE:{fields[0]}:{start}-{end}"
                 family, _, te_class = name.partition("#")
-                self.features.append(Feature(
+                self.features.add(
                     entry.key, self._normalize_seqid(entry, fields[0]), start, end,
                     fields[5] if len(fields) > 5 and fields[5] in "+-" else ".", ".",
                     "transposable_element", "TE", name, "", family,
                     te_class or "Unknown", os.path.basename(path), "BED",
-                ))
+                )
 
     def _read_seqid_map(self, entry: ManifestEntry) -> None:
         with _open_text(entry.seqid_map) as handle:
@@ -836,8 +977,14 @@ class GfaAnnotator:
 
     def _derive_introns(self, entry: ManifestEntry, start_index: int) -> None:
         exons: Dict[Tuple[str, str], List[Feature]] = defaultdict(list)
-        for feature in self.features[start_index:]:
-            if feature.entry_key != entry.key or feature.feature_type.lower() != "exon":
+        features = self.features
+        exon_codes = {code for code, value in enumerate(features.labels.values)
+                      if value.lower() == "exon"}
+        for index in range(start_index, len(features) if exon_codes else start_index):
+            if features.feature_type[index] not in exon_codes:
+                continue
+            feature = features[index]
+            if feature.entry_key != entry.key:
                 continue
             for parent in filter(None, feature.parent.split(",")):
                 exons[(feature.seqid, parent)].append(feature)
@@ -846,11 +993,11 @@ class GfaAnnotator:
             for left, right in zip(values, values[1:]):
                 if right.start <= left.end:
                     continue
-                self.features.append(Feature(
+                self.features.add(
                     entry.key, seqid, left.end, right.start, left.strand, ".", "intron",
                     "gene_structure", f"intron:{parent}:{left.end}-{right.start}", parent,
                     "", "", "derived_from_exons", f"Parent={parent}",
-                ))
+                )
 
     def parse_gfa_occurrences(self) -> None:
         # Three streaming passes keep memory proportional to the graph, not to
@@ -1483,44 +1630,86 @@ class GfaAnnotator:
                                  "rGFA_origin", "origin_only")
 
     def project_annotations(self) -> None:
-        occurrences, projected = self.occurrences, self.projected
-        sources = occurrences.sources.values
-        features, feature_bins = self.features, self.feature_bins
+        """Join occurrences with overlapping features of the same source sequence.
+
+        Rows are emitted per occurrence in ascending feature order, exactly as
+        a per-occurrence scan of the 1 kb feature bins would emit them.
+        """
+        occurrences, projected, features = self.occurrences, self.projected, self.features
         total = len(occurrences)
-        for o in range(total):
-            entry_key, seqid = sources[occurrences.source[o]]
-            genome_start, genome_end = occurrences.genome_start[o], occurrences.genome_end[o]
-            candidates: Set[int] = set()
-            for bin_id in range(genome_start // _BIN_SIZE,
-                                (genome_end - 1) // _BIN_SIZE + 1):
-                candidates.update(feature_bins.get((entry_key, seqid, bin_id), ()))
-            if candidates:
-                node_start, node_end = occurrences.node_start[o], occurrences.node_end[o]
-                reverse = occurrences.reverse[o]
-                for index in sorted(candidates):
-                    feature = features[index]
-                    overlap_start = max(feature.start, genome_start)
-                    overlap_end = min(feature.end, genome_end)
-                    if overlap_end <= overlap_start:
-                        continue
-                    left = overlap_start - genome_start
-                    right = overlap_end - genome_start
-                    projected.occurrence.append(o)
-                    projected.feature.append(index)
-                    if reverse:
-                        projected.node_start.append(node_end - right)
-                        projected.node_end.append(node_end - left)
-                    else:
-                        projected.node_start.append(node_start + left)
-                        projected.node_end.append(node_start + right)
-                    projected.genome_start.append(overlap_start)
-                    projected.genome_end.append(overlap_end)
-            if (o + 1) % 1_000_000 == 0:
-                logger.info("Projection progress: %d/%d occurrences; %d intervals",
-                            o + 1, total, len(projected))
+        if not total or not len(features):
+            return
+        to_feature_source = np.array(
+            [features.sources.codes.get(value, -1) for value in occurrences.sources.values],
+            dtype=np.int64)
+        occurrence_source = _column(occurrences.source, np.uint32)
+        occurrence_start = _column(occurrences.genome_start, np.int64)
+        occurrence_end = _column(occurrences.genome_end, np.int64)
+        occurrence_node_start = _column(occurrences.node_start, np.int64)
+        occurrence_node_end = _column(occurrences.node_end, np.int64)
+        occurrence_reverse = _column(occurrences.reverse, np.uint8)
+        bin_keys, bin_features = features.bin_keys, features.bin_features
+        feature_start, feature_end = features.start, features.end
+        for chunk_start, chunk_end in self._chunks(total):
+            rows = np.arange(chunk_start, chunk_end, dtype=np.int64)
+            source = to_feature_source[occurrence_source[rows]]
+            rows = rows[source >= 0]
+            source = source[source >= 0]
+            genome_start, genome_end = occurrence_start[rows], occurrence_end[rows]
+            first = genome_start // _BIN_SIZE
+            counts = np.maximum((genome_end - 1) // _BIN_SIZE - first + 1, 0)
+            local = np.repeat(np.arange(len(rows), dtype=np.int64), counts)
+            within = np.arange(len(local), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+            keys = (source[local] << 36) | (first[local] + within)
+            low = np.searchsorted(bin_keys, keys, side="left")
+            hits = np.searchsorted(bin_keys, keys, side="right") - low
+            pair_local = np.repeat(local, hits)
+            within = np.arange(len(pair_local), dtype=np.int64) - np.repeat(np.cumsum(hits) - hits, hits)
+            pair_feature = bin_features[np.repeat(low, hits) + within].astype(np.int64)
+            del keys, low, hits, within, local
+            overlap_start = np.maximum(feature_start[pair_feature], genome_start[pair_local])
+            overlap_end = np.minimum(feature_end[pair_feature], genome_end[pair_local])
+            hit = overlap_end > overlap_start
+            pair_local, pair_feature = pair_local[hit], pair_feature[hit]
+            overlap_start, overlap_end = overlap_start[hit], overlap_end[hit]
+            order = np.lexsort((pair_feature, pair_local))
+            pair_local, pair_feature = pair_local[order], pair_feature[order]
+            overlap_start, overlap_end = overlap_start[order], overlap_end[order]
+            # A feature and an occurrence that share several bins pair once.
+            if len(pair_local) > 1:
+                first_pair = np.ones(len(pair_local), dtype=bool)
+                first_pair[1:] = ((pair_local[1:] != pair_local[:-1]) |
+                                  (pair_feature[1:] != pair_feature[:-1]))
+                pair_local, pair_feature = pair_local[first_pair], pair_feature[first_pair]
+                overlap_start, overlap_end = overlap_start[first_pair], overlap_end[first_pair]
+            pair_rows = rows[pair_local]
+            left = overlap_start - genome_start[pair_local]
+            right = overlap_end - genome_start[pair_local]
+            reverse = occurrence_reverse[pair_rows].astype(bool)
+            node_start = np.where(reverse, occurrence_node_end[pair_rows] - right,
+                                  occurrence_node_start[pair_rows] + left)
+            node_end = np.where(reverse, occurrence_node_end[pair_rows] - left,
+                                occurrence_node_start[pair_rows] + right)
+            projected.occurrence.frombytes(pair_rows.astype(np.uint32).tobytes())
+            projected.feature.frombytes(pair_feature.astype(np.uint32).tobytes())
+            projected.node_start.frombytes(node_start.astype(np.int64).tobytes())
+            projected.node_end.frombytes(node_end.astype(np.int64).tobytes())
+            projected.genome_start.frombytes(overlap_start.astype(np.int64).tobytes())
+            projected.genome_end.frombytes(overlap_end.astype(np.int64).tobytes())
+            logger.info("Projection progress: %d/%d occurrences; %d intervals",
+                        chunk_end, total, len(projected))
 
     def _entry_complete(self, occurrence: Occurrence) -> bool:
         return self.entries[occurrence.entry_key].annotation_complete
+
+    def _label_rank(self, codes: np.ndarray) -> np.ndarray:
+        """Per-row rank of interned feature labels in Python string order."""
+        labels = self.features.labels.values
+        used = np.unique(codes).tolist()
+        rank = np.zeros(len(labels), dtype=np.int64)
+        for position, code in enumerate(sorted(used, key=labels.__getitem__)):
+            rank[code] = position
+        return rank[codes]
 
     def _node_sort_rank(self) -> np.ndarray:
         """Rank of every node id (by node index) in Python string order."""
@@ -1551,11 +1740,7 @@ class GfaAnnotator:
         columns = self._projection_columns()
         node_rank = self._node_sort_rank()
         rank_rows = node_rank[columns["node"]]
-        feature_types = sorted({feature.feature_type for feature in self.features})
-        type_rank = {value: rank for rank, value in enumerate(feature_types)}
-        feature_type_rank = np.fromiter(
-            (type_rank[feature.feature_type] for feature in self.features),
-            dtype=np.int32, count=len(self.features))
+        feature_type_rank = self._label_rank(self.features.feature_type)
         # Same order as a stable sort on (node_id, node_start, node_end,
         # occurrence_id, feature_type); occurrence ids are zero-padded row numbers.
         sorted_projected = np.lexsort((
@@ -1789,6 +1974,36 @@ class GfaAnnotator:
         self._write_annotated_gfa()
         self._write_provenance(conflicts)
 
+    def _features_in_source_order(self) -> np.ndarray:
+        """Feature rows sorted by (entry_key, seqid, start, end, feature_id, feature_type)."""
+        features = self.features
+        if not len(features):
+            return np.zeros(0, dtype=np.int64)
+        values = features.sources.values
+        source_rank = np.empty(len(values), dtype=np.int64)
+        source_rank[np.fromiter(sorted(range(len(values)), key=values.__getitem__),
+                                dtype=np.int64, count=len(values))] = np.arange(len(values))
+        rank = source_rank[features.source]
+        order = np.lexsort((features.end, features.start, rank))
+        # Rows sharing source, start and end are ordered by their string keys;
+        # lexsort is stable, so remaining full ties keep row order.
+        a, b = order[:-1], order[1:]
+        tied = (rank[a] == rank[b]) & (features.start[a] == features.start[b]) & \
+            (features.end[a] == features.end[b])
+        del a, b, rank
+        if tied.any():
+            starts = np.flatnonzero(np.concatenate(([True], ~tied)))
+            sizes = np.diff(np.append(starts, len(order)))
+            labels = features.labels.values
+            for group in np.flatnonzero(sizes > 1).tolist():
+                lo = int(starts[group])
+                hi = lo + int(sizes[group])
+                order[lo:hi] = sorted(
+                    order[lo:hi].tolist(),
+                    key=lambda row: (features.feature_id.get(row),
+                                     labels[int(features.feature_type[row])]))
+        return order
+
     def _write_repeat_tables(
             self, sorted_projected: np.ndarray, columns: Dict[str, np.ndarray]) -> None:
         """Write RepeatMasker-style graph-space and source-space summaries."""
@@ -1810,46 +2025,60 @@ class GfaAnnotator:
             key: [end for _start, end in intervals]
             for key, intervals in callable_intervals.items()
         }
+        self._feature_source_order = self._features_in_source_order()
 
         source_union = _StreamingUnion()
         source_element_counts: Counter = Counter()
         graph_element_counts: Counter = Counter()
         counted_repeatmasker_ids: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
-        for feature in sorted(
-                self.features,
-                key=lambda x: (x.entry_key, x.seqid, x.start, x.end,
-                               x.feature_id, x.feature_type)):
-            buckets = _repeat_summary_buckets(
-                feature.category, feature.feature_type,
-                feature.family, feature.te_class)
-            source_key = (feature.entry_key, feature.seqid)
-            intervals = callable_intervals.get(source_key)
-            if not buckets or not intervals:
-                continue
-            index = bisect_right(callable_ends[source_key], feature.start)
-            overlaps: List[Tuple[int, int]] = []
-            while index < len(intervals) and intervals[index][0] < feature.end:
-                start = max(feature.start, intervals[index][0])
-                end = min(feature.end, intervals[index][1])
-                if end > start:
-                    overlaps.append((start, end))
-                index += 1
-            if not overlaps:
-                continue
-            count_element = True
-            if feature.parent.startswith("RMID:"):
-                seen_ids = counted_repeatmasker_ids[feature.entry_key]
-                fragment_key = f"{feature.te_class}\0{feature.parent}"
-                count_element = fragment_key not in seen_ids
-                seen_ids.add(fragment_key)
-            for bucket in buckets:
-                if count_element:
-                    source_element_counts[(feature.entry_key, bucket)] += 1
-                    graph_element_counts[bucket] += 1
-                for start, end in overlaps:
-                    source_union.add(
-                        (feature.entry_key, bucket, feature.seqid), start, end)
+        features = self.features
+        labels = features.labels.values
+        source_values = features.sources.values
+        feature_buckets: Dict[Tuple[int, int, int, int], Tuple[str, ...]] = {}
+        for start_row, end_row in self._chunks(len(features)):
+            rows = self._feature_source_order[start_row:end_row]
+            for row, source_code, feature_start, feature_end, category, feature_type, \
+                    family, te_class in zip(
+                        rows.tolist(), features.source[rows].tolist(),
+                        features.start[rows].tolist(), features.end[rows].tolist(),
+                        features.category[rows].tolist(), features.feature_type[rows].tolist(),
+                        features.family[rows].tolist(), features.te_class[rows].tolist()):
+                label_key = (category, feature_type, family, te_class)
+                buckets = feature_buckets.get(label_key)
+                if buckets is None:
+                    buckets = feature_buckets[label_key] = _repeat_summary_buckets(
+                        labels[category], labels[feature_type], labels[family],
+                        labels[te_class])
+                source_key = source_values[source_code]
+                intervals = callable_intervals.get(source_key)
+                if not buckets or not intervals:
+                    continue
+                index = bisect_right(callable_ends[source_key], feature_start)
+                overlaps: List[Tuple[int, int]] = []
+                while index < len(intervals) and intervals[index][0] < feature_end:
+                    start = max(feature_start, intervals[index][0])
+                    end = min(feature_end, intervals[index][1])
+                    if end > start:
+                        overlaps.append((start, end))
+                    index += 1
+                if not overlaps:
+                    continue
+                entry_key, seqid = source_key
+                count_element = True
+                parent = features.parent.get(row)
+                if parent.startswith("RMID:"):
+                    seen_ids = counted_repeatmasker_ids[entry_key]
+                    fragment_key = f"{labels[te_class]}\0{parent}"
+                    count_element = fragment_key not in seen_ids
+                    seen_ids.add(fragment_key)
+                for bucket in buckets:
+                    if count_element:
+                        source_element_counts[(entry_key, bucket)] += 1
+                        graph_element_counts[bucket] += 1
+                    for start, end in overlaps:
+                        source_union.add((entry_key, bucket, seqid), start, end)
 
+        self._feature_source_order = None
         source_lengths: Counter = Counter()
         for (entry_key, bucket, _seqid), length in source_union.total.items():
             source_lengths[(entry_key, bucket)] += length
@@ -1857,24 +2086,31 @@ class GfaAnnotator:
         # Rows arrive grouped by node and sorted by node_start, so the per-node
         # interval union state can be dropped whenever the node changes.
         graph_lengths: Counter = Counter()
-        bucket_cache: Dict[int, Tuple[str, ...]] = {}
+        bucket_cache: Dict[Tuple[int, int, int, int], Tuple[str, ...]] = {}
+        labels = self.features.labels.values
         node_union = _StreamingUnion()
         current_node = None
         for start, end in self._chunks(len(sorted_projected)):
             order = sorted_projected[start:end]
-            for node, node_start, node_end, feature_index in zip(
+            feature_rows = columns["feature"][order]
+            features = self.features
+            for node, node_start, node_end, category, feature_type, family, te_class in zip(
                     columns["node"][order].tolist(), columns["node_start"][order].tolist(),
-                    columns["node_end"][order].tolist(), columns["feature"][order].tolist()):
+                    columns["node_end"][order].tolist(),
+                    features.category[feature_rows].tolist(),
+                    features.feature_type[feature_rows].tolist(),
+                    features.family[feature_rows].tolist(),
+                    features.te_class[feature_rows].tolist()):
                 if node != current_node:
                     graph_lengths.update(node_union.total)
                     node_union = _StreamingUnion()
                     current_node = node
-                buckets = bucket_cache.get(feature_index)
+                label_key = (category, feature_type, family, te_class)
+                buckets = bucket_cache.get(label_key)
                 if buckets is None:
-                    feature = self.features[feature_index]
-                    buckets = bucket_cache[feature_index] = _repeat_summary_buckets(
-                        feature.category, feature.feature_type, feature.family,
-                        feature.te_class)
+                    buckets = bucket_cache[label_key] = _repeat_summary_buckets(
+                        labels[category], labels[feature_type], labels[family],
+                        labels[te_class])
                 for bucket in buckets:
                     node_union.add(bucket, node_start, node_end)
         graph_lengths.update(node_union.total)
