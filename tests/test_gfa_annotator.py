@@ -471,6 +471,42 @@ class GfaAnnotatorTests(unittest.TestCase):
             self.assertEqual(nodes["n1"]["sample:sampleB"], "NA")
             self.assertEqual(nodes["n2"]["sample:sampleA"], "NA")
 
+    def test_streamed_traversals_keep_order_and_drop_duplicate_occurrences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph = root / "graph.gfa"
+            # The W line precedes the P lines but is still resolved after them;
+            # the repeated P line re-traverses the same source coordinates and
+            # the links are only given in their reverse-complement view.
+            graph.write_text(
+                "W\tsampleB\t1\tChr1\t0\t10\t>n1>n2\n"
+                "S\tn1\tAAAAA\nS\tn2\tCCCCC\n"
+                "P\tsampleA#1#Chr1\tn1+,n2+\t*\n"
+                "P\tsampleA#1#Chr1\tn1+,n2+\t*\n"
+                "L\tn2\t-\tn1\t-\t0M\n")
+            gff = root / "a.gff3"
+            gff.write_text("Chr1\tgenes\tgene\t1\t10\t.\t+\t.\tID=a\n")
+            manifest = self.write_manifest(root, [
+                {"sample": "sampleA", "haplotype": "1", "gff3": gff.name,
+                 "annotation_complete": "true"},
+                {"sample": "sampleB", "haplotype": "1", "gff3": gff.name,
+                 "annotation_complete": "true"},
+            ])
+            annotator = GfaAnnotator(str(graph), str(root / "anno"), str(manifest))
+            annotator.annotate()
+
+            occurrences = [(x.occurrence_id, x.sample, x.node_id, x.genome_start)
+                           for x in annotator.occurrences]
+            self.assertEqual(occurrences, [
+                ("occ_000000000001", "sampleA", "n1", 0),
+                ("occ_000000000002", "sampleA", "n2", 5),
+                ("occ_000000000003", "sampleB", "n1", 0),
+                ("occ_000000000004", "sampleB", "n2", 5),
+            ])
+            self.assertEqual(len(annotator.projected), 4)
+            self.assertEqual(Path(annotator.unresolved_path).read_text(),
+                             "record\treason\tdetail\n")
+
     def test_pan_te_anno_only_skips_discovery_and_writes_new_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
