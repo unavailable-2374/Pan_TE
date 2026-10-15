@@ -102,6 +102,7 @@ at <https://www.dfam.org/releases/>.)
 |--------|-------------|
 | `--genome <fa>` | Genome FASTA. Required unless `--paf` or `--gfa` is given. |
 | `--model-dir <dir>` | Path to ClassifyTE (enables classification). |
+| `--keep-contained` | Keep classified entries that are contained fragments of a longer same-class entry (dropped by default). |
 | `--paf <file>` / `--paf-fasta <fa...>` | PAF from all-vs-all alignment + its assembly FASTA(s). FASTA identifiers must be unique across assemblies. |
 | `--paf-mapping <tsv>` | Optional chromosome mapping (seqname, assembly_id, chr_id). |
 | `--gfa <file>` / `--gfa-ref <name>` | Pangenome graph (rGFA / PGGB smoothxg); reference sample/path auto-detected if omitted. rGFA default allele mode requires `--gfa-gaf`. |
@@ -126,7 +127,8 @@ at <https://www.dfam.org/releases/>.)
 ## Output
 
 - `combine/raw_te_library.fa` — deduplicated de novo TE library (all three tracks merged).
-- `combine/TEs.fa` — the classified TE library (when `--model-dir` is provided).
+- `combine/TEs.fa` — the classified TE library (when `--model-dir` is provided). Entries that are fragments contained (≥80% coverage, ≥80% identity) in a longer entry of the same class, or Unknown fragments, are dropped; contained entries of a different class (likely nested insertions) are kept. Use `--keep-contained` to skip this step.
+- `combine/TEs.unpruned.fa` and `combine/contained_fragments.tsv` — the library before that step and the per-entry drop/keep report.
 - `genome/gfa_enrichment/gfa_allele_manifest.tsv` — one row per locus-aware allele occurrence, with locus, coordinates, type, exact representative, sample support, QC status, and rGFA+GAF provenance when applicable.
 - `genome/gfa_enrichment/gfa_rgfa_locus_presence.tsv` — rGFA candidate-locus `0/1/NA` matrix. The SR=0 reference sample is fixed to `0`; other `0` calls require one quality GAF record spanning both candidate anchors; unresolved/overlapping calls remain `NA`.
 - `genome/gfa_enrichment/gfa_unique_locus_alleles.fa` — exact locus-aware representative sequences before QC (kept by default).

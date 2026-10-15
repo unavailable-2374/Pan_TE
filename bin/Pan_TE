@@ -468,6 +468,11 @@ def parse_arguments():
                        type=str,
                        default='',
                        help='Extra arguments passed verbatim to dtr run')
+    parser.add_argument('--keep-contained',
+                       action='store_true',
+                       help='Keep library entries that are fragments contained (>=80%% '
+                            'coverage, >=80%% identity) in a longer entry of the same '
+                            'class. By default they are dropped after classification.')
     parser.add_argument('--te-looker-final-gated',
                        action='store_true',
                        help='Require dtr internal stitch/gate/merge and its explicit '
@@ -609,7 +614,8 @@ class PanTEPipeline:
                  te_looker_extra_args: str = '',
                  te_looker_final_gated: bool = False,
                  te_looker_w: int = 1,
-                 memory_limit_mb: int = 0):
+                 memory_limit_mb: int = 0,
+                 keep_contained: bool = False):
         """Initialize the pipeline with configuration parameters."""
         self.original_genome_file = os.path.abspath(genome_file) if genome_file else None
         self.genome_file = None  # Will be set after decompression if needed
@@ -642,6 +648,7 @@ class PanTEPipeline:
         self.te_looker_final_gated = bool(te_looker_final_gated)
         self.te_looker_w = max(1, int(te_looker_w or 1))
         self.memory_limit_mb = int(memory_limit_mb or 0)
+        self.keep_contained = bool(keep_contained)
         self._dtr_caps: Optional[Dict] = None
         self.processed_genome = os.path.join(self.output_dir, DIR_GENOME, 'genome.fa')
 
@@ -1931,9 +1938,31 @@ class PanTEPipeline:
                 f"{q(os.path.join(BIN_DIR, 'run_Classifier'))} {q(self.model_dir)} {self.threads}",
                 combine_dir
             )
+            self.drop_contained_fragments(combine_dir)
 
         self.create_checkpoint('combine')
         logger.info("Combine done")
+
+    def drop_contained_fragments(self, combine_dir):
+        """Drop classified entries contained in a longer entry of the same class.
+
+        Runs after classification because the keep/drop rule compares classes:
+        a contained fragment is dropped when it shares the longer entry's
+        top-level class or is Unknown, and kept when the class differs (likely
+        a nested insertion). The unpruned library is kept as TEs.unpruned.fa.
+        """
+        library = os.path.join(combine_dir, 'TEs.fa')
+        if self.keep_contained or not os.path.exists(library) or os.path.getsize(library) == 0:
+            return
+        import drop_contained_fragments
+        unpruned = os.path.join(combine_dir, 'TEs.unpruned.fa')
+        shutil.copyfile(library, unpruned)
+        logger.info("Dropping same-class contained fragments (cd-hit-est -c 0.8 -aS 0.8)...")
+        stats = drop_contained_fragments.run(
+            unpruned, library, threads=self.threads,
+            report=os.path.join(combine_dir, 'contained_fragments.tsv'))
+        logger.info(f"Contained fragments: {stats['input']} -> {stats['kept']} "
+                    f"({stats['dropped']} dropped, {stats['kept_cross_class']} kept as cross-class)")
 
     def annotate_gfa(self):
         """Project all supplied genome annotations onto GFA node coordinates."""
@@ -2033,7 +2062,8 @@ def main():
             te_looker_extra_args=args.te_looker_extra_args,
             te_looker_final_gated=args.te_looker_final_gated,
             te_looker_w=args.te_looker_w,
-            memory_limit_mb=args.M
+            memory_limit_mb=args.M,
+            keep_contained=args.keep_contained
         )
 
         if args.M > 0:
