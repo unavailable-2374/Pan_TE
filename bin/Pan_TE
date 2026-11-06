@@ -1932,8 +1932,20 @@ class PanTEPipeline:
                 combine_dir
             )
 
+        self._apply_final_gene_filter(combine_dir, te_library)
+
         self.create_checkpoint('combine')
         logger.info("Combine done")
+
+    def _apply_final_gene_filter(self, combine_dir: str, unclassified_library: str):
+        """Remove host-gene sequence from the finished library. Failure aborts the run."""
+        from final_gene_filter import filter_library, resolve_cellular_db
+        classified = os.path.join(combine_dir, 'TEs.fa')
+        library = classified if os.path.exists(classified) else unclassified_library
+        before = os.path.join(combine_dir, 'TEs.before_gene_filter.fa')
+        shutil.copyfile(library, before)
+        logger.info("Removing host-gene sequence from the final library")
+        filter_library(before, resolve_cellular_db(), combine_dir, self.threads)
 
     def annotate_gfa(self):
         """Project all supplied genome annotations onto GFA node coordinates."""

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pan_te-setup-data — fetch the data assets that cannot ship inside the conda package
-# (license / redistribution limits): the Dfam library used by RepeatMasker, and the
-# ClassifyTE code + trained models.
+# (license / redistribution limits): the Dfam library used by RepeatMasker, the
+# ClassifyTE code + trained models, and the cellular protein DB for the final gene filter.
 #
 # This script performs REAL downloads. If a download fails it stops with the exact error
 # and a non-zero exit code — it never fabricates or stubs the data.
@@ -9,12 +9,14 @@
 #   pan_te-setup-data --classifyte-dir <DIR>           # fetch ClassifyTE repo + models
 #   pan_te-setup-data --dfam-url <URL>                 # fetch a Dfam famdb partition for RepeatMasker
 #   pan_te-setup-data --dfam-list                      # show how to pick a Dfam partition
+#   pan_te-setup-data --cellular-db <DIR>              # build the cellular protein DB (required)
 #   pan_te-setup-data --classifyte-dir <DIR> --dfam-url <URL>   # both
 set -euo pipefail
 
 CLASSIFYTE_DIR=""
 DFAM_URL=""
 DFAM_LIST=0
+CELLULAR_DIR=""
 CLASSIFYTE_REPO="https://github.com/unavailable-2374/ClassifyTE.git"
 # ClassifyTE_Models.zip (Google Drive file id from the Pan_TE README).
 CLASSIFYTE_MODELS_GDRIVE_ID="1CuDciG0Ru5zRBhffjQmgJdqSMQB89mfh"
@@ -28,6 +30,8 @@ Options:
                          Pass DIR to Pan_TE later as --model-dir.
   --dfam-url URL         Download this Dfam famdb .h5 partition into RepeatMasker's
                          Libraries/famdb/ directory (see --dfam-list for how to choose).
+  --cellular-db DIR      Download Swiss-Prot and build DIR/sprot_cell. Required by the final
+                         gene filter; set PAN_TE_CELLULAR_DB=DIR/sprot_cell to use it.
   --dfam-list            Explain how to choose a Dfam partition URL, then exit.
   -h, --help             Show this help.
 EOF
@@ -41,6 +45,7 @@ while [ $# -gt 0 ]; do
         --classifyte-dir) CLASSIFYTE_DIR="${2:?}"; shift 2 ;;
         --dfam-url)       DFAM_URL="${2:?}"; shift 2 ;;
         --dfam-list)      DFAM_LIST=1; shift ;;
+        --cellular-db)    CELLULAR_DIR="${2:?}"; shift 2 ;;
         -h|--help)        usage; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -67,7 +72,32 @@ EOF
     exit 0
 fi
 
-[ -n "$CLASSIFYTE_DIR" ] || [ -n "$DFAM_URL" ] || { usage; die "nothing to do: pass --classifyte-dir and/or --dfam-url"; }
+[ -n "$CLASSIFYTE_DIR" ] || [ -n "$DFAM_URL" ] || [ -n "$CELLULAR_DIR" ] || { usage; die "nothing to do: pass --classifyte-dir, --dfam-url and/or --cellular-db"; }
+
+if [ -n "$CELLULAR_DIR" ]; then
+    for tool in curl diamond makeblastdb RepeatMasker python3; do
+        command -v "$tool" >/dev/null || die "$tool not found on PATH"
+    done
+    PEPS="$(dirname "$(readlink -f "$(command -v RepeatMasker)")")/Libraries/RepeatPeps.lib"
+    [ -s "$PEPS" ] || die "RepeatPeps.lib not found at $PEPS"
+    BUILDER="$(dirname "$(readlink -f "$(command -v Pan_TE)")")/../share/pan_te/build_cellular_db.py"
+    [ -f "$BUILDER" ] || BUILDER="$(dirname "$(readlink -f "$0")")/../../bin/build_cellular_db.py"
+    [ -f "$BUILDER" ] || die "build_cellular_db.py not found"
+    mkdir -p "$CELLULAR_DIR"
+    QUERY='(reviewed:true)%20NOT%20(keyword:KW-0814)%20NOT%20(taxonomy_id:10239)'
+    log "Downloading Swiss-Prot cellular proteins into $CELLULAR_DIR"
+    curl -fsS --retry 5 -o "$CELLULAR_DIR/sprot_q.fa.gz" \
+        "https://rest.uniprot.org/uniprotkb/stream?format=fasta&compressed=true&query=$QUERY" \
+        || die "Swiss-Prot download failed"
+    gzip -t "$CELLULAR_DIR/sprot_q.fa.gz" || die "Swiss-Prot download is corrupt"
+    curl -fsSI "https://rest.uniprot.org/uniprotkb/search?query=reviewed:true&size=1" \
+        | grep -i '^x-uniprot-release:' > "$CELLULAR_DIR/UNIPROT_RELEASE" || die "could not read the UniProt release"
+    gzip -dc "$CELLULAR_DIR/sprot_q.fa.gz" > "$CELLULAR_DIR/sprot_q.fa"
+    python3 "$BUILDER" "$CELLULAR_DIR/sprot_q.fa" "$PEPS" "$CELLULAR_DIR" "${THREADS:-8}" \
+        || die "cellular DB build failed"
+    rm -f "$CELLULAR_DIR/sprot_q.fa"
+    log "Cellular DB ready. Use: export PAN_TE_CELLULAR_DB=$CELLULAR_DIR/sprot_cell"
+fi
 
 # ---------------------------------------------------------------------------
 # ClassifyTE: clone repo + fetch trained models

@@ -49,7 +49,7 @@ def _blastx_cellular(fasta_path: str, db_path: str, config,
 
     Returns {qid: (max_coverage, pident_at_max_cov, subject_title)} where coverage =
     aligned_aa * 3 / nucleotide_qlen, taken as the per-query maximum over HSPs that
-    meet the identity floor. Empty dict on any failure (caller treats as no hit).
+    meet the identity floor. A BLAST failure raises: "no hit" must mean BLAST found none.
     """
     # blastx -num_threads scales poorly on one query stream; split the query into
     # n_jobs chunks run as concurrent processes (each 1 thread) to use the cores.
@@ -94,9 +94,7 @@ def _blastx_cellular(fasta_path: str, db_path: str, config,
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as ex:
         for j, rc, err, op in ex.map(_run, range(n_jobs)):
             if rc != 0:
-                logger.warning(f"gene-exclusion blastx chunk {j} failed ({rc} {err}); "
-                               f"skipping exclusion")
-                return {}
+                raise RuntimeError(f"gene-exclusion blastx chunk {j} failed ({rc} {err})")
             out_files.append(op)
 
     pid_floor = config.gene_excl_min_pident

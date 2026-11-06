@@ -34,6 +34,7 @@ CORE_TOOLS: List[Tuple[str, str, str, Tuple[str, ...]]] = [
     ('trf',          'Step 3 (mdl-repeat)', 'bioconda::trf',           ('mdl_repeat',)),
     ('rmblastn',     'Step 3 (Refiner)',    'bioconda::rmblast',       ('mdl_repeat',)),
     ('blastn',       'Step 3 (Refiner)',    'bioconda::blast',         ('mdl_repeat',)),
+    ('blastx',       'Step 5 (gene filter)', 'bioconda::blast',        ('combine',)),
     ('makeblastdb',  'Step 3 (Refiner)',    'bioconda::blast',         ('mdl_repeat',)),
     ('mafft',        'Step 3 (Refiner)',    'bioconda::mafft',         ('mdl_repeat',)),
     ('abpoa',        'Step 3 (Refiner)',    'bioconda::abpoa',         ('mdl_repeat',)),
@@ -316,6 +317,17 @@ def _check_classifier(pipeline, report: Report, pending: set) -> None:
                     f"Re-fetch with `pan_te-setup-data --classifyte-dir <dir>`")
 
 
+def _check_cellular_db(report: Report, pending: set) -> None:
+    """The final gene filter has no skip path, so a missing DB must stop the run up front."""
+    if 'combine' not in pending:
+        return
+    from final_gene_filter import resolve_cellular_db
+    if not resolve_cellular_db():
+        report.failures.append(
+            "cellular protein DB not found (needed by the final gene filter). Build it with "
+            "`pan_te-setup-data --cellular-db <DIR>` and set PAN_TE_CELLULAR_DB=<DIR>/sprot_cell")
+
+
 def _estimate_genome_bp(pipeline) -> Tuple[int, str]:
     """Genome size for the memory check: the .fai when it exists, else the FASTA size.
 
@@ -403,6 +415,7 @@ def run_preflight(pipeline, check_only: bool = False) -> bool:
     _check_perl(bin_dir, report, pending)
     _check_python(report, pending)
     _check_classifier(pipeline, report, pending)
+    _check_cellular_db(report, pending)
     _check_memory(pipeline, report, pending)
 
     for message in report.warnings:

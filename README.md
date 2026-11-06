@@ -63,7 +63,13 @@ conda. Fetch them after install with the bundled helper:
         --classifyte-dir ~/Pan_TE_data/ClassifyTE \
         --dfam-url https://www.dfam.org/releases/Dfam_3.9/families/dfam39_full.0.h5.gz
 
-(From a source checkout, call `bin/pan_te-setup-data`. Verify the current Dfam release/filenames
+The final gene filter also requires a cellular protein DB (Swiss-Prot with TE proteins removed).
+Pan_TE stops at preflight when it is missing:
+
+    pan_te-setup-data --cellular-db ~/Pan_TE_data/cellular
+    export PAN_TE_CELLULAR_DB=~/Pan_TE_data/cellular/sprot_cell
+
+(From a source checkout, call `recipes/pan_te/pan_te-setup-data`. Verify the current Dfam release/filenames
 at <https://www.dfam.org/releases/>.)
 
 ## Usage

@@ -833,10 +833,7 @@ sub refine_consensus {
     $bed_arg = "--bed " . shell_quote($bed_file) if -f $bed_file;
     $stats_arg = "--stats " . shell_quote($stats_file) if -f $stats_file;
 
-    # Curation reference assets (env-overridable). Cellular protein DB = SwissProt with
-    # TE proteins removed (species-agnostic). Used only if present; steps skip otherwise.
-    my $REFS = "/scratch/shuoc/TE/Pan_TE_refs";
-    my $cellular_db = $ENV{PAN_TE_CELLULAR_DB} // ((-f "$REFS/sprot_cell.pin") ? "$REFS/sprot_cell" : "");
+    # Host-gene removal runs once on the finished library (bin/final_gene_filter.py), not here.
     my $organelle_ref = $ENV{PAN_TE_ORGANELLE_REF} // "";
     # barrnap resolved from PATH (conda provides it); PAN_TE_BARRNAP overrides if needed.
     my $barrnap_exe = $ENV{PAN_TE_BARRNAP} // "barrnap";
@@ -854,18 +851,14 @@ sub refine_consensus {
         "--enable-copy-recruit",
         "--hard-min-copies 5",
         "--enable-rescue",
-        # Library curation (gene exclusion + non-TE separation). Cellular protein DB is
-        # a species-agnostic pipeline asset; organelle ref is species-specific (optional,
-        # rRNA/satellite still run without it). Each step skips cleanly if its tool/ref
-        # is absent. Override paths via env (PAN_TE_CELLULAR_DB / PAN_TE_ORGANELLE_REF).
-        ($cellular_db ? "--cellular-protein-db " . shell_quote($cellular_db) : ""),
+        # Non-TE separation. Organelle ref is species-specific (optional, rRNA/satellite
+        # still run without it). Override the path via env (PAN_TE_ORGANELLE_REF).
         "--enable-nonte",
         ($organelle_ref ? "--organelle-ref " . shell_quote($organelle_ref) : ""),
         ($barrnap_exe ? "--barrnap-exe " . shell_quote($barrnap_exe) : ""),
-        # Phase-1 rmblastn copy source + seed de-nesting (N7) + protein flank trim.
+        # Phase-1 rmblastn copy source + seed de-nesting (N7).
         "--enable-rmblastn-copies",
         "--enable-seed-chimera",
-        "--enable-flank-trim",
         "--enable-structural-trim",
         $bed_arg,
         $stats_arg
