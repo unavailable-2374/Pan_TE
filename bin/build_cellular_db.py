@@ -10,7 +10,8 @@ Input is a Swiss-Prot FASTA already restricted by the UniProt query
   so RepeatPeps cannot flag a host protein that translates one, and such a segment would
   make the filter cut real Alu entries. Segments homologous to RepeatPeps, or to the
   translated Dfam curated TE consensi (identity >= 35%), are replaced by X. The rest of the
-  protein stays usable.
+  protein stays usable. Dfam segments are located with DIAMOND and with BLASTX at the same
+  settings the gene filter uses, so the mask is at least as sensitive as the filter.
 
 Usage: build_cellular_db.py <query.fa> <RepeatPeps.lib> <Dfam-curated_only.embl.gz> <output_dir> <threads>
 """
@@ -106,6 +107,39 @@ def write_masked_fasta(source: str, target: str, mask) -> tuple:
     return total, masked_proteins, masked_aa
 
 
+def blastx_segments(query: str, db: str, threads: int, work_dir: str):
+    """Protein intervals hit by translated TE consensi, at the gene filter's BLASTX settings."""
+    records, name = {}, None
+    for line in open(query):
+        if line.startswith(">"):
+            name = line[1:].split()[0]; records[name] = []
+        else:
+            records[name].append(line.strip())
+    chunks = [os.path.join(work_dir, f"dfam_q{j}.fa") for j in range(threads)]
+    handles = [open(c, "w") for c in chunks]
+    for i, (k, v) in enumerate(records.items()):
+        handles[i % threads].write(f">{k}\n{''.join(v)}\n")
+    for h in handles:
+        h.close()
+
+    def run(chunk):
+        out = chunk + ".tsv"
+        subprocess.run(["blastx", "-query", chunk, "-db", db, "-evalue", "1e-5", "-max_target_seqs", "100000",
+                        "-num_threads", "1", "-outfmt", "6 sseqid sstart send pident", "-out", out], check=True)
+        return out
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        outs = list(pool.map(run, chunks))
+    for out in outs:
+        for line in open(out):
+            protein, start, end, pident = line.split()
+            if float(pident) >= float(MIN_IDENTITY):
+                yield min(int(start), int(end)), max(int(start), int(end)), protein
+    for c in chunks + outs:
+        os.remove(c)
+
+
 def diamond(*args) -> None:
     subprocess.run(["diamond", *args, "--quiet"], check=True)
 
@@ -143,12 +177,20 @@ def main(query: str, peps: str, dfam_embl: str, out_dir: str, threads: str) -> N
         protein, start, end = line.split()
         mask[protein].append(tuple(sorted((int(start), int(end)))))
 
+    subprocess.run(["makeblastdb", "-in", path("sprot_unmasked.fa"), "-dbtype", "prot", "-out", path("sprot_unmasked"),
+                    "-parse_seqids"], check=True, stdout=subprocess.DEVNULL)
+    for start, end, protein in blastx_segments(path("dfam_te.fa"), path("sprot_unmasked"), int(threads), out_dir):
+        mask[protein].append((start, end))
+
     total, masked_proteins, masked_aa = write_masked_fasta(path("sprot_unmasked.fa"), path("sprot_cell.fa"), mask)
     subprocess.run(["makeblastdb", "-in", path("sprot_cell.fa"), "-dbtype", "prot", "-out", path("sprot_cell"),
                     "-parse_seqids"], check=True, stdout=subprocess.DEVNULL)
     for name in ("sprot_kw.fa", "sprot_unmasked.fa", "vs_peps.tsv", "seg_peps.tsv", "seg_dfam.tsv",
                  "dfam_te.fa", "peps.dmnd", "sprot.dmnd"):
         os.remove(path(name))
+    for name in os.listdir(out_dir):
+        if name.startswith("sprot_unmasked."):
+            os.remove(path(name))
     print(f"sprot_cell: {total} proteins, {families} Dfam TE families, "
           f"{masked_proteins} proteins with {masked_aa} residues masked, in {out_dir}")
 
