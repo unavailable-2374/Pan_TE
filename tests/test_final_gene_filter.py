@@ -1,3 +1,4 @@
+import io
 import os
 import stat
 import subprocess
@@ -119,6 +120,26 @@ class CellularDbTests(unittest.TestCase):
     def test_te_product_names_are_removed(self):
         self.assertTrue(build_cellular_db.names_te_product(">sp|P1|X Transposase foo OS=Bar OX=1"))
         self.assertFalse(build_cellular_db.names_te_product(">sp|P2|Y F-box protein OS=Copia virus"))
+
+    def test_only_te_families_are_taken_from_dfam(self):
+        embl = """ID   DF1; SV 1; linear; DNA; STD; UNC; 5 BP.
+CC   RepeatMasker Annotations:
+CC        Type: SINE
+SQ   Sequence 5 BP;
+     acgta                                                         5
+//
+ID   DF2; SV 1; linear; DNA; STD; UNC; 5 BP.
+CC        Type: Satellite
+SQ   Sequence 5 BP;
+     ttttt                                                         5
+//
+""".splitlines(True)
+        out = io.StringIO()
+        self.assertEqual(build_cellular_db.embl_te_consensi(embl, out), 1)
+        self.assertEqual(out.getvalue(), ">DF1\nacgta\n")
+
+    def test_te_segments_are_masked_and_the_rest_kept(self):
+        self.assertEqual(build_cellular_db.mask_sequence("MKLVAGT", [(2, 3), (7, 99)]), "MXXVAGX")
 
 
 if __name__ == "__main__":

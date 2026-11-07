@@ -3,7 +3,8 @@
 
 Multi-copy host gene families (F-box, LRR-RLK, PPR, lectins, ...) are recurrent and get
 collected as repeats; they mask coding sequence without being TEs. This step runs on the
-finished library, against a cellular protein DB with TE proteins removed:
+finished library, against a cellular protein DB with TE proteins removed and TE-derived
+protein segments masked (see build_cellular_db.py):
 
 1. Drop by the single-HSP rule (Refiner_mdl.phase2_gene_exclusion): coverage >= 0.5 with no
    TE evidence, or coverage >= 0.7 regardless of evidence.

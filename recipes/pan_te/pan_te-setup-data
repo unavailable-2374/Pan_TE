@@ -92,8 +92,14 @@ if [ -n "$CELLULAR_DIR" ]; then
     gzip -t "$CELLULAR_DIR/sprot_q.fa.gz" || die "Swiss-Prot download is corrupt"
     curl -fsSI "https://rest.uniprot.org/uniprotkb/search?query=reviewed:true&size=1" \
         | grep -i '^x-uniprot-release:' > "$CELLULAR_DIR/UNIPROT_RELEASE" || die "could not read the UniProt release"
+    DFAM_EMBL="$CELLULAR_DIR/Dfam-curated_only-1.embl.gz"
+    log "Downloading the Dfam curated TE families"
+    curl -fsS --retry 5 -o "$DFAM_EMBL" \
+        "https://www.dfam.org/releases/Dfam_3.9/families/Dfam-curated_only-1.embl.gz" \
+        || die "Dfam download failed"
+    gzip -t "$DFAM_EMBL" || die "Dfam download is corrupt"
     gzip -dc "$CELLULAR_DIR/sprot_q.fa.gz" > "$CELLULAR_DIR/sprot_q.fa"
-    python3 "$BUILDER" "$CELLULAR_DIR/sprot_q.fa" "$PEPS" "$CELLULAR_DIR" "${THREADS:-8}" \
+    python3 "$BUILDER" "$CELLULAR_DIR/sprot_q.fa" "$PEPS" "$DFAM_EMBL" "$CELLULAR_DIR" "${THREADS:-8}" \
         || die "cellular DB build failed"
     rm -f "$CELLULAR_DIR/sprot_q.fa"
     log "Cellular DB ready. Use: export PAN_TE_CELLULAR_DB=$CELLULAR_DIR/sprot_cell"
